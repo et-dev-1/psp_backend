@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Invoice</title>
+  </head>
+  <body style="margin:0; padding:0; background-color:#f3f4f6; font-family:Arial, Helvetica, sans-serif; color:#111827;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f3f4f6; padding:24px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:760px; background-color:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e5e7eb;">
+            <tr>
+              <td style="padding:28px 32px; background:linear-gradient(135deg, #111827 0%, #374151 100%); color:#ffffff;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td>
+                      <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:14px;">
+                        <tr>
+                          <td style="vertical-align:middle; padding-right:14px;">
+                            <img src="{{company_logo_url}}" alt="{{company_name}} logo" style="display:block; width:56px; height:56px; object-fit:contain; border-radius:10px; background-color:#ffffff; padding:6px;" />
+                          </td>
+                          <td style="vertical-align:middle;">
+                            <p style="margin:0; font-size:18px; line-height:24px; font-weight:700; color:#ffffff;">{{company_name}}</p>
+                            <p style="margin:4px 0 0 0; font-size:13px; line-height:18px; color:#d1d5db;">{{company_email}}</p>
+                            <p style="margin:4px 0 0 0; font-size:12px; line-height:18px; color:#d1d5db;">{{company_address}}</p>
+                          </td>
+                        </tr>
+                      </table>
+                      <h1 style="margin:0; font-size:28px; line-height:34px; font-weight:700;">Order Receipt</h1>
+                    </td>
+                    <td align="right" style="vertical-align:top;">
+                      <div style="display:inline-block; padding:10px 14px; border-radius:12px; background-color:rgba(255,255,255,0.12); text-align:left;">
+                        <p style="margin:0; font-size:12px; color:#e5e7eb;">Order Date</p>
+                        <p style="margin:4px 0 0 0; font-size:14px; font-weight:600; color:#ffffff;">{{order_date}}</p>
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:28px 32px 8px 32px;">
+                <p style="margin:0; font-size:16px;">Hello <strong>{{customer_name}}</strong>,</p>
+                <p style="margin:10px 0 0 0; font-size:14px; line-height:22px; color:#4b5563;">
+                  Thank you for your order. Below is your invoice with all order details.
+                </p>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:16px 32px 8px 32px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="50%" style="padding-right:8px; vertical-align:top;">
+                      <div style="border:1px solid #e5e7eb; border-radius:14px; padding:18px; background-color:#f9fafb; height:100%;">
+                        <p style="margin:0 0 12px 0; font-size:13px; font-weight:700; color:#111827; text-transform:uppercase; letter-spacing:0.4px;">Customer Details</p>
+                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Name:</strong> {{customer_name}}</p>
+                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Email:</strong> {{customer_email}}</p>
+                        <p style="margin:0; font-size:14px; line-height:22px;"><strong>Shipping Address:</strong> {{shipping_address}}</p>
+                      </div>
+                    </td>
+                    <td width="50%" style="padding-left:8px; vertical-align:top;">
+                      <div style="border:1px solid #e5e7eb; border-radius:14px; padding:18px; background-color:#f9fafb; height:100%;">
+                        <p style="margin:0 0 12px 0; font-size:13px; font-weight:700; color:#111827; text-transform:uppercase; letter-spacing:0.4px;">Order Summary</p>
+                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Order ID:</strong> {{order_id}}</p>
+                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Total:</strong> SEK {{grand_total}}</p>
+                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Tax:</strong> SEK {{tax_amount}}</p>
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:20px 32px 8px 32px;">
+                <h2 style="margin:0 0 14px 0; font-size:18px; line-height:24px; color:#111827;">Order Items</h2>
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate; border-spacing:0; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden;">
+                  <thead>
+                    <tr style="background-color:#111827; color:#ffffff;">
+                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Item</th>
+                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Qty</th>
+                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Unit Price</th>
+                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Line Tax</th>
+                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Line Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {{items_rows}}
+                    {{totals_footer_row}}
+                  </tbody>
+                </table>
+                <p style="margin:10px 2px 0 2px; font-size:12px; line-height:18px; color:#6b7280;">{{private_seller_vat_note}}</p>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:24px 32px 32px 32px;">
+                <div style="border-top:1px solid #e5e7eb; padding-top:18px;">
+                  <p style="margin:0 0 8px 0; font-size:14px; color:#4b5563;">If you have any questions about this order, please contact:</p>
+                  <p style="margin:0 0 4px 0; font-size:14px; font-weight:700; color:#111827;">{{company_name}}</p>
+                  <p style="margin:0 0 4px 0; font-size:14px; color:#111827;">{{company_email}}</p>
+                  <p style="margin:0 0 8px 0; font-size:14px; color:#111827;">{{company_address}}</p>
+                  <p style="margin:0 0 8px 0; font-size:14px; color:#d1d5db;">Organization Number: {{organization_number}}</p>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

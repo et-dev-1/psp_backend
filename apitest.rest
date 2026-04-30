@@ -1,0 +1,29 @@
+### ============================================
+### CUSTOMER MANAGEMENT
+### ============================================
+#@baseUrl = http://wheat-termite-731613.hostingersite.com:3000
+
+###
+curl -I http://192.168.1.233:8080    # frontend
+
+###
+curl -i http://192.168.1.233:3001/health   # backend (local mapping from Compose)
+
+
+@baseUrl = http://192.168.1.233:3001
+
+### Base URL
+# Use {{baseUrl}} in requests below
+
+### ============================================
+### PRODUCT LIST
+### ============================================
+
+### Get Public Product List
+GET {{baseUrl}}/api/public/products
+
+### Get Public Promoted Products
+GET {{baseUrl}}/api/public/products/promoted
+
+### Get Customer Product List Alias
+GET {{baseUrl}}/api/customer/products

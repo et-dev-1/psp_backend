@@ -1,0 +1,17 @@
+dist
+uploads/
+trash
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+.idea/
+.vscode/
+node_modules/
+*.env
+*.env.local
+*.env.development
+*.env.test
+*.env.production
