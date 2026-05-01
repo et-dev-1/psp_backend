@@ -39,7 +39,7 @@ async function main() {
     }
 
     console.log('[apply-schema] Applying schema.sql …')
-    const schemaPath = path.join(__dirname, '..', 'schema.sql')
+    const schemaPath = path.join(__dirname, '..', '..', 'schema.sql')
     const sql = await fs.readFile(schemaPath, 'utf8')
 
     // Split on semicolons followed by optional whitespace/newline
