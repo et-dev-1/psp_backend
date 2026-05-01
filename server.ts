@@ -956,7 +956,38 @@ const requireSellerOrAdmin = async (req: Request, res: Response): Promise<AuthWi
   }
 }
 
+const fsPromises = fs.promises;
 const ensureCommissionSettingsTable = async () => {
+  // --- API to run schema.sql ---
+  app.post('/run-schema', async (req, res) => {
+    // Only allow admin users to run this endpoint
+    const auth = await requireAdmin(req, res);
+    if (!auth) return;
+
+    try {
+      const schemaPath = path.join(__dirname, 'schema.sql');
+      const sql = await fsPromises.readFile(schemaPath, 'utf8');
+
+      // Split SQL by semicolon, filter out empty lines
+      const statements = sql
+        .split(/;\s*\n/)
+        .map((stmt) => stmt.trim())
+        .filter((stmt) => stmt.length > 0);
+
+      const conn = await db.getConnection();
+      try {
+        for (const stmt of statements) {
+          await conn.query(stmt);
+        }
+        res.json({ ok: true, message: 'schema.sql executed successfully' });
+      } finally {
+        conn.release();
+      }
+    } catch (error) {
+      console.error('Error running schema.sql:', error);
+      res.status(500).json({ ok: false, error: String(error) });
+    }
+  });
   try {
     if (hasCommissionSettingsTableCache === true) return
 

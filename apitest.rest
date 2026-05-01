@@ -1,16 +1,17 @@
 ### ============================================
 ### CUSTOMER MANAGEMENT
 ### ============================================
-#@baseUrl = http://wheat-termite-731613.hostingersite.com:3000
+#@baseUrl = http://testdokploy-back-qats7f-42190c-64-112-125-55.traefik.me
 
-###
-curl -I http://192.168.1.233:8080    # frontend
+@baseUrl = http://localhost:3001
 
 ###
 curl -i http://192.168.1.233:3001/health   # backend (local mapping from Compose)
 
+curl -i http://testdokploy-back-qats7f-42190c-64-112-125-55.traefik.me:3001/health
 
-@baseUrl = http://192.168.1.233:3001
+
+#@baseUrl = http://192.168.1.233:3001
 
 ### Base URL
 # Use {{baseUrl}} in requests below
@@ -18,6 +19,13 @@ curl -i http://192.168.1.233:3001/health   # backend (local mapping from Compose
 ### ============================================
 ### PRODUCT LIST
 ### ============================================
+
+###
+get GET {{baseUrl}}/health
+
+
+###Run Schema
+post {{baseUrl}}/run-schema
 
 ### Get Public Product List
 GET {{baseUrl}}/api/public/products

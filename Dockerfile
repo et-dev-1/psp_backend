@@ -23,7 +23,8 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/server.js ./server.js
 COPY --from=build /app/email ./email
 COPY --from=build /app/swish ./swish
+COPY --from=build /app/schema.sql ./schema.sql
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["npm", "run", "start:prod"]

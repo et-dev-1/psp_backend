@@ -1,7 +1,3 @@
--- Create Database
-CREATE DATABASE IF NOT EXISTS store_db;
-USE store_db;
-
 -- Users Table 
 CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
