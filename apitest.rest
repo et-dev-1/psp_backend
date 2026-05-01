@@ -5,14 +5,6 @@
 
 #@baseUrl = http://localhost:3001
 
-###
-curl -i http://192.168.1.233:3001/health   # backend (local mapping from Compose)
-
-curl -i http://testdokploy-back-qats7f-42190c-64-112-125-55.traefik.me:3001/health
-
-
-#@baseUrl = http://192.168.1.233:3001
-
 ### Base URL
 # Use {{baseUrl}} in requests below
 

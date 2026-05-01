@@ -67,27 +67,14 @@ export const PROMOTION_COMMISSION_PERCENT = toNumber(process.env.PROMOTION_COMMI
 export const SWISH_ENABLED = toBool(process.env.SWISH_ENABLED, false)
 export const SWISH_TEST_MODE = toBool(process.env.SWISH_TEST_MODE, true)
 
-const isLocalhostClientUrl = (() => {
-  if (!CLIENT_URL) return true
-  try {
-    const parsed = new URL(CLIENT_URL)
-    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
-  } catch {
-    return false
-  }
-})()
+// CORS origin check is ALWAYS enabled unless explicitly disabled via env.
+export const DISABLE_CORS_ORIGIN_CHECK = toBool(process.env.DISABLE_CORS_ORIGIN_CHECK, false)
 
-// Auto behavior: disable strict CORS origin checks when CLIENT_URL is not localhost.
-export const DISABLE_CORS_ORIGIN_CHECK = process.env.DISABLE_CORS_ORIGIN_CHECK !== undefined
-  ? toBool(process.env.DISABLE_CORS_ORIGIN_CHECK, false)
-  : !isLocalhostClientUrl
-
-// CORS origins: explicit list or environment variable
-const DEFAULT_CORS_ORIGINS = [
+// Development-only fallback origins (never used in production).
+const DEV_CORS_ORIGINS = [
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:5175',
-  // Common local/private network addresses
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
   'http://127.0.0.1:5175',
@@ -97,30 +84,37 @@ const ENV_CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean)
   : []
 
-// In production, default CORS to CLIENT_URL when CORS_ORIGINS is not provided.
-export const CORS_ORIGINS = ENV_CORS_ORIGINS.length
+// In production: require explicit CORS_ORIGINS or CLIENT_URL — no implicit fallback.
+// In development: fall back to localhost dev ports if nothing is configured.
+export const CORS_ORIGINS: string[] = ENV_CORS_ORIGINS.length
   ? ENV_CORS_ORIGINS
-  : NODE_ENV === 'production' && CLIENT_URL
-    ? [CLIENT_URL]
-    : DEFAULT_CORS_ORIGINS
+  : NODE_ENV === 'production'
+    ? CLIENT_URL ? [CLIENT_URL] : []   // empty = block all origins in prod if misconfigured
+    : DEV_CORS_ORIGINS
 
-// Helper to check if origin should be allowed (matches localhost or private IP pattern)
+// Checks whether an origin is permitted.
+// Production: strict whitelist only (CORS_ORIGINS env).
+// Development: also allows private-network IPs on common Vite ports.
 export const isOriginAllowed = (origin: string | undefined): boolean => {
   if (DISABLE_CORS_ORIGIN_CHECK) return true
   if (!origin) return false
 
-  // Check explicit whitelist first
+  // Explicit whitelist (CORS_ORIGINS / CLIENT_URL from env)
   if (CORS_ORIGINS.includes(origin)) return true
 
-  // In development, allow any private network IP on ports 5173-5175
+  // In development only: also allow any private-network IP on Vite dev ports
   if (NODE_ENV !== 'production') {
-    const url = new URL(origin)
-    const isPrivateIP =
-      url.hostname === 'localhost' ||
-      url.hostname === '127.0.0.1' ||
-      /^(10|172|192)\./.test(url.hostname) // Private IP ranges: 10.x, 172.16-31.x, 192.168.x.x
-    const isFrontendPort = ['5173', '5174', '5175'].includes(url.port)
-    return isPrivateIP && isFrontendPort
+    try {
+      const url = new URL(origin)
+      const isPrivateIP =
+        url.hostname === 'localhost' ||
+        url.hostname === '127.0.0.1' ||
+        /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(url.hostname)
+      const isFrontendPort = ['5173', '5174', '5175'].includes(url.port)
+      return isPrivateIP && isFrontendPort
+    } catch {
+      return false
+    }
   }
 
   return false
