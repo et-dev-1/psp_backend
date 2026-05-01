@@ -2970,20 +2970,14 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
       sinceSql ? [auth.id, sinceSql] : [auth.id],
     )
 
-    const hasProfileRejectionReason = await hasProfilesRejectionReasonColumn()
-    const profileRejectionReasonExpression = hasProfileRejectionReason
-      ? "COALESCE(rejection_reason, '')"
-      : "''"
     const profileTimestampExpression = await hasProfilesUpdatedAtColumn()
       ? 'updated_at'
       : 'created_at'
 
     const [profileStatusRows] = await db.query<RowDataPacket[]>(
       `SELECT
-        COALESCE(is_verified, 0) AS is_verified,
-        ${profileRejectionReasonExpression} AS rejection_reason,
-        COALESCE(is_blocked, 0) AS is_blocked,
-        COALESCE(blocked_reason, '') AS blocked_reason,
+        COALESCE(status, 'pending') AS status,
+        COALESCE(status_reason, '') AS status_reason,
         COALESCE(${profileTimestampExpression}, created_at) AS status_updated_at
       FROM profiles
       WHERE user_id = ?
@@ -3095,10 +3089,12 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
       .pop() || null
 
     const profileStatus = profileStatusRows[0] || null
-    const isProfileBlocked = Number(profileStatus?.is_blocked || 0) === 1
-    const rejectionReason = String(profileStatus?.rejection_reason || '').trim()
-    const isProfileRejected = !isProfileBlocked && rejectionReason.length > 0
-    const isProfileAccepted = !isProfileBlocked && !isProfileRejected && Number(profileStatus?.is_verified || 0) === 1
+    const normalizedStatus = getSellerProfileStatus(profileStatus)
+    const statusReason = getSellerProfileStatusReason(profileStatus)
+    const isProfileBlocked = normalizedStatus === 'blocked'
+    const isProfileRejected = normalizedStatus === 'rejected'
+    const isProfileAccepted = normalizedStatus === 'verified'
+    const rejectionReason = isProfileRejected ? statusReason : ''
     const profileStatusUpdatedAt = profileStatus?.status_updated_at || null
 
     let acceptedCount = 0
@@ -3152,7 +3148,7 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
         id: 'seller-profile-blocked',
         title: 'Account suspended',
         description: isProfileBlocked
-          ? (String(profileStatus?.blocked_reason || '').trim() || 'Your seller account is currently suspended by admin.')
+          ? (statusReason || 'Your seller account is currently suspended by admin.')
           : 'Your seller account is active.',
         count: isProfileBlocked ? 1 : 0,
         href: '/profile-registration',
