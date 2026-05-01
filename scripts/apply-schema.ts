@@ -42,11 +42,18 @@ async function main() {
     const schemaPath = path.join(__dirname, '..', '..', 'schema.sql')
     const sql = await fs.readFile(schemaPath, 'utf8')
 
-    // Split on semicolons followed by optional whitespace/newline
+    // Split on semicolons followed by optional whitespace/newline,
+    // strip leading comment lines from each chunk, then discard empty chunks.
     const statements = sql
       .split(/;\s*(?:\r?\n|$)/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0 && !s.startsWith('--'))
+      .map((s) =>
+        s
+          .split('\n')
+          .filter((line) => !line.trimStart().startsWith('--'))
+          .join('\n')
+          .trim(),
+      )
+      .filter((s) => s.length > 0)
 
     for (const stmt of statements) {
       await conn.query(stmt)
