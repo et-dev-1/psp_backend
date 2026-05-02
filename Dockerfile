@@ -27,4 +27,4 @@ COPY --from=build /app/schema.sql ./schema.sql
 
 EXPOSE 3000
 
-CMD ["npm", "run", "start:prod"]
+CMD ["sh", "-c", "node dist/scripts/apply-schema.js && exec node server.js"]
