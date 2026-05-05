@@ -101,8 +101,18 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true })
 }
 
+const supportUploadDir = path.join(__dirname, 'uploads', 'support')
+if (!fs.existsSync(supportUploadDir)) {
+  fs.mkdirSync(supportUploadDir, { recursive: true })
+}
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
+    if (file.fieldname === 'attachments') {
+      cb(null, supportUploadDir)
+      return
+    }
+
     cb(null, uploadDir)
   },
   filename: (req, file, cb) => {
@@ -138,6 +148,19 @@ const upload = multer({
       return cb(new Error('Digital file must be a PDF or image file'))
     }
 
+    if (file.fieldname === 'attachments') {
+      const allowedAttachmentTypes = /pdf|jpeg|jpg|png|gif|webp/
+      const extname = allowedAttachmentTypes.test(path.extname(file.originalname).toLowerCase())
+      const mimetype =
+        file.mimetype === 'application/pdf' || /image\/(jpeg|jpg|png|gif|webp)/.test(file.mimetype)
+
+      if (extname && mimetype) {
+        return cb(null, true)
+      }
+
+      return cb(new Error('Support attachments must be PDF or image files'))
+    }
+
     return cb(new Error('Unexpected file field'))
   },
 })
@@ -148,6 +171,8 @@ const productUpload = upload.fields([
   { name: 'variant_images', maxCount: 50 },
   { name: 'variant_files', maxCount: 50 },
 ])
+
+const supportUpload = upload.array('attachments', 5)
 
 // Serve static files for uploaded images
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
@@ -9483,6 +9508,138 @@ const ALLOWED_REASONS = [
   'Other',
 ]
 
+const ALLOWED_SUPPORT_TYPES = ['ask_question', 'report_issue', 'give_feedback'] as const
+type SellerSupportType = (typeof ALLOWED_SUPPORT_TYPES)[number]
+
+const SUPPORT_TYPE_LABELS: Record<SellerSupportType, string> = {
+  ask_question: 'Ask a question',
+  report_issue: 'Report issue',
+  give_feedback: 'Give feedback',
+}
+
+app.post('/api/seller/support', supportUpload, async (req: Request, res: Response) => {
+  const auth = await requireSellerOrAdmin(req, res)
+  if (!auth) return
+
+  const ip = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown')
+    .split(',')[0].trim()
+
+  if (!contactRateLimit(ip)) {
+    return res.status(429).json({
+      message: 'Too many messages. Please wait 15 minutes before sending again.',
+    })
+  }
+
+  const sellerName = sanitizeField(req.body?.sellerName, 100)
+  const sellerEmailFromBody = sanitizeField(req.body?.sellerEmail, 150).toLowerCase()
+  const subject = sanitizeField(req.body?.subject, 120)
+  const type = sanitizeField(req.body?.type, 40).toLowerCase() as SellerSupportType
+  const description = sanitizeField(req.body?.description, 2000)
+
+  if (!sellerName || sellerName.length < 2) {
+    return res.status(400).json({ message: 'Seller name is required (at least 2 characters).' })
+  }
+
+  if (!subject || subject.length < 3) {
+    return res.status(400).json({ message: 'Subject is required (at least 3 characters).' })
+  }
+
+  if (!ALLOWED_SUPPORT_TYPES.includes(type)) {
+    return res.status(400).json({ message: 'Please choose a valid support type.' })
+  }
+
+  if (!description || description.length < 10) {
+    return res.status(400).json({ message: 'Description is too short (at least 10 characters).' })
+  }
+
+  const supportEmail = config.EMAIL.address || config.SMTP.user || ''
+  if (!supportEmail) {
+    console.error('[Seller Support] EMAIL_ADDRESS env variable is not set.')
+    return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
+  }
+
+  try {
+    const [userRows] = await db.query<RowDataPacket[]>(
+      'SELECT email, role FROM users WHERE id = ? LIMIT 1',
+      [auth.id],
+    )
+
+    const sellerEmailFromDb = sanitizeField(userRows[0]?.email, 150).toLowerCase()
+    const sellerEmail = sellerEmailFromDb || sellerEmailFromBody
+
+    if (!sellerEmail || !VALID_EMAIL_RE.test(sellerEmail)) {
+      return res.status(400).json({ message: 'A valid seller email is required.' })
+    }
+
+    const supportTypeLabel = SUPPORT_TYPE_LABELS[type]
+    const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : []
+    const attachmentList = files.length
+      ? `<ul>${files.map((file) => `<li>${file.originalname}</li>`).join('')}</ul>`
+      : '<p>No attachments.</p>'
+
+    const emailBody = `
+<h2 style="font-family:sans-serif;color:#1e1b4b;">New Seller Support Message</h2>
+<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;width:100%;max-width:650px;">
+  <tr><td style="padding:8px 12px;font-weight:600;color:#374151;width:170px;">Seller name</td><td style="padding:8px 12px;color:#111827;">${sellerName}</td></tr>
+  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Seller email</td><td style="padding:8px 12px;color:#111827;">${sellerEmail}</td></tr>
+  <tr><td style="padding:8px 12px;font-weight:600;color:#374151;">Support type</td><td style="padding:8px 12px;color:#111827;">${supportTypeLabel}</td></tr>
+  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Subject</td><td style="padding:8px 12px;color:#111827;">${subject}</td></tr>
+  <tr>
+    <td style="padding:8px 12px;font-weight:600;color:#374151;vertical-align:top;">Description</td>
+    <td style="padding:8px 12px;color:#111827;white-space:pre-wrap;">${description}</td>
+  </tr>
+  <tr style="background:#f9fafb;">
+    <td style="padding:8px 12px;font-weight:600;color:#374151;vertical-align:top;">Attachments</td>
+    <td style="padding:8px 12px;color:#111827;">${attachmentList}</td>
+  </tr>
+</table>
+<p style="font-family:sans-serif;font-size:12px;color:#9ca3af;margin-top:24px;">Sent from seller support panel.</p>
+    `.trim()
+
+    await ensureSupportMessagesTable()
+
+    await db.query(
+      `INSERT INTO support_messages (
+        sender_name,
+        sender_email,
+        sender_role,
+        sender_user_id,
+        recipient_role,
+        subject,
+        order_id,
+        message
+      ) VALUES (?, ?, ?, ?, 'admin', ?, ?, ?)`,
+      [
+        sellerName,
+        sellerEmail,
+        auth.role,
+        auth.id,
+        `${supportTypeLabel}: ${subject}`,
+        null,
+        description,
+      ],
+    )
+
+    await sendEmail(
+      supportEmail,
+      `[Seller Support] ${supportTypeLabel} - ${subject}`,
+      emailBody,
+      {
+        attachments: files.map((file) => ({
+          filename: file.originalname,
+          path: file.path,
+          contentType: file.mimetype,
+        })),
+      },
+    )
+
+    return res.json({ success: true, message: 'Support message sent to admin.' })
+  } catch (error) {
+    console.error('[Seller Support] Failed to process support request:', error)
+    return res.status(500).json({ message: 'Could not send support message at this time. Please try again later.' })
+  }
+})
+
 app.post('/api/public/newsletter/subscribe', async (req: Request, res: Response) => {
   try {
     const email = sanitizeField(req.body?.email, 255).toLowerCase()
@@ -9661,20 +9818,13 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 
 const DEFAULT_PORT = config.PORT
 
-const startServer = (port: number, hasRetried = false) => {
+const startServer = (port: number) => {
   const server = app.listen(port, '0.0.0.0', () => {
     setupWebSocket(server)
     console.log(`Server running on http://0.0.0.0:${port}`)
   })
 
   server.on('error', (error: NodeJS.ErrnoException) => {
-    if (error.code === 'EADDRINUSE' && !hasRetried) {
-      const fallbackPort = port + 1
-      console.warn(`Port ${port} is in use. Retrying on port ${fallbackPort}...`)
-      startServer(fallbackPort, true)
-      return
-    }
-
     console.error('Failed to start server:', error)
     process.exit(1)
   })

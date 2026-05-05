@@ -73,11 +73,7 @@ export const DISABLE_CORS_ORIGIN_CHECK = toBool(process.env.DISABLE_CORS_ORIGIN_
 // Development-only fallback origins (never used in production).
 const DEV_CORS_ORIGINS = [
   'http://localhost:5173',
-  'http://localhost:5174',
-  'http://localhost:5175',
   'http://127.0.0.1:5173',
-  'http://127.0.0.1:5174',
-  'http://127.0.0.1:5175',
 ]
 
 const ENV_CORS_ORIGINS = process.env.CORS_ORIGINS
@@ -110,7 +106,7 @@ export const isOriginAllowed = (origin: string | undefined): boolean => {
         url.hostname === 'localhost' ||
         url.hostname === '127.0.0.1' ||
         /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(url.hostname)
-      const isFrontendPort = ['5173', '5174', '5175'].includes(url.port)
+      const isFrontendPort = url.port === '5173'
       return isPrivateIP && isFrontendPort
     } catch {
       return false

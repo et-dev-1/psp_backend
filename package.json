@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "nodemon --exec ts-node server.ts",
     "start": "node server.js",
-    "db:init": "node dist/scripts/apply-schema.js",
+    "db:init": "ts-node scripts/apply-schema.ts",
     "start:prod": "npm run db:init && npm start",
     "build": "tsc",
     "build:hostinger": "npm run build",

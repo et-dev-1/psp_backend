@@ -26,6 +26,41 @@ if (!DATABASE_URL) {
   process.exit(1)
 }
 
+async function ensureColumn(
+  conn: mysql.Connection,
+  tableName: string,
+  columnName: string,
+  definition: string,
+) {
+  const [rows] = await conn.query<mysql.RowDataPacket[]>(
+    `SHOW COLUMNS FROM ${tableName} LIKE ?`,
+    [columnName],
+  )
+
+  if (rows.length > 0) return
+
+  console.log(`[apply-schema] Adding ${tableName}.${columnName} ...`)
+  await conn.query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`)
+}
+
+async function reconcileExistingSchema(conn: mysql.Connection) {
+  const [profileTableRows] = await conn.query<mysql.RowDataPacket[]>("SHOW TABLES LIKE 'profiles'")
+  if (profileTableRows.length === 0) return
+
+  await ensureColumn(conn, 'profiles', 'clearance_number', 'VARCHAR(50) NULL')
+  await ensureColumn(conn, 'profiles', 'personal_account_number', 'VARCHAR(100) NULL')
+  await ensureColumn(conn, 'profiles', 'personal_bank_name', 'VARCHAR(150) NULL')
+  await ensureColumn(conn, 'profiles', 'company_logo_url', 'VARCHAR(2000) NULL')
+  await ensureColumn(conn, 'profiles', 'company_bank_type', "ENUM('bankgiro', 'plusgiro') NULL")
+  await ensureColumn(conn, 'profiles', 'company_account_number', 'VARCHAR(100) NULL')
+  await ensureColumn(conn, 'profiles', 'status', "ENUM('pending', 'verified', 'blocked', 'rejected') DEFAULT 'pending'")
+  await ensureColumn(conn, 'profiles', 'status_reason', 'TEXT NULL')
+  await ensureColumn(conn, 'profiles', 'is_verified', 'BOOLEAN NOT NULL DEFAULT FALSE')
+  await ensureColumn(conn, 'profiles', 'is_blocked', 'BOOLEAN NOT NULL DEFAULT FALSE')
+  await ensureColumn(conn, 'profiles', 'rejection_reason', 'TEXT NULL')
+  await ensureColumn(conn, 'profiles', 'blocked_reason', 'TEXT NULL')
+}
+
 async function main() {
   const conn = await mysql.createConnection({ uri: DATABASE_URL, multipleStatements: false })
 
@@ -33,7 +68,8 @@ async function main() {
     // Check sentinel table
     const [rows] = await conn.query<mysql.RowDataPacket[]>("SHOW TABLES LIKE 'users'")
     if (rows.length > 0) {
-      console.log('[apply-schema] Schema already applied (users table exists). Skipping.')
+      console.log('[apply-schema] Base schema already exists. Reconciling incremental columns.')
+      await reconcileExistingSchema(conn)
       await seedAdminUser(conn)
       return
     }
@@ -58,6 +94,8 @@ async function main() {
     for (const stmt of statements) {
       await conn.query(stmt)
     }
+
+    await reconcileExistingSchema(conn)
 
     console.log('[apply-schema] Schema applied successfully.')
     await seedAdminUser(conn)

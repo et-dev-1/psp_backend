@@ -1,3 +1,8 @@
+
+
+-- [apply-schema] Schema already applied (users table exists). Skipping.
+
+
 -- Users Table 
 CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -68,16 +73,26 @@ CREATE TABLE IF NOT EXISTS profiles (
   phone VARCHAR(20),
   profile_type ENUM('private', 'company') DEFAULT 'private',
   personal_id_number VARCHAR(50),
+  clearance_number VARCHAR(50),
+  personal_account_number VARCHAR(100),
+  personal_bank_name VARCHAR(150),
   profile_picture_url VARCHAR(2000),
+  company_logo_url VARCHAR(2000),
   display_name VARCHAR(255) NULL, 
   -- Company info
   company_name VARCHAR(255),
   company_org_number VARCHAR(100),
   company_vat_number VARCHAR(100),
   company_address VARCHAR(255),
+  company_bank_type ENUM('bankgiro', 'plusgiro') NULL,
+  company_account_number VARCHAR(100),
   -- Admin verification
   status ENUM('pending', 'verified', 'blocked', 'rejected') DEFAULT 'pending',
   status_reason TEXT NULL,
+  is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+  is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+  rejection_reason TEXT NULL,
+  blocked_reason TEXT NULL,
   last_login TIMESTAMP NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,

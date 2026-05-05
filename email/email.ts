@@ -359,6 +359,11 @@ export const sendEmail = async (
   options?: {
     useTestSender?: boolean
     testSenderEmail?: string
+    attachments?: Array<{
+      filename: string
+      path: string
+      contentType?: string
+    }>
   },
 ): Promise<{ success: true; messageId: string }> => {
   if (!receiverEmail || !subject || !body) {
@@ -412,6 +417,7 @@ export const sendEmail = async (
     subject,
     text: textBody,
     html: htmlBody,
+    attachments: options?.attachments,
   })
 
   return {
