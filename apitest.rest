@@ -27,3 +27,16 @@ GET {{baseUrl}}/api/public/products/promoted
 
 ### Get Customer Product List Alias
 GET {{baseUrl}}/api/customer/products
+
+
+### Swish Payment Request
+curl -v -X PUT "https://staging.getswish.pub.tds.tieto.com/swish-cpcapi/api/v2/paymentrequests/57c03c27-1f8c-40aa-9999-40e56327f2ee"   -H "Content-Type: application/json"   --cert "./swish/swish_client_cert/Swish_Merchant_TestCertificate_1234679304.p12:swish"   --cert-type P12   --cacert "./swish/swish_client_cert/Swish_TLS_RootCA.pem"   --data '{
+    "payeePaymentReference": "0123456789",
+    "callbackUrl": "https://example.com/api/swishcb/paymentrequests",
+    "payerAlias": "4671234768",
+    "payeeAlias": "1234679304",
+    "amount": "100",
+    "currency": "SEK",
+    "message": "Kingston USB Flash Drive 8 GB",
+    "callbackIdentifier": "11A86BE70EA346E4B1C39C874173F478"
+  }'

@@ -8,6 +8,7 @@
     "start": "node server.js",
     "db:init": "ts-node scripts/apply-schema.ts",
     "start:prod": "npm run db:init && npm start",
+    "ship": "git add . && git commit -m \"update\" && git push",
     "build": "tsc",
     "build:hostinger": "npm run build",
     "start:hostinger": "node server.js",

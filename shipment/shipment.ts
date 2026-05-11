@@ -1,4 +1,6 @@
 import util from 'node:util'
+import fs from 'node:fs'
+import path from 'node:path'
 
 type LabelFormat = 'PDF' | 'PNG' | 'ZPL'
 
@@ -136,7 +138,7 @@ const POSTNORD_SANDBOX_HOST = (() => {
 
 const POSTNORD_PRODUCTION_HOST = (() => {
 	const value = getTrimmedEnv('POSTNORD_PRODUCTION_HOST')
-	return value !== undefined ? value : 'https://atapi2.postnord.com'
+	return value !== undefined ? value : 'https://api2.postnord.com'
 })()
 
 const DEFAULT_TRACK_PATH = (() => {
@@ -166,7 +168,7 @@ const DEFAULT_TRANSIT_TIME_PATH = (() => {
 
 const DEFAULT_COST_PORTAL_PATH = (() => {
 	const value = getTrimmedEnv('POSTNORD_DEFAULT_COST_PORTAL_PATH')
-	return value !== undefined ? value : '/api/pricing/agreementProduct'
+	return value !== undefined ? value : '/rest/shipment/v1/deliveryoptions/bywarehouse'
 })()
 
 const POSTNORD_PORTAL_HOST = (() => {
@@ -174,15 +176,20 @@ const POSTNORD_PORTAL_HOST = (() => {
 	return value !== undefined ? value : 'https://portal.postnord.com'
 })()
 
+const POSTNORD_PORTAL_REFERRER = (() => {
+	const value = getTrimmedEnv('POSTNORD_PORTAL_REFERRER')
+	return value !== undefined ? value : 'https://portal.postnord.com/shippingtoolpro/buy-shipping'
+})()
+
 const DEFAULT_FALLBACK_CURRENCY = (() => {
 	const value = getTrimmedEnv('DEFAULT_FALLBACK_CURRENCY')
 	return value !== undefined ? value : 'SEK'
 })()
 
-let portalPricingDisabledForSession = false
 let transitTimeCooldownUntil = 0
 
 const getEnv = (key: string): string => String(process.env[key] || '').trim()
+const SHIPMENT_LOG_PATH = path.resolve(process.cwd(), 'shipment.log')
 
 const isTruthyEnv = (key: string, defaultValue = false): boolean => {
 	const value = getEnv(key)
@@ -191,6 +198,7 @@ const isTruthyEnv = (key: string, defaultValue = false): boolean => {
 }
 
 const isPostNordDebugLogsEnabled = (): boolean => isTruthyEnv('POSTNORD_DEBUG_LOGS', process.env.NODE_ENV !== 'production')
+const isPostNordFetchDebugEnabled = (): boolean => isTruthyEnv('POSTNORD_PRINT_FETCH', false)
 
 const shouldLogPostNordTraffic = (path: string): boolean => {
 	const normalizedPath = String(path || '').toLowerCase()
@@ -205,6 +213,54 @@ const formatForLog = (value: unknown): string => util.inspect(value, {
 	compact: false,
 	breakLength: 120,
 })
+
+const maskSensitiveHeaderValue = (headerName: string, value: string): string => {
+	const key = headerName.toLowerCase()
+	if (key === 'authorization' || key === 'x-api-key') return '***'
+	return value
+}
+
+const maskSensitiveUrlParams = (rawUrl: string): string => {
+	try {
+		const parsed = new URL(rawUrl)
+		if (parsed.searchParams.has('apikey')) {
+			parsed.searchParams.set('apikey', '***')
+		}
+		return parsed.toString()
+	} catch {
+		return rawUrl
+	}
+}
+
+const printFetchDebug = (label: string, options: {
+	url: string
+	method: 'GET' | 'POST'
+	headers: Record<string, string>
+	body?: unknown
+}) => {
+	const sanitizedHeaders: Record<string, string> = {}
+	for (const [key, value] of Object.entries(options.headers)) {
+		sanitizedHeaders[key] = maskSensitiveHeaderValue(key, String(value))
+	}
+
+	const debugFetch = {
+		method: options.method,
+		headers: sanitizedHeaders,
+		body: options.body ? JSON.stringify(options.body) : undefined,
+	}
+
+	const logEntry = [
+		`[${new Date().toISOString()}] ${label} fetch debug:`,
+		`fetch(${JSON.stringify(maskSensitiveUrlParams(options.url))}, ${JSON.stringify(debugFetch, null, 2)});`,
+		'',
+	].join('\n')
+
+	try {
+		fs.appendFileSync(SHIPMENT_LOG_PATH, `${logEntry}\n`, 'utf8')
+	} catch (error) {
+		console.error('[Shipment] Failed to write fetch debug to shipment.log', error)
+	}
+}
 
 const getPostNordHost = (): string => {
 	const explicitHost = getEnv('POSTNORD_HOST')
@@ -300,6 +356,9 @@ const postNordRequest = async <T>(options: {
 		...options.query,
 		apikey: apiKey,
 	})
+	const requestHeaders: Record<string, string> = {
+		'Content-Type': 'application/json',
+	}
 
 	if (logEnabled) {
 		console.log(`[PostNord] request\n${formatForLog({
@@ -310,11 +369,18 @@ const postNordRequest = async <T>(options: {
 		})}`)
 	}
 
+	if (isPostNordFetchDebugEnabled()) {
+		printFetchDebug('[PostNord]', {
+			url,
+			method: options.method,
+			headers: requestHeaders,
+			body: options.body,
+		})
+	}
+
 	const response = await fetch(url, {
 		method: options.method,
-		headers: {
-			'Content-Type': 'application/json',
-		},
+		headers: requestHeaders,
 		body: options.body ? JSON.stringify(options.body) : undefined,
 	})
 
@@ -684,6 +750,64 @@ const buildCostPayload = (input: EstimateShipmentCostInput): Record<string, unkn
 	}
 }
 
+const buildDeliveryOptionsPayload = (input: EstimateShipmentCostInput): Record<string, unknown> => {
+	const senderAddress = input.senderAddress || getDefaultSenderAddress()
+	requireAddress(input.address)
+	requireAddress(senderAddress, 'senderAddress')
+
+	const weightKg = toFiniteNumber(input.weightKg)
+	requirePositiveNumber('weightKg', weightKg)
+
+	const customerKey =
+		getEnv('POSTNORD_DELIVERY_CUSTOMER_KEY')
+		|| getEnv('POSTNORD_CUSTOMER_KEY')
+		|| getEnv('POSTNORD_SENDER_COMPANY')
+		|| getEnv('POSTNORD_CUSTOMER_NUMBER')
+		|| 'SellingPlatform'
+
+	return {
+		customer: {
+			customerKey,
+		},
+		warehouses: [
+			{
+				id: 'warehouse1',
+				address: {
+					postCode: senderAddress.postalCode,
+					city: senderAddress.city,
+					street: senderAddress.street,
+					countryCode: String(senderAddress.countryCode || '').trim().toUpperCase().slice(0, 2),
+				},
+				orderHandling: {
+					daysUntilOrderIsReady: '0-1',
+				},
+			},
+		],
+		recipient: {
+			address: {
+				postCode: input.address.postalCode,
+				city: input.address.city,
+				street: input.address.street,
+				countryCode: String(input.address.countryCode || '').trim().toUpperCase().slice(0, 2),
+			},
+		},
+		parcel: {
+			weight: Math.round(weightKg * 1000),
+			weightUnit: 'g',
+		},
+	}
+}
+
+const parseDeliveryOptionsAsCost = (raw: unknown): EstimateShipmentCostOutput => {
+	return {
+		amount: null,
+		currency: null,
+		deliveryTime: null,
+		breakdown: [],
+		raw,
+	}
+}
+
 const portalRequest = async <T>(options: {
 	method: 'GET' | 'POST'
 	path: string
@@ -693,6 +817,7 @@ const portalRequest = async <T>(options: {
 	const normalizedPath = options.path.startsWith('/') ? options.path : `/${options.path}`
 	const url = new URL(`${POSTNORD_PORTAL_HOST}${normalizedPath}`)
 	const logEnabled = isPostNordDebugLogsEnabled()
+	const portalAuthToken = getEnv('POSTNORD_PORTAL_AUTHORIZATION') || getEnv('POSTNORD_AUTHORIZATION')
 
 	if (options.query) {
 		for (const [key, value] of Object.entries(options.query)) {
@@ -707,13 +832,43 @@ const portalRequest = async <T>(options: {
 			path: options.path,
 			url: url.toString(),
 			query: options.query || null,
+			headers: {
+				accept: 'application/json, text/plain, */*',
+				'content-type': 'application/json',
+				authorization: portalAuthToken ? '***' : undefined,
+				referer: POSTNORD_PORTAL_REFERRER,
+			},
 			body: options.body ?? null,
 		})}`)
 	}
 
+	const portalHeaders: Record<string, string> = {
+		Accept: 'application/json, text/plain, */*',
+		'Accept-Language': getEnv('POSTNORD_PORTAL_ACCEPT_LANGUAGE') || 'en-US,en;q=0.9',
+		'Content-Type': 'application/json',
+		...(portalAuthToken ? { Authorization: portalAuthToken } : {}),
+		...(getEnv('POSTNORD_PORTAL_PRIORITY') ? { Priority: getEnv('POSTNORD_PORTAL_PRIORITY') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_CH_UA') ? { 'Sec-CH-UA': getEnv('POSTNORD_PORTAL_SEC_CH_UA') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_CH_UA_MOBILE') ? { 'Sec-CH-UA-Mobile': getEnv('POSTNORD_PORTAL_SEC_CH_UA_MOBILE') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_CH_UA_PLATFORM') ? { 'Sec-CH-UA-Platform': getEnv('POSTNORD_PORTAL_SEC_CH_UA_PLATFORM') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_FETCH_DEST') ? { 'Sec-Fetch-Dest': getEnv('POSTNORD_PORTAL_SEC_FETCH_DEST') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_FETCH_MODE') ? { 'Sec-Fetch-Mode': getEnv('POSTNORD_PORTAL_SEC_FETCH_MODE') } : {}),
+		...(getEnv('POSTNORD_PORTAL_SEC_FETCH_SITE') ? { 'Sec-Fetch-Site': getEnv('POSTNORD_PORTAL_SEC_FETCH_SITE') } : {}),
+		Referer: POSTNORD_PORTAL_REFERRER,
+	}
+
+	if (isPostNordFetchDebugEnabled()) {
+		printFetchDebug('[PostNord Portal]', {
+			url: url.toString(),
+			method: options.method,
+			headers: portalHeaders,
+			body: options.body,
+		})
+	}
+
 	const response = await fetch(url.toString(), {
 		method: options.method,
-		headers: { 'Content-Type': 'application/json' },
+		headers: portalHeaders,
 		body: options.body ? JSON.stringify(options.body) : undefined,
 	})
 
@@ -769,7 +924,7 @@ const buildPortalCostPayload = (input: EstimateShipmentCostInput): Record<string
 	const market = input.market || getEnv('POSTNORD_MARKET') || 'SE'
 	const language = input.language || getEnv('POSTNORD_LANGUAGE') || 'en'
 	const recipientType = (input.recipientType || 'PRIVATE') as 'PRIVATE' | 'BUSINESS'
-	const productType = input.productType || 'PARCEL'
+	const productType = input.productType || 'LETTER'
 	const additionalInformation = typeof input.additionalInformation === 'boolean' ? input.additionalInformation : true
 	const toEmail = String(input.toEmail || input.address.emailAddress || '').trim() || undefined
 	const toMobilePhone = String(
@@ -779,7 +934,7 @@ const buildPortalCostPayload = (input: EstimateShipmentCostInput): Record<string
 		|| '',
 	).trim() || undefined
 
-	return {
+	const basePayload: Record<string, unknown> = {
 		section: 'SHIPPING_LABEL',
 		language,
 		market,
@@ -804,11 +959,16 @@ const buildPortalCostPayload = (input: EstimateShipmentCostInput): Record<string
 		addonValues: {},
 		shipTo,
 		pickup,
-		packageType,
 		selectedWeight: Math.round(weightKg * 1000),
 		selectedWeightUnit: 'g',
 		additionalInformation,
 	}
+
+	if (shipTo === 'HOME') {
+		basePayload.packageType = packageType
+	}
+
+	return basePayload
 }
 
 const collectStringValues = (node: unknown, currentPath = '$'): Array<{ path: string; value: string }> => {
@@ -1578,47 +1738,40 @@ export const estimateShipmentCost = async (
 		throw new ShipmentProviderError('Input is required for estimateShipmentCost.')
 	}
 
-	let costResult: EstimateShipmentCostOutput
-	const portalPricingEnabled = isTruthyEnv('POSTNORD_USE_PORTAL_PRICING', false) && !portalPricingDisabledForSession
+	const endpointPath = input.endpointPath || DEFAULT_COST_PORTAL_PATH
+	const payload = input.externalPayload && isObject(input.externalPayload)
+		? input.externalPayload
+		: buildDeliveryOptionsPayload(input)
 
-	if (!portalPricingEnabled) {
-		if (isPostNordDebugLogsEnabled()) {
-			console.log('[PostNord Portal] shipment fare using fallback estimate (no API call)', {
-				reason: portalPricingDisabledForSession ? 'portal-pricing-disabled-for-session' : 'POSTNORD_USE_PORTAL_PRICING=false',
-			})
+	let costResult: EstimateShipmentCostOutput
+	try {
+		const postNordResponse = await postNordRequest<unknown>({
+			method: 'POST',
+			path: endpointPath,
+			body: payload,
+		})
+		costResult = parseDeliveryOptionsAsCost(postNordResponse)
+	} catch (error) {
+		console.warn('[PostNord] documented shipment API request failed.', {
+			message: error instanceof Error ? error.message : String(error),
+		})
+		if (error instanceof ShipmentProviderError) {
+			if (error.statusCode === 403) {
+				throw new ShipmentProviderError('postnord api key is invalid or missing required permissions', 403, {
+					cause: error.details,
+				})
+			}
+
+			if (typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode < 500) {
+				throw new ShipmentProviderError('postnord rejected shipment request', error.statusCode, {
+					cause: error.details,
+				})
+			}
 		}
-		costResult = buildFallbackCostEstimate(input)
-	} else if (input.externalPayload && isObject(input.externalPayload)) {
-		// Custom external payload provided — send as-is to the portal
-		const portalResponse = await portalRequest<unknown>({
-			method: 'POST',
-			path: input.endpointPath || DEFAULT_COST_PORTAL_PATH,
-			body: input.externalPayload,
-		}).catch((err) => {
-			if (err instanceof ShipmentProviderError && err.statusCode === 401) {
-				portalPricingDisabledForSession = true
-				console.warn('[PostNord Portal] unauthorized; disabling portal pricing for the rest of this server session.')
-			}
-			console.warn('[PostNord Portal] external payload request failed, using fallback.', { message: err?.message })
-			return null
+
+		throw new ShipmentProviderError('unable to reach postnord', 503, {
+			cause: error instanceof ShipmentProviderError ? error.details : undefined,
 		})
-		costResult = portalResponse ? parseCostResponse(portalResponse) : buildFallbackCostEstimate(input)
-	} else {
-		// Build portal-format payload and call PostNord Portal pricing API
-		const portalPayload = buildPortalCostPayload(input)
-		const portalResponse = await portalRequest<unknown>({
-			method: 'POST',
-			path: DEFAULT_COST_PORTAL_PATH,
-			body: portalPayload,
-		}).catch((err) => {
-			if (err instanceof ShipmentProviderError && err.statusCode === 401) {
-				portalPricingDisabledForSession = true
-				console.warn('[PostNord Portal] unauthorized; disabling portal pricing for the rest of this server session.')
-			}
-			console.warn('[PostNord Portal] pricing request failed, using fallback estimate.', { message: err?.message })
-			return null
-		})
-		costResult = portalResponse ? parseCostResponse(portalResponse) : buildFallbackCostEstimate(input)
 	}
 
 	// Supplement with transit time delivery estimate

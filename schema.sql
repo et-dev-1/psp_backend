@@ -1,8 +1,3 @@
-
-
--- [apply-schema] Schema already applied (users table exists). Skipping.
-
-
 -- Users Table 
 CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

@@ -3,6 +3,7 @@ import { IncomingHttpHeaders } from 'http'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import tls from 'tls'
 
 const getTrimmedEnv = (key: string): string | undefined => {
   const raw = process.env[key]
@@ -17,6 +18,12 @@ const getRequiredEnv = (key: string): string => {
     throw new Error(`${key} is not set`)
   }
   return value
+}
+
+const getBooleanEnv = (key: string, defaultValue = false): boolean => {
+  const value = getTrimmedEnv(key)
+  if (value === undefined) return defaultValue
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase())
 }
 
 interface PaymentRequest {
@@ -35,6 +42,11 @@ interface PaymentResponse {
   id?: string
   location?: string
   paymentRequestToken?: string
+}
+
+interface CancelPaymentResponse {
+  instructionUUID: string
+  statusCode: number
 }
 
 interface SwishApiError {
@@ -58,39 +70,47 @@ interface SwishApiConfig {
 class SwishApi {
   private testMode: boolean
   private baseHost: string
+  private apiBasePath: string
   private agent: https.Agent
 
   constructor(config: SwishApiConfig = {}) {
-    this.testMode = config.testMode !== false
-    const explicitBaseHost = getTrimmedEnv('SWISH_BASE_HOST')
-    if (explicitBaseHost) {
-      this.baseHost = explicitBaseHost
-    } else if (this.testMode) {
-      this.baseHost = getRequiredEnv('SWISH_TEST_HOST')
-    } else {
-      this.baseHost = getRequiredEnv('SWISH_PRODUCTION_HOST')
-    }
+    this.testMode = getBooleanEnv('SWISH_TEST_MODE', false)
+    this.baseHost = getRequiredEnv('SWISH_BASE_HOST')
+    this.apiBasePath = getTrimmedEnv('SWISH_API_BASE_PATH') || '/swish-cpcapi/api'
 
-    const certPath = config.certificatePath || path.join(__dirname, 'swish_client_cert')
-    const certificatePassword = config.certificatePassword || 'swish'
+    const certificatePassword = getRequiredEnv('SWISH_CERTIFICATE_PASSWORD')
 
     // Use p12 to honor the certificate passphrase provided by Swish test certs.
-    const p12FilePath = path.join(certPath, 'Swish_Merchant_TestCertificate_1234679304.p12')
-    const caFilePath = path.join(certPath, 'Swish_TLS_RootCA.pem')
+    const certDir = path.resolve(getRequiredEnv('SWISH_CERTIFICATE_PATH'))
+    const p12FilePath = path.resolve(certDir, getRequiredEnv('SWISH_P12_FILENAME'))
+    const caFileName = getTrimmedEnv('SWISH_CA_FILENAME')
+    const caFilePath = caFileName ? path.resolve(certDir, caFileName) : undefined
 
     if (!fs.existsSync(p12FilePath)) {
       throw new Error(`Client p12 certificate not found: ${p12FilePath}`)
     }
-    if (!fs.existsSync(caFilePath)) {
-      throw new Error(`Root CA certificate not found: ${caFilePath}`)
+
+    const caCertificates: string[] = [...tls.rootCertificates]
+    if (caFilePath) {
+      if (!fs.existsSync(caFilePath)) {
+        throw new Error(`CA certificate not found: ${caFilePath}`)
+      }
+      caCertificates.push(fs.readFileSync(caFilePath, 'utf-8'))
     }
 
     this.agent = new https.Agent({
       pfx: fs.readFileSync(p12FilePath),
       passphrase: certificatePassword,
-      ca: fs.readFileSync(caFilePath, 'utf-8'),
+      ca: caCertificates,
       rejectUnauthorized: true,
     })
+  }
+
+  private buildApiPath(version: 'v1' | 'v2', resourcePath: string): string {
+    const base = this.apiBasePath.startsWith('/') ? this.apiBasePath : `/${this.apiBasePath}`
+    const normalizedBase = base.replace(/\/+$/, '')
+    const normalizedResource = resourcePath.startsWith('/') ? resourcePath : `/${resourcePath}`
+    return `${normalizedBase}/${version}${normalizedResource}`
   }
 
   /**
@@ -100,13 +120,14 @@ class SwishApi {
     return crypto.randomBytes(16).toString('hex').toUpperCase()
   }
 
-  private async request<T>(method: 'GET' | 'PUT', relativePath: string, body?: unknown): Promise<{
+  private async request<T>(method: 'GET' | 'PUT' | 'PATCH', relativePath: string, body?: unknown, contentType?: string): Promise<{
     statusCode: number
     headers: IncomingHttpHeaders
     data: T
   }> {
     const url = new URL(`${this.baseHost}${relativePath}`)
     const payload = body ? JSON.stringify(body) : undefined
+    const resolvedContentType = contentType || 'application/json'
 
     return new Promise((resolve, reject) => {
       const req = https.request(
@@ -119,7 +140,7 @@ class SwishApi {
           agent: this.agent,
           timeout: 15000,
           headers: {
-            'Content-Type': 'application/json',
+            'Content-Type': resolvedContentType,
             ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
           },
         },
@@ -190,7 +211,7 @@ class SwishApi {
         testMode: this.testMode,
       })
 
-      const response = await this.request<unknown>('PUT', `/swish-cpcapi/api/v2/paymentrequests/${instructionId}`, {
+      const response = await this.request<unknown>('PUT', this.buildApiPath('v2', `/paymentrequests/${instructionId}`), {
         payeePaymentReference: request.payeePaymentReference,
         callbackUrl: request.callbackUrl,
         payeeAlias: request.payeeAlias,
@@ -237,11 +258,25 @@ class SwishApi {
    */
   async getPaymentStatus(instructionId: string): Promise<unknown> {
     try {
-      const response = await this.request<unknown>('GET', `/swish-cpcapi/api/v1/paymentrequests/${instructionId}`)
+      let response: Awaited<ReturnType<typeof this.request<unknown>>>
+      try {
+        response = await this.request<unknown>('GET', this.buildApiPath('v2', `/paymentrequests/${instructionId}`))
+      } catch (error: unknown) {
+        const normalized = error as SwishApiError
+        // Some Swish environments still expose GET status on v1 only.
+        if (normalized.code === 405) {
+          response = await this.request<unknown>('GET', this.buildApiPath('v1', `/paymentrequests/${instructionId}`))
+        } else {
+          throw error
+        }
+      }
 
       console.log('[Swish API] Payment status retrieved:', {
         instructionId,
+        httpStatus: response.statusCode,
+        headers: response.headers,
         status: typeof response.data === 'object' ? (response.data as Record<string, unknown>).status : undefined,
+        response: response.data,
       })
 
       return response.data
@@ -252,6 +287,42 @@ class SwishApi {
         instructionId,
         status: normalized.code,
         message: normalized.message,
+      })
+
+      throw normalized
+    }
+  }
+
+  /**
+   * Cancel an ongoing payment request.
+   * Swish expects an update to the existing payment request status.
+   */
+  async cancelPaymentRequest(instructionId: string): Promise<CancelPaymentResponse> {
+    try {
+      // Swish Commerce API: cancel via PATCH with JSON Patch document
+      // PATCH /swish-cpcapi/api/v1/paymentrequests/{id}
+      // Content-Type: application/json-patch+json
+      // Body: [{"op":"replace","path":"/status","value":"cancelled"}]
+      const jsonPatch = [{ op: 'replace', path: '/status', value: 'cancelled' }]
+      const response = await this.request<unknown>(
+        'PATCH',
+        this.buildApiPath('v1', `/paymentrequests/${instructionId}`),
+        jsonPatch,
+        'application/json-patch+json',
+      )
+
+      return {
+        instructionUUID: instructionId,
+        statusCode: response.statusCode,
+      }
+    } catch (error: unknown) {
+      const normalized = error as SwishApiError
+
+      console.error('[Swish API] Error cancelling payment request:', {
+        instructionId,
+        status: normalized.code,
+        message: normalized.message,
+        details: normalized.details,
       })
 
       throw normalized
@@ -281,7 +352,7 @@ class SwishApi {
         amount,
       })
 
-      const response = await this.request<unknown>('PUT', `/swish-cpcapi/api/v2/refunds/${refundId}`, {
+      const response = await this.request<unknown>('PUT', this.buildApiPath('v2', `/refunds/${refundId}`), {
         originalInstructionUUID: originalInstuctionId,
         callbackUrl,
         amount: String(amount),

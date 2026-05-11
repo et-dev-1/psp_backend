@@ -3343,18 +3343,41 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
 
     const {
       amount,
-      payeeAlias,
       payerAlias,
       message,
       payeePaymentReference,
-      callbackUrl,
     } = req.body || {}
 
+    const getTrimmedEnv = (key: string): string | undefined => {
+      const rawValue = process.env[key]
+      if (typeof rawValue !== 'string') return undefined
+      const trimmedValue = rawValue.trim()
+      return trimmedValue.length > 0 ? trimmedValue : undefined
+    }
+
+    const getDefaultSwishCallbackUrl = (): string | undefined => {
+      const configuredCallbackUrl = getTrimmedEnv('SWISH_CALLBACK_URL')
+      if (configuredCallbackUrl) return configuredCallbackUrl
+
+      const publicBaseUrl = getTrimmedEnv('BACKEND_PUBLIC_BASE_URL')
+      if (!publicBaseUrl) return undefined
+
+      return `${publicBaseUrl.replace(/\/+$/, '')}/api/swish/callback`
+    }
+
+    const makePaymentReference = (): string => `BB-${Date.now().toString().slice(-10)}`
+
+    const normalizedPayeeAlias = String(getTrimmedEnv('SWISH_PAYEE_ALIAS') || '').trim()
+    const normalizedCurrency = String(getTrimmedEnv('SWISH_CURRENCY') || 'SEK').trim()
+    const normalizedMessage = String(message || 'Barakah Butik order').trim()
+    const normalizedPayeePaymentReference = String(payeePaymentReference || makePaymentReference()).trim()
+    const normalizedCallbackUrl = String(getDefaultSwishCallbackUrl() || '').trim()
+
     // Validate required fields
-    if (!amount || !payeeAlias || !message || !payeePaymentReference || !callbackUrl) {
+    if (!amount || !normalizedPayeeAlias || !normalizedMessage || !normalizedPayeePaymentReference || !normalizedCallbackUrl) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields: amount, payeeAlias, message, payeePaymentReference, callbackUrl',
+        message: 'Missing required payment configuration. Check amount and Swish merchant configuration on the server.',
       })
     }
 
@@ -3365,7 +3388,6 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       })
     }
 
-    const normalizedPayeeAlias = String(payeeAlias || '').trim()
     if (!/^\d{10}$/.test(normalizedPayeeAlias)) {
       return res.status(400).json({
         success: false,
@@ -3373,7 +3395,6 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       })
     }
 
-    const normalizedPayeePaymentReference = String(payeePaymentReference || '').trim()
     if (!/^[A-Za-z0-9\-]{1,35}$/.test(normalizedPayeePaymentReference)) {
       return res.status(400).json({
         success: false,
@@ -3381,7 +3402,6 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       })
     }
 
-    const normalizedMessage = String(message || '').trim()
     if (!normalizedMessage || normalizedMessage.length > 50) {
       return res.status(400).json({
         success: false,
@@ -3389,20 +3409,25 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       })
     }
 
-    const normalizedPayerAliasRaw = String(payerAlias || '').trim()
-    const normalizedPayerAlias = normalizedPayerAliasRaw.replace(/\s+/g, '')
+    const normalizedPayerAliasRaw = String(payerAlias || '').trim().replace(/\s+/g, '').replace(/^\+/, '')
+    // Normalize Swedish local format 07XXXXXXXX → 467XXXXXXXX when payerAlias is provided.
+    const normalizedPayerAlias = normalizedPayerAliasRaw
+      ? (normalizedPayerAliasRaw.startsWith('0')
+        ? `46${normalizedPayerAliasRaw.slice(1)}`
+        : normalizedPayerAliasRaw)
+      : undefined
+    // Swish expects E.164 digits without +, e.g. 46701234567
     if (normalizedPayerAlias && !/^\d{8,15}$/.test(normalizedPayerAlias)) {
       return res.status(400).json({
         success: false,
-        message: 'payerAlias must be digits only (8-15 chars) without + when provided.',
+        message: 'payerAlias must be a valid phone number (e.g. 0701234567 or 46701234567).',
       })
     }
 
-    const normalizedCallbackUrl = String(callbackUrl || '').trim()
     if (!/^https:\/\//i.test(normalizedCallbackUrl)) {
       return res.status(400).json({
         success: false,
-        message: 'callbackUrl must use HTTPS (https://...)',
+        message: 'Swish callback URL must use HTTPS. Set SWISH_CALLBACK_URL or BACKEND_PUBLIC_BASE_URL to a public https:// URL.',
       })
     }
 
@@ -3420,8 +3445,8 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       payeePaymentReference: normalizedPayeePaymentReference,
       callbackUrl: normalizedCallbackUrl,
       payeeAlias: normalizedPayeeAlias,
-      currency: 'SEK',
-      payerAlias: normalizedPayerAlias || undefined,
+      currency: normalizedCurrency,
+      payerAlias: normalizedPayerAlias,
       amount: String(amount),
       message: normalizedMessage,
       callbackIdentifier,
@@ -3434,6 +3459,7 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
         instructionUUID: paymentRequest.instructionUUID,
         id: paymentRequest.id,
         location: paymentRequest.location,
+        payeeAlias: normalizedPayeeAlias,
         paymentRequestToken: paymentRequest.paymentRequestToken,
       },
     })
@@ -3495,6 +3521,195 @@ app.post('/api/swish/payment-status', async (req: Request, res: Response) => {
       message,
       error: error.code || 'UNKNOWN_ERROR',
       details: error.details,
+    })
+  }
+})
+
+// ===== Swish Cancel Payment Request =====
+app.post('/api/swish/cancel', async (req: Request, res: Response) => {
+  try {
+    if (!swishApi) {
+      return res.status(503).json({
+        success: false,
+        message: 'Swish service is not configured on this server.',
+      })
+    }
+
+    const { instructionUUID } = req.body || {}
+    const normalizedInstructionUUID = String(instructionUUID || '').trim()
+
+    if (!normalizedInstructionUUID) {
+      return res.status(400).json({
+        success: false,
+        message: 'instructionUUID is required',
+      })
+    }
+
+    const statusResponse = await swishApi.getPaymentStatus(normalizedInstructionUUID)
+    const currentStatus = String((statusResponse as { status?: string })?.status || '').toUpperCase()
+
+    if (['PAID', 'ERROR', 'DECLINED', 'CANCELLED'].includes(currentStatus)) {
+      return res.status(200).json({
+        success: true,
+        message: `Payment is already finalized with status: ${currentStatus || 'UNKNOWN'}.`,
+        data: {
+          instructionUUID: normalizedInstructionUUID,
+          status: currentStatus || 'UNKNOWN',
+          cancelled: false,
+        },
+      })
+    }
+
+    await swishApi.cancelPaymentRequest(normalizedInstructionUUID)
+
+    return res.status(200).json({
+      success: true,
+      message: 'Swish payment cancellation request sent.',
+      data: {
+        instructionUUID: normalizedInstructionUUID,
+        status: 'CANCEL_REQUESTED',
+        cancelled: true,
+      },
+    })
+  } catch (error: any) {
+    console.error('[API] Swish cancel error:', error)
+
+    const statusCode =
+      typeof error.code === 'number' && error.code >= 400 && error.code <= 599
+        ? error.code
+        : 500
+
+    return res.status(statusCode).json({
+      success: false,
+      message: error.message || 'Failed to cancel Swish payment request',
+      error: error.code || 'UNKNOWN_ERROR',
+      details: error.details,
+    })
+  }
+})
+
+// ===== Swish QR (proxy for POST-only Swish QR API) =====
+app.post('/api/swish/qr', async (req: Request, res: Response) => {
+  try {
+    const { paymentRequestToken, size, format } = req.body || {}
+
+    const token = String(paymentRequestToken || '').trim()
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: 'paymentRequestToken is required',
+      })
+    }
+
+    const requestedSize = Number(size)
+    const normalizedSize = Number.isFinite(requestedSize)
+      ? Math.max(120, Math.min(1024, Math.round(requestedSize)))
+      : 520
+
+    const normalizedFormat = String(format || 'png').trim().toLowerCase() === 'svg' ? 'svg' : 'png'
+    const swishQrBaseUrl = String(process.env.SWISH_QR_BASE_URL || '').trim()
+    if (!swishQrBaseUrl) {
+      return res.status(500).json({
+        success: false,
+        message: 'SWISH_QR_BASE_URL is not configured.',
+      })
+    }
+
+    const callbackUrlRaw = String(process.env.SWISH_CALLBACK_URL || '').trim()
+    const callbackUrl = /^https:\/\//i.test(callbackUrlRaw) ? callbackUrlRaw : ''
+    const swishDeepLink = callbackUrl
+      ? `swish://paymentrequest?token=${encodeURIComponent(token)}&callbackurl=${encodeURIComponent(callbackUrl)}`
+      : `swish://paymentrequest?token=${encodeURIComponent(token)}`
+
+    const buildLocalFallbackQr = async () => {
+      const dataUrl = await QRCode.toDataURL(swishDeepLink, {
+        width: normalizedSize,
+        margin: 1,
+        color: {
+          dark: '#07111f',
+          light: '#ffffff',
+        },
+      })
+      return {
+        success: true,
+        data: {
+          dataUrl,
+          mimeType: 'image/png',
+          source: 'local-fallback',
+          qrProviderUrl: swishQrBaseUrl,
+        },
+      }
+    }
+
+    const swishResponse = await fetch(swishQrBaseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        token,
+        size: normalizedSize,
+        format: normalizedFormat,
+      }),
+    })
+
+    const qrBytes = Buffer.from(await swishResponse.arrayBuffer())
+    const swishContentType = String(swishResponse.headers.get('content-type') || '').toLowerCase()
+    const mimeType = swishContentType.includes('svg')
+      ? 'image/svg+xml'
+      : swishContentType.includes('png')
+        ? 'image/png'
+        : normalizedFormat === 'svg'
+          ? 'image/svg+xml'
+          : 'image/png'
+
+    if (!swishResponse.ok) {
+      const details = qrBytes.length > 0 ? qrBytes.toString('utf-8') : null
+      console.warn('[API] Swish QR provider failed, using local fallback QR.', {
+        swishStatus: swishResponse.status,
+        provider: swishQrBaseUrl,
+        details,
+      })
+      const fallback = await buildLocalFallbackQr()
+      return res.status(200).json(fallback)
+    }
+
+    const dataUrl = `data:${mimeType};base64,${qrBytes.toString('base64')}`
+    return res.status(200).json({
+      success: true,
+      data: {
+        dataUrl,
+        mimeType,
+        source: 'swish-provider',
+        qrProviderUrl: swishQrBaseUrl,
+      },
+    })
+  } catch (error: any) {
+    console.error('[API] Swish QR error:', error)
+    try {
+      const token = String(req.body?.paymentRequestToken || '').trim()
+      if (token) {
+        const fallbackDataUrl = await QRCode.toDataURL(`swish://paymentrequest?token=${encodeURIComponent(token)}`, {
+          width: 520,
+          margin: 1,
+        })
+        return res.status(200).json({
+          success: true,
+          data: {
+            dataUrl: fallbackDataUrl,
+            mimeType: 'image/png',
+            source: 'local-fallback-error-path',
+          },
+        })
+      }
+    } catch (fallbackError) {
+      console.error('[API] Swish QR fallback error:', fallbackError)
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to generate Swish QR code',
     })
   }
 })
@@ -6842,14 +7057,15 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     products, // Array of { product_id, quantity, variant_id? }
     discount_amount,
     payment_method_id, // Stripe payment method ID
+    swish_instruction_uuid,
   } = req.body
 
   if (!customer_id || !products || !Array.isArray(products) || products.length === 0) {
     return res.status(400).json({ message: 'Customer ID and products are required' })
   }
 
-  if (!payment_method_id) {
-    return res.status(400).json({ message: 'Payment method is required' })
+  if (!payment_method_id && !swish_instruction_uuid) {
+    return res.status(400).json({ message: 'Either payment method or paid Swish instruction is required' })
   }
 
   try {
@@ -7070,32 +7286,68 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     const useTestReceiver = config.EMAIL.useTestReceiver
     const testReceiverEmail = config.EMAIL.testReceiver
 
-    // 2. Process Payment via Stripe
-    let paymentIntent
-    try {
-      paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(finalTotal * 100), // Convert to cents
-        currency: 'SEK',
-        payment_method: payment_method_id,
-        confirm: true,
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: 'never',
-        },
-      })
+    // 2. Verify payment (Stripe card or Swish)
+    let paymentReferenceId = ''
+    let paymentProvider: 'stripe' | 'swish' = 'stripe'
 
-      if (paymentIntent.status !== 'succeeded') {
+    if (swish_instruction_uuid) {
+      if (!swishApi) {
+        return res.status(503).json({ message: 'Swish service is not configured on this server.' })
+      }
+
+      const instructionUUID = String(swish_instruction_uuid || '').trim().toUpperCase()
+      if (!/^[0-9A-F]{32}$/.test(instructionUUID)) {
+        return res.status(400).json({ message: 'Invalid Swish instruction UUID.' })
+      }
+
+      try {
+        const swishStatus = await swishApi.getPaymentStatus(instructionUUID) as Record<string, unknown>
+        const status = String(swishStatus?.status || '').toUpperCase()
+        if (status !== 'PAID') {
+          return res.status(400).json({
+            message: 'Swish payment is not completed.',
+            status,
+          })
+        }
+      } catch (swishError) {
+        console.error('Swish payment verification error:', swishError)
         return res.status(400).json({
-          message: 'Payment failed',
-          status: paymentIntent.status
+          message: 'Unable to verify Swish payment. Please try again.',
         })
       }
-    } catch (paymentError: any) {
-      console.error('Payment error:', paymentError)
-      // Return generic error without exposing provider details
-      return res.status(400).json({
-        message: 'Payment processing failed. Please try again or contact support.'
-      })
+
+      paymentProvider = 'swish'
+      paymentReferenceId = instructionUUID
+    } else {
+      let paymentIntent
+      try {
+        paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(finalTotal * 100), // Convert to cents
+          currency: 'SEK',
+          payment_method: payment_method_id,
+          confirm: true,
+          automatic_payment_methods: {
+            enabled: true,
+            allow_redirects: 'never',
+          },
+        })
+
+        if (paymentIntent.status !== 'succeeded') {
+          return res.status(400).json({
+            message: 'Payment failed',
+            status: paymentIntent.status
+          })
+        }
+      } catch (paymentError: any) {
+        console.error('Payment error:', paymentError)
+        // Return generic error without exposing provider details
+        return res.status(400).json({
+          message: 'Payment processing failed. Please try again or contact support.'
+        })
+      }
+
+      paymentProvider = 'stripe'
+      paymentReferenceId = String(paymentIntent.id || '')
     }
 
     // 3. Payment Successful - Create Orders for each seller
@@ -7137,7 +7389,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
           sellerGrandTotal,
           sellerCommission,
           'unpaid',
-          paymentIntent.id,
+          paymentReferenceId,
         ]
       )
 
@@ -7411,7 +7663,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
     res.status(201).json({
       message: 'Order placed successfully',
-      payment_intent_id: paymentIntent.id,
+      payment_intent_id: paymentReferenceId,
+      payment_provider: paymentProvider,
       payment_status: 'paid',
       group_order_id: groupOrderId,
       order_ids: createdOrders.map(o => o.order_id),
@@ -7424,7 +7677,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     emitToAdmin('order:created', {
       group_order_id: groupOrderId,
       order_ids: createdOrders.map((order) => order.order_id),
-      payment_intent_id: paymentIntent.id,
+      payment_intent_id: paymentReferenceId,
       total_amount: finalTotal,
     })
 
