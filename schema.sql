@@ -41,8 +41,6 @@ VALUES
   ('email_company_name', ''),
   ('email_company_address', ''),
   ('email_company_logo_url', ''),
-  ('email_use_test_receiver', 'false'),
-  ('email_test_receiver', ''),
   -- Company Information
   ('company_organization_number', ''),
   -- PostNord Shipping Configuration

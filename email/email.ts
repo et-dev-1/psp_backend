@@ -6,21 +6,7 @@ import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER } from '../config'
 const host = SMTP.host
 const port = SMTP.port
 const secure = SMTP.secure
-const username = SMTP.user
-const password = SMTP.pass
-const fromName = SMTP.fromName
-const defaultTestSender = EMAIL.address
 const organizationNumber = COMPANY_ORGANIZATION_NUMBER || 'N/A'
-
-const transporter = nodemailer.createTransport({
-  host,
-  port,
-  secure,
-  auth: {
-    user: username,
-    pass: password,
-  },
-})
 
 const stripHtml = (value: string): string => {
   return value
@@ -73,8 +59,33 @@ const getSellerPayoutReceiptTemplate = (): string => {
   return sellerPayoutReceiptTemplateCache
 }
 
+const emailFooterTemplatePath = path.join(__dirname, 'EmailFooter.hbs')
+let emailFooterTemplateCache: string | null = null
+
+const getEmailFooterTemplate = (): string => {
+  if (emailFooterTemplateCache) return emailFooterTemplateCache
+  emailFooterTemplateCache = fs.readFileSync(emailFooterTemplatePath, 'utf8')
+  return emailFooterTemplateCache
+}
+
 const renderTemplate = (template: string, values: Record<string, string>): string => {
   return template.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '')
+}
+
+export const createEmailFooterHtml = (input: {
+  company_name: string
+  company_email: string
+  company_address: string
+  organization_number: string
+  introText?: string
+}): string => {
+  return renderTemplate(getEmailFooterTemplate(), {
+    company_name: String(input.company_name || '').trim(),
+    company_email: String(input.company_email || '').trim(),
+    company_address: String(input.company_address || '').trim(),
+    organization_number: String(input.organization_number || '').trim(),
+    footer_intro_text: String(input.introText || 'If you have any questions, please contact:').trim(),
+  })
 }
 
 type InvoiceItemInput = {
@@ -135,6 +146,13 @@ export const createDigitalProductEmailHtml = (input: CreateDigitalProductEmailHt
     order_id: String(input.order_id || ''),
     order_date: String(input.order_date || ''),
     product_rows: productRowsHtml || '<tr><td colspan="2" style="padding:14px 16px; text-align:center; font-size:13px; color:#6b7280;">No downloads available.</td></tr>',
+    email_footer: createEmailFooterHtml({
+      company_name: String(input.company.company_name || ''),
+      company_email: String(input.company.company_email || ''),
+      company_address: String(input.company.company_address || ''),
+      organization_number: String(input.company.organization_number || ''),
+      introText: 'If you have any questions about this order, please contact:',
+    }),
   })
 }
 
@@ -270,6 +288,13 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
     private_seller_vat_note: hasPrivateSellerVatZeroItems
       ? '* Item(s) marked with * have 0% VAT because the seller is a private seller.'
       : '',
+    email_footer: createEmailFooterHtml({
+      company_name: String(input.company.company_name || ''),
+      company_email: String(input.company.company_email || ''),
+      company_address: String(input.company.company_address || ''),
+      organization_number: String(input.company.organization_number || ''),
+      introText: 'If you have any questions about this order, please contact:',
+    }),
   })
 }
 
@@ -317,6 +342,13 @@ export const createShipmentNotificationEmailHtml = (input: CreateShipmentNotific
     tracking_number: String(input.tracking_number || ''),
     tracking_url: String(input.tracking_url || '').trim(),
     shipping_address: String(input.shipping_address || 'N/A'),
+    email_footer: createEmailFooterHtml({
+      company_name: String(input.company.company_name || ''),
+      company_email: String(input.company.company_email || ''),
+      company_address: String(input.company.company_address || ''),
+      organization_number: String(input.company.organization_number || ''),
+      introText: 'Questions about your order? Contact us:',
+    }),
   })
 }
 
@@ -349,6 +381,13 @@ export const createSellerPayoutReceiptEmailHtml = (input: CreateSellerPayoutRece
     total_commission: Number(input.total_commission || 0).toFixed(2),
     total_payout: Number(input.total_payout || 0).toFixed(2),
     orders_rows: rowsHtml || '<tr><td colspan="5" style="padding:12px 16px; font-size:13px; color:#6b7280;">No orders included in this payout.</td></tr>',
+    email_footer: createEmailFooterHtml({
+      company_name: String(input.company.company_name || ''),
+      company_email: String(input.company.company_email || ''),
+      company_address: String(input.company.company_address || ''),
+      organization_number: String(input.company.organization_number || ''),
+      introText: 'Questions about this payout? Contact:',
+    }),
   })
 }
 
@@ -371,10 +410,14 @@ export const sendEmail = async (
   }
 
   const useTestSender = Boolean(options?.useTestSender)
+  const smtpUser = String(SMTP.user || EMAIL.address || '').trim()
+  const smtpPass = String(SMTP.pass || '').trim()
+  const defaultTestSender = String(EMAIL.address || '').trim()
+  const fromName = String(SMTP.fromName || 'SellingPlatform').trim()
   const senderEmail = useTestSender
     ? String(options?.testSenderEmail || defaultTestSender).trim()
-    : username
-  const smtpConfigured = Boolean(username && password)
+    : smtpUser
+  const smtpConfigured = Boolean(smtpUser && smtpPass)
 
   if (!smtpConfigured && !useTestSender) {
     throw new Error('SMTP_USER and SMTP_PASS must be configured')
@@ -400,6 +443,15 @@ export const sendEmail = async (
   const looksLikeHtml = /<[^>]+>/.test(body)
   const htmlBody = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
   const textBody = looksLikeHtml ? stripHtml(body) : body
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user: smtpUser,
+      pass: smtpPass,
+    },
+  })
 
   const emailData = {
     ...{

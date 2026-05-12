@@ -33,18 +33,16 @@ export const SMTP = {
   host: process.env.EMAIL_HOST || 'smtp.hostinger.com',
   port: Number(process.env.EMAIL_PORT || 465),
   secure: process.env.EMAIL_SECURE ? process.env.EMAIL_SECURE === 'true' : Number(process.env.EMAIL_PORT || 465) === 465,
-  user: process.env.EMAIL_USER || process.env.EMAIL_ADDRESS || '',
+  user: process.env.EMAIL_ADDRESS || '',
   pass: process.env.EMAIL_PASS || '',
-  fromName: process.env.EMAIL_FROM_NAME || 'SellingPlatform',
+  fromName: process.env.EMAIL_FROM_NAME || 'Admin',
 }
 
 export const EMAIL = {
   address: process.env.EMAIL_ADDRESS || '',
-  companyName: process.env.EMAIL_COMPANY_NAME || 'Smart Embedded System',
-  companyAddress: process.env.EMAIL_COMPANY_ADDRESS || '',
-  companyLogoUrl: String(process.env.EMAIL_COMPANY_LOGO_URL || ''),
-  useTestReceiver: toBool(process.env.EMAIL_USE_TEST_RECEIVER, false),
-  testReceiver: String(process.env.EMAIL_TEST_RECEIVER || ''),
+  companyName: '',
+  companyAddress: '',
+  companyLogoUrl: '',
 }
 
 export const COMPANY_ORGANIZATION_NUMBER = String(process.env.COMPANY_ORGANIZATION_NUMBER || '')

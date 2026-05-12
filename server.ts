@@ -47,6 +47,92 @@ const toBoolSetting = (value: unknown, fallback = false): boolean => {
   return ['1', 'true', 'yes', 'on'].includes(raw)
 }
 
+const SMTP_PASSWORD_SETTING_KEY = 'smtp_password_encrypted'
+
+const getSmtpEncryptionKey = (): Buffer => {
+  const secret = String(process.env.EMAIL_PASSWORD_ENCRYPTION_KEY || config.JWT_SECRET || '').trim()
+  if (!secret) {
+    throw new Error('Missing EMAIL_PASSWORD_ENCRYPTION_KEY or JWT_SECRET for SMTP password encryption')
+  }
+  return crypto.createHash('sha256').update(secret).digest()
+}
+
+const encryptSmtpPassword = (plainTextPassword: string): string => {
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', getSmtpEncryptionKey(), iv)
+  const encrypted = Buffer.concat([cipher.update(plainTextPassword, 'utf8'), cipher.final()])
+  const authTag = cipher.getAuthTag()
+  return `${iv.toString('base64')}:${authTag.toString('base64')}:${encrypted.toString('base64')}`
+}
+
+const decryptSmtpPassword = (encryptedPayload: string): string => {
+  const [ivB64, tagB64, cipherTextB64] = String(encryptedPayload || '').split(':')
+  if (!ivB64 || !tagB64 || !cipherTextB64) {
+    throw new Error('Invalid SMTP password payload format')
+  }
+
+  const iv = Buffer.from(ivB64, 'base64')
+  const authTag = Buffer.from(tagB64, 'base64')
+  const cipherText = Buffer.from(cipherTextB64, 'base64')
+  const decipher = crypto.createDecipheriv('aes-256-gcm', getSmtpEncryptionKey(), iv)
+  decipher.setAuthTag(authTag)
+  const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()])
+  return decrypted.toString('utf8')
+}
+
+const applySmtpPasswordFromStorage = async (): Promise<void> => {
+  await ensureCommissionSettingsTable()
+
+  const [rows] = await db.query<RowDataPacket[]>(
+    'SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1',
+    [SMTP_PASSWORD_SETTING_KEY],
+  )
+
+  const encrypted = String(rows[0]?.setting_value || '').trim()
+  if (!encrypted) return
+
+  try {
+    const decrypted = decryptSmtpPassword(encrypted)
+    config.SMTP.pass = decrypted
+    process.env.EMAIL_PASS = decrypted
+  } catch (error) {
+    console.error('Failed to decrypt stored SMTP password:', error)
+  }
+}
+
+type PlatformCompanyEmailInfo = {
+  company_logo_url: string
+  company_name: string
+  company_email: string
+  company_address: string
+  organization_number: string
+}
+
+const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> => {
+  const [rows] = await db.query<RowDataPacket[]>(
+    `SELECT
+      u.email AS admin_email,
+      p.company_name,
+      p.company_address,
+      p.company_org_number,
+      p.company_logo_url
+     FROM users u
+     LEFT JOIN profiles p ON p.user_id = u.id
+     WHERE u.role = 'admin'
+     ORDER BY p.created_at DESC, u.id ASC
+     LIMIT 1`,
+  )
+
+  const row = rows[0] || {}
+  return {
+    company_logo_url: String(row.company_logo_url || config.EMAIL.companyLogoUrl || '').trim(),
+    company_name: String(row.company_name || config.EMAIL.companyName || 'Smart Embedded System').trim(),
+    company_email: String(config.EMAIL.address || config.SMTP.user || row.admin_email || '').trim(),
+    company_address: String(row.company_address || config.EMAIL.companyAddress || '').trim(),
+    organization_number: String(row.company_org_number || config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
+  }
+}
+
 interface AuthPayload {
   id: number
 }
@@ -173,6 +259,28 @@ const productUpload = upload.fields([
 ])
 
 const supportUpload = upload.array('attachments', 5)
+
+const adminSettingsLogoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      const dir = path.join(__dirname, 'uploads', 'company_logos')
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      cb(null, dir)
+    },
+    filename: (_req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9)
+      cb(null, uniqueSuffix + path.extname(file.originalname))
+    },
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = /jpeg|jpg|png|gif|webp/
+    const extname = allowed.test(path.extname(file.originalname).toLowerCase())
+    const mimetype = allowed.test(file.mimetype)
+    if (extname && mimetype) return cb(null, true)
+    return cb(new Error('Only image files are allowed'))
+  },
+})
 
 // Serve static files for uploaded images
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
@@ -1082,20 +1190,6 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_use_test_receiver', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(Boolean(config.EMAIL.useTestReceiver))],
-    )
-
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_test_receiver', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.EMAIL.testReceiver || '')],
-    )
-
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
        VALUES ('company_organization_number', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
       [String(config.COMPANY_ORGANIZATION_NUMBER || '')],
@@ -1150,11 +1244,6 @@ type RuntimeSettings = {
   promotion_commission_percent: number
   vat_shipping_rate: number
   email_address: string
-  email_company_name: string
-  email_company_address: string
-  email_company_logo_url: string
-  email_use_test_receiver: boolean
-  email_test_receiver: string
   company_organization_number: string
   postnord_customer_number: string
   postnord_debug_logs: boolean
@@ -1166,11 +1255,6 @@ type RuntimeSettings = {
 const applyRuntimeSettings = (settings: RuntimeSettings) => {
   process.env.VAT_SHIPPING_RATE = String(settings.vat_shipping_rate)
   process.env.EMAIL_ADDRESS = settings.email_address
-  process.env.EMAIL_COMPANY_NAME = settings.email_company_name
-  process.env.EMAIL_COMPANY_ADDRESS = settings.email_company_address
-  process.env.EMAIL_COMPANY_LOGO_URL = settings.email_company_logo_url
-  process.env.EMAIL_USE_TEST_RECEIVER = String(settings.email_use_test_receiver)
-  process.env.EMAIL_TEST_RECEIVER = settings.email_test_receiver
   process.env.COMPANY_ORGANIZATION_NUMBER = settings.company_organization_number
   process.env.POSTNORD_CUSTOMER_NUMBER = settings.postnord_customer_number
   process.env.POSTNORD_DEBUG_LOGS = String(settings.postnord_debug_logs)
@@ -1180,11 +1264,6 @@ const applyRuntimeSettings = (settings: RuntimeSettings) => {
 
   VAT_SHIPPING_RATE = settings.vat_shipping_rate
   config.EMAIL.address = settings.email_address
-  config.EMAIL.companyName = settings.email_company_name
-  config.EMAIL.companyAddress = settings.email_company_address
-  config.EMAIL.companyLogoUrl = settings.email_company_logo_url
-  config.EMAIL.useTestReceiver = settings.email_use_test_receiver
-  config.EMAIL.testReceiver = settings.email_test_receiver
   config.POSTNORD.customerNumber = settings.postnord_customer_number
   config.POSTNORD.debugLogs = settings.postnord_debug_logs
   config.POSTNORD.usePortalPricing = settings.postnord_use_portal_pricing
@@ -1193,17 +1272,13 @@ const applyRuntimeSettings = (settings: RuntimeSettings) => {
 
 const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
   await ensureCommissionSettingsTable()
+  await applySmtpPasswordFromStorage()
   const keys = [
     'platform_commission_percent',
     'platform_commission_fixed',
     'promotion_commission_percent',
     'vat_shipping_rate',
     'email_address',
-    'email_company_name',
-    'email_company_address',
-    'email_company_logo_url',
-    'email_use_test_receiver',
-    'email_test_receiver',
     'company_organization_number',
     'postnord_customer_number',
     'postnord_debug_logs',
@@ -1233,11 +1308,6 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     promotion_commission_percent: Number.isFinite(promotionPercent) ? promotionPercent : DEFAULT_PROMOTION_COMMISSION_PERCENT,
     vat_shipping_rate: Number.isFinite(vatShippingRate) ? vatShippingRate : config.VAT_SHIPPING_RATE,
     email_address: String(map.get('email_address') || config.EMAIL.address || ''),
-    email_company_name: String(map.get('email_company_name') || config.EMAIL.companyName || 'Smart Embedded System'),
-    email_company_address: String(map.get('email_company_address') || config.EMAIL.companyAddress || ''),
-    email_company_logo_url: String(map.get('email_company_logo_url') || config.EMAIL.companyLogoUrl || ''),
-    email_use_test_receiver: toBoolSetting(map.get('email_use_test_receiver'), Boolean(config.EMAIL.useTestReceiver)),
-    email_test_receiver: String(map.get('email_test_receiver') || config.EMAIL.testReceiver || ''),
     company_organization_number: String(map.get('company_organization_number') || config.COMPANY_ORGANIZATION_NUMBER || ''),
     postnord_customer_number: String(map.get('postnord_customer_number') || config.POSTNORD.customerNumber || ''),
     postnord_debug_logs: toBoolSetting(map.get('postnord_debug_logs'), Boolean(config.POSTNORD.debugLogs)),
@@ -1551,9 +1621,35 @@ const calculateCommissionBreakdown = (
   }
 }
 
+const commissionUpdateTemplatePath = path.join(__dirname, 'email', 'CommissionUpdateNotice.hbs')
+let commissionUpdateTemplateCache: string | null = null
+
+const getCommissionUpdateTemplate = (): string => {
+  if (commissionUpdateTemplateCache) return commissionUpdateTemplateCache
+  commissionUpdateTemplateCache = fs.readFileSync(commissionUpdateTemplatePath, 'utf8')
+  return commissionUpdateTemplateCache
+}
+
+const emailFooterTemplatePath = path.join(__dirname, 'email', 'EmailFooter.hbs')
+let emailFooterTemplateCache: string | null = null
+
+const getEmailFooterTemplate = (): string => {
+  if (emailFooterTemplateCache) return emailFooterTemplateCache
+  emailFooterTemplateCache = fs.readFileSync(emailFooterTemplatePath, 'utf8')
+  return emailFooterTemplateCache
+}
+
 const sendCommissionUpdateNotificationToSellers = async (payload: {
-  commissionPercent: number
-  commissionFixed: number
+  previous: {
+    commissionPercent: number
+    commissionFixed: number
+    promotionCommissionPercent: number
+  }
+  current: {
+    commissionPercent: number
+    commissionFixed: number
+    promotionCommissionPercent: number
+  }
 }) => {
   const [sellerRows] = await db.query<RowDataPacket[]>(
     `SELECT email
@@ -1573,20 +1669,66 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
     return { sent: 0, failed: 0 }
   }
 
-  const subject = 'Platform commission has been updated'
-  const html = `
-    <div style="font-family: Arial, sans-serif; color:#111827; line-height:1.6;">
-      <h2 style="margin:0 0 12px;">Commission Update Notice</h2>
-      <p style="margin:0 0 10px;">Hello Seller,</p>
-      <p style="margin:0 0 10px;">The platform commission settings have been updated and will apply to new orders.</p>
-      <ul style="margin:0 0 12px 18px; padding:0;">
-        <li>Commission Percentage: <strong>${payload.commissionPercent.toFixed(2)}%</strong></li>
-        <li>Commission Fixed Amount: <strong>${payload.commissionFixed.toFixed(2)} SEK</strong></li>
-      </ul>
-      <p style="margin:0;">If you have any questions, please contact platform support.</p>
-    </div>
-  `
+  const changedRows = [
+    {
+      label: 'Commission Percentage',
+      prev: `${payload.previous.commissionPercent.toFixed(2)}%`,
+      next: `${payload.current.commissionPercent.toFixed(2)}%`,
+      changed: payload.previous.commissionPercent !== payload.current.commissionPercent,
+    },
+    {
+      label: 'Commission Fixed Amount',
+      prev: `${payload.previous.commissionFixed.toFixed(2)} SEK`,
+      next: `${payload.current.commissionFixed.toFixed(2)} SEK`,
+      changed: payload.previous.commissionFixed !== payload.current.commissionFixed,
+    },
+    {
+      label: 'Promotion Commission',
+      prev: `${payload.previous.promotionCommissionPercent.toFixed(2)}%`,
+      next: `${payload.current.promotionCommissionPercent.toFixed(2)}%`,
+      changed: payload.previous.promotionCommissionPercent !== payload.current.promotionCommissionPercent,
+    },
+  ]
 
+  const hasChanges = changedRows.some((row) => row.changed)
+  const changeRowsHtml = changedRows
+    .map((row) => {
+      const rowStyle = row.changed ? 'background-color:#ecfdf5;' : 'background-color:#ffffff;'
+      const marker = row.changed
+        ? '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#047857;color:#ffffff;font-size:11px;font-weight:700;">CHANGED</span>'
+        : '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#e5e7eb;color:#374151;font-size:11px;font-weight:700;">UNCHANGED</span>'
+      return `<tr style="${rowStyle}">
+        <td style="padding:10px;border:1px solid #d1d5db;font-weight:600;">${row.label}</td>
+        <td style="padding:10px;border:1px solid #d1d5db;">${row.prev}</td>
+        <td style="padding:10px;border:1px solid #d1d5db;">${row.next}</td>
+        <td style="padding:10px;border:1px solid #d1d5db;">${marker}</td>
+      </tr>`
+    })
+    .join('')
+
+  const companyInfo = await getPlatformCompanyEmailInfo()
+  const footerHtml = renderTemplate(getEmailFooterTemplate(), {
+    footer_intro_text: 'Questions? Please contact platform support.',
+    company_name: String(companyInfo.company_name || ''),
+    company_email: String(companyInfo.company_email || ''),
+    company_address: String(companyInfo.company_address || ''),
+    organization_number: String(companyInfo.organization_number || ''),
+  })
+
+  const html = renderTemplate(getCommissionUpdateTemplate(), {
+    company_logo_url: String(companyInfo.company_logo_url || '').trim(),
+    company_name: String(companyInfo.company_name || 'Smart Embedded System').trim(),
+    company_email: String(companyInfo.company_email || '').trim(),
+    company_address: String(companyInfo.company_address || '').trim(),
+    organization_number: String(companyInfo.organization_number || '').trim(),
+    change_rows: changeRowsHtml,
+    changes_note: hasChanges
+      ? 'Highlighted rows are the values that changed.'
+      : 'No value changed since the last notification; this is a manual reminder email.',
+    email_footer: footerHtml,
+  })
+
+  const subject = 'Platform commission has been updated'
   const results = await Promise.allSettled(
     sellerEmails.map((email) => sendEmail(email, subject, html)),
   )
@@ -2723,6 +2865,51 @@ app.put('/api/settings/preferences', async (req: Request, res: Response) => {
   }
 })
 
+app.post('/api/settings/change-password', async (req: Request, res: Response) => {
+  const auth = await requireSellerOrAdmin(req, res)
+  if (!auth) return
+
+  const currentPassword = String(req.body?.current_password || req.body?.currentPassword || '')
+  const newPassword = String(req.body?.new_password || req.body?.newPassword || '')
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Current password and new password are required.' })
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters.' })
+  }
+
+  try {
+    const [rows] = await db.query<RowDataPacket[]>(
+      'SELECT password FROM users WHERE id = ? LIMIT 1',
+      [auth.id],
+    )
+
+    if (!rows.length || !rows[0].password) {
+      return res.status(404).json({ message: 'User not found.' })
+    }
+
+    const currentMatches = await bcrypt.compare(currentPassword, String(rows[0].password))
+    if (!currentMatches) {
+      return res.status(400).json({ message: 'Current password is incorrect.' })
+    }
+
+    const sameAsCurrent = await bcrypt.compare(newPassword, String(rows[0].password))
+    if (sameAsCurrent) {
+      return res.status(400).json({ message: 'New password must be different from current password.' })
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10)
+    await db.query('UPDATE users SET password = ? WHERE id = ? LIMIT 1', [hashedPassword, auth.id])
+
+    return res.json({ success: true, message: 'Password changed successfully.' })
+  } catch (error) {
+    console.error('Change password error:', error)
+    return res.status(500).json({ message: 'Failed to change password.' })
+  }
+})
+
 app.get('/api/admin/settings/commission', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
   if (!auth) return
@@ -2788,25 +2975,62 @@ app.put('/api/admin/settings/commission', async (req: Request, res: Response) =>
       [String(promotionCommissionPercent)],
     )
 
-    const emailResult = await sendCommissionUpdateNotificationToSellers({
-      commissionPercent,
-      commissionFixed,
-    })
-
     return res.json({
       success: true,
       message: 'Commission settings updated successfully.',
       commission_percent: commissionPercent,
       commission_fixed: commissionFixed,
       promotion_commission_percent: promotionCommissionPercent,
+    })
+  } catch (error) {
+    console.error('Admin commission settings update error:', error)
+    return res.status(500).json({ message: 'Failed to update commission settings' })
+  }
+})
+
+app.post('/api/admin/settings/commission/send-email', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const previousPercentRaw = Number(req.body?.previous_commission_percent)
+  const previousFixedRaw = Number(req.body?.previous_commission_fixed)
+  const previousPromotionPercentRaw = Number(req.body?.previous_promotion_commission_percent)
+
+  try {
+    const current = await getCommissionSettings()
+
+    const previous = {
+      commissionPercent: Number.isFinite(previousPercentRaw)
+        ? roundToTwo(previousPercentRaw)
+        : current.percent,
+      commissionFixed: Number.isFinite(previousFixedRaw)
+        ? roundToTwo(previousFixedRaw)
+        : current.fixed,
+      promotionCommissionPercent: Number.isFinite(previousPromotionPercentRaw)
+        ? roundToTwo(previousPromotionPercentRaw)
+        : current.promotionPercent,
+    }
+
+    const emailResult = await sendCommissionUpdateNotificationToSellers({
+      previous,
+      current: {
+        commissionPercent: roundToTwo(current.percent),
+        commissionFixed: roundToTwo(current.fixed),
+        promotionCommissionPercent: roundToTwo(current.promotionPercent),
+      },
+    })
+
+    return res.json({
+      success: true,
+      message: 'Commission update email sent successfully.',
       seller_notification: {
         sent: emailResult.sent,
         failed: emailResult.failed,
       },
     })
   } catch (error) {
-    console.error('Admin commission settings update error:', error)
-    return res.status(500).json({ message: 'Failed to update commission settings' })
+    console.error('Admin commission notification send error:', error)
+    return res.status(500).json({ message: 'Failed to send commission update email' })
   }
 })
 
@@ -2840,11 +3064,6 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
     const values: Array<[string, string]> = [
       ['vat_shipping_rate', String(vatShippingRate)],
       ['email_address', String(payload.email_address || '').trim()],
-      ['email_company_name', String(payload.email_company_name || '').trim()],
-      ['email_company_address', String(payload.email_company_address || '').trim()],
-      ['email_company_logo_url', String(payload.email_company_logo_url || '').trim()],
-      ['email_use_test_receiver', String(Boolean(payload.email_use_test_receiver))],
-      ['email_test_receiver', String(payload.email_test_receiver || '').trim()],
       ['company_organization_number', String(payload.company_organization_number || '').trim()],
       ['postnord_customer_number', String(payload.postnord_customer_number || '').trim()],
       ['postnord_debug_logs', String(Boolean(payload.postnord_debug_logs))],
@@ -2868,6 +3087,75 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Admin runtime settings update error:', error)
     return res.status(500).json({ message: 'Failed to update runtime settings' })
+  }
+})
+
+app.post('/api/admin/settings/runtime/email-password', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const plainTextPassword = String(req.body?.email_password || '')
+
+  if (!plainTextPassword.trim()) {
+    return res.status(400).json({ message: 'email_password is required' })
+  }
+
+  try {
+    await ensureCommissionSettingsTable()
+
+    const encryptedPassword = encryptSmtpPassword(plainTextPassword)
+    if (encryptedPassword.length > 255) {
+      return res.status(400).json({ message: 'email_password is too long' })
+    }
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [SMTP_PASSWORD_SETTING_KEY, encryptedPassword],
+    )
+
+    config.SMTP.pass = plainTextPassword
+    process.env.EMAIL_PASS = plainTextPassword
+
+    return res.json({ success: true, message: 'Email password updated successfully.' })
+  } catch (error) {
+    console.error('Admin email password update error:', error)
+    return res.status(500).json({ message: 'Failed to update email password' })
+  }
+})
+
+app.post('/api/admin/settings/runtime/company-logo', adminSettingsLogoUpload.single('companyLogo'), async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const file = req.file
+  if (!file) {
+    return res.status(400).json({ message: 'No company logo file provided.' })
+  }
+
+  const companyLogoUrl = `/uploads/company_logos/${file.filename}`
+
+  try {
+    await ensureCommissionSettingsTable()
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('email_company_logo_url', ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [companyLogoUrl],
+    )
+
+    const settings = await getRuntimeSettings()
+    applyRuntimeSettings(settings)
+
+    return res.json({
+      success: true,
+      email_company_logo_url: companyLogoUrl,
+      settings,
+    })
+  } catch (error) {
+    console.error('Admin company logo upload error:', error)
+    return res.status(500).json({ message: 'Failed to upload company logo.' })
   }
 })
 
@@ -4917,14 +5205,9 @@ app.post('/api/admin/orders/payout', async (req: Request, res: Response) => {
 
       const sellerEmail = String(sellerProfile?.seller_email || '').trim()
       if (sellerEmail) {
+        const companyInfo = await getPlatformCompanyEmailInfo()
         const payoutEmailHtml = createSellerPayoutReceiptEmailHtml({
-          company: {
-            company_logo_url: String(config.EMAIL.companyLogoUrl || '').trim(),
-            company_name: String(config.EMAIL.companyName || 'Smart Embedded System').trim(),
-            company_email: String(config.EMAIL.address || config.SMTP.user || '').trim(),
-            company_address: String(config.EMAIL.companyAddress || '').trim(),
-            organization_number: String(config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
-          },
+          company: companyInfo,
           seller_name: sellerName,
           payout_reference: reference,
           payout_date: String(payoutDate || ''),
@@ -7283,8 +7566,6 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
     // Charge customer shipping fee WITH VAT
     const finalTotal = commissionBreakdown.totalGrandAmount
-    const useTestReceiver = config.EMAIL.useTestReceiver
-    const testReceiverEmail = config.EMAIL.testReceiver
 
     // 2. Verify payment (Stripe card or Swish)
     let paymentReferenceId = ''
@@ -7566,14 +7847,10 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         .filter((part) => Boolean(part && String(part).trim()))
         .join(', ')
 
+      const companyInfo = await getPlatformCompanyEmailInfo()
+
       const html = createInvoiceEmailHtml({
-        company: {
-          company_logo_url: String(config.EMAIL.companyLogoUrl || '').trim(),
-          company_name: String(config.EMAIL.companyName || 'Smart Embedded System').trim(),
-          company_email: String(config.EMAIL.address || config.SMTP.user || '').trim(),
-          company_address: String(config.EMAIL.companyAddress || '').trim(),
-          organization_number: String(config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
-        },
+        company: companyInfo,
         customer_name: String(customerRows[0].name || 'Customer'),
         order_id: orderIdsSummary,
         order_date: new Date().toLocaleDateString('en-US', {
@@ -7594,7 +7871,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         items: allInvoiceItems,
       })
 
-      const receiverEmail = useTestReceiver ? testReceiverEmail : String(customerRows[0].email || '')
+      const receiverEmail = String(customerRows[0].email || '')
       if (receiverEmail) {
         const subject = `Invoice for Orders ${orderIdsSummary}`
         await sendEmail(receiverEmail, subject, html)
@@ -7609,14 +7886,9 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     try {
       if (allDigitalDownloadTokens.length > 0) {
         const backendBaseUrl = getServerBaseUrl(req)
+        const companyInfo = await getPlatformCompanyEmailInfo()
         const digitalEmailHtml = createDigitalProductEmailHtml({
-          company: {
-            company_logo_url: String(config.EMAIL.companyLogoUrl || '').trim(),
-            company_name: String(config.EMAIL.companyName || 'Smart Embedded System').trim(),
-            company_email: String(config.EMAIL.address || config.SMTP.user || '').trim(),
-            company_address: String(config.EMAIL.companyAddress || '').trim(),
-            organization_number: String(config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
-          },
+          company: companyInfo,
           customer_name: String(customerRows[0].name || 'Customer'),
           order_id: `#${groupOrderId}`,
           order_date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
@@ -7625,9 +7897,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
             download_url: `${backendBaseUrl}/api/public/download/${t.token}`,
           })),
         })
-        const digitalReceiverEmail = useTestReceiver
-          ? testReceiverEmail
-          : String(customerRows[0].email || '')
+        const digitalReceiverEmail = String(customerRows[0].email || '')
         if (digitalReceiverEmail) {
           await sendEmail(
             digitalReceiverEmail,
@@ -8558,8 +8828,6 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
 
   const orderId = Number(req.params.id)
   const smtpConfigured = Boolean((config.SMTP.user || config.EMAIL.address) && config.SMTP.pass)
-  const useTestReceiver = config.EMAIL.useTestReceiver
-  const testReceiverEmail = config.EMAIL.testReceiver
 
   if (!Number.isFinite(orderId) || orderId <= 0) {
     return res.status(400).json({ message: 'Invalid order id' })
@@ -8663,14 +8931,10 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
       .filter((part) => Boolean(part && String(part).trim()))
       .join(', ')
 
+    const companyInfo = await getPlatformCompanyEmailInfo()
+
     const html = createInvoiceEmailHtml({
-      company: {
-        company_logo_url: String(config.EMAIL.companyLogoUrl || '').trim(),
-        company_name: String(config.EMAIL.companyName || 'Smart Embedded System').trim(),
-        company_email: String(config.EMAIL.address || config.SMTP.user || '').trim(),
-        company_address: String(config.EMAIL.companyAddress || '').trim(),
-        organization_number: String(config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
-      },
+      company: companyInfo,
       customer_name: String(order.customer_name || 'Customer'),
       order_id: String(order.order_id || order.id),
       order_date: new Date(order.order_date).toLocaleDateString('en-US', {
@@ -8688,7 +8952,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
       items: invoiceItems,
     })
 
-    const receiverEmail = useTestReceiver ? testReceiverEmail : String(order.customer_email)
+    const receiverEmail = String(order.customer_email)
 
     if (!receiverEmail) {
       return res.status(400).json({ message: 'Receiver email is missing' })
@@ -8702,7 +8966,6 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
       order_id: order.order_id,
       customer_email: order.customer_email,
       receiver_email: receiverEmail,
-      use_test_receiver: useTestReceiver,
       smtp_configured: smtpConfigured,
       sender_email: config.SMTP.user || config.EMAIL.address || null,
     })
@@ -8838,14 +9101,9 @@ app.put('/api/orders/:id', async (req: Request, res: Response) => {
               ? `${defaultTrackingBase}${encodeURIComponent(trackingNumber)}`
               : null
             const finalTrackingUrl = trackingUrl || defaultTrackingUrl || ''
+            const companyInfo = await getPlatformCompanyEmailInfo()
             const html = createShipmentNotificationEmailHtml({
-              company: {
-                company_logo_url: String(config.EMAIL.companyLogoUrl || '').trim(),
-                company_name: String(config.EMAIL.companyName || 'Smart Embedded System').trim(),
-                company_email: String(config.EMAIL.address || config.SMTP.user || '').trim(),
-                company_address: String(config.EMAIL.companyAddress || '').trim(),
-                organization_number: String(config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
-              },
+              company: companyInfo,
               customer_name: String(o.customer_name || 'Customer'),
               order_id: String(o.order_id || orderId),
               order_date: o.order_date ? new Date(o.order_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '',
@@ -10083,4 +10341,15 @@ const startServer = (port: number) => {
   })
 }
 
-startServer(DEFAULT_PORT)
+const bootstrapAndStartServer = async () => {
+  try {
+    const settings = await getRuntimeSettings()
+    applyRuntimeSettings(settings)
+  } catch (error) {
+    console.error('Failed to preload runtime settings. Starting with environment defaults.', error)
+  }
+
+  startServer(DEFAULT_PORT)
+}
+
+bootstrapAndStartServer()

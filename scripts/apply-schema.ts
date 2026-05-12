@@ -105,7 +105,7 @@ async function main() {
 }
 
 async function seedAdminUser(conn: mysql.Connection) {
-  const DEFAULT_ADMIN_EMAIL = 'admin@admin.com'
+  const DEFAULT_ADMIN_EMAIL = 'experts.town.ab@gmail.com'
   const DEFAULT_ADMIN_PASSWORD = 'Admin1234!'
 
   const [rows] = await conn.query<mysql.RowDataPacket[]>(
