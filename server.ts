@@ -370,6 +370,7 @@ let hasBankAccountsTableCache: boolean | null = null
 let hasCommissionSettingsTableCache: boolean | null = null
 let hasSupportMessagesTableCache: boolean | null = null
 let hasShipmentLabelsTableCache: boolean | null = null
+let hasAccountingStepChecksTableCache: boolean | null = null
 
 const pendingTwoFaSecrets = new Map<number, { secret: string; expiresAt: number }>()
 const authCaptchaChallenges = new Map<string, { answer: string; expiresAt: number }>()
@@ -1162,6 +1163,104 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('stripe_payment_fixed_cost', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['0'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('stripe_payment_percent_cost', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['0'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('swish_payment_fixed_cost', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['0'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('swish_payment_percent_cost', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['0'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_main_bank', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['1930'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_stripe_clearing', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['1580'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_tax', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['1630'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_seller_liability', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['2890'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_output_vat', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['2610'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_output_vat_reverse', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['2614'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_input_vat', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['2640'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_commission_revenue', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['3001'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_stripe_fees', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['6040'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('account_bank_costs', ?)
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+      ['6570'],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
        VALUES ('email_address', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
       [String(config.EMAIL.address || '')],
@@ -1243,6 +1342,20 @@ type RuntimeSettings = {
   platform_commission_fixed: number
   promotion_commission_percent: number
   vat_shipping_rate: number
+  stripe_payment_fixed_cost: number
+  stripe_payment_percent_cost: number
+  swish_payment_fixed_cost: number
+  swish_payment_percent_cost: number
+  account_main_bank: string
+  account_stripe_clearing: string
+  account_tax: string
+  account_seller_liability: string
+  account_output_vat: string
+  account_output_vat_reverse: string
+  account_input_vat: string
+  account_commission_revenue: string
+  account_stripe_fees: string
+  account_bank_costs: string
   email_address: string
   company_organization_number: string
   postnord_customer_number: string
@@ -1278,6 +1391,20 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     'platform_commission_fixed',
     'promotion_commission_percent',
     'vat_shipping_rate',
+    'stripe_payment_fixed_cost',
+    'stripe_payment_percent_cost',
+    'swish_payment_fixed_cost',
+    'swish_payment_percent_cost',
+    'account_main_bank',
+    'account_stripe_clearing',
+    'account_tax',
+    'account_seller_liability',
+    'account_output_vat',
+    'account_output_vat_reverse',
+    'account_input_vat',
+    'account_commission_revenue',
+    'account_stripe_fees',
+    'account_bank_costs',
     'email_address',
     'company_organization_number',
     'postnord_customer_number',
@@ -1301,12 +1428,30 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
   const platformFixed = Number(map.get('platform_commission_fixed'))
   const promotionPercent = Number(map.get('promotion_commission_percent'))
   const vatShippingRate = Number(map.get('vat_shipping_rate'))
+  const stripePaymentFixedCost = Number(map.get('stripe_payment_fixed_cost'))
+  const stripePaymentPercentCost = Number(map.get('stripe_payment_percent_cost'))
+  const swishPaymentFixedCost = Number(map.get('swish_payment_fixed_cost'))
+  const swishPaymentPercentCost = Number(map.get('swish_payment_percent_cost'))
 
   return {
     platform_commission_percent: Number.isFinite(platformPercent) ? platformPercent : DEFAULT_PLATFORM_COMMISSION_PERCENT,
     platform_commission_fixed: Number.isFinite(platformFixed) ? platformFixed : DEFAULT_PLATFORM_COMMISSION_FIXED,
     promotion_commission_percent: Number.isFinite(promotionPercent) ? promotionPercent : DEFAULT_PROMOTION_COMMISSION_PERCENT,
     vat_shipping_rate: Number.isFinite(vatShippingRate) ? vatShippingRate : config.VAT_SHIPPING_RATE,
+    stripe_payment_fixed_cost: Number.isFinite(stripePaymentFixedCost) ? stripePaymentFixedCost : 0,
+    stripe_payment_percent_cost: Number.isFinite(stripePaymentPercentCost) ? stripePaymentPercentCost : 0,
+    swish_payment_fixed_cost: Number.isFinite(swishPaymentFixedCost) ? swishPaymentFixedCost : 0,
+    swish_payment_percent_cost: Number.isFinite(swishPaymentPercentCost) ? swishPaymentPercentCost : 0,
+    account_main_bank: String(map.get('account_main_bank') || '1930'),
+    account_stripe_clearing: String(map.get('account_stripe_clearing') || '1580'),
+    account_tax: String(map.get('account_tax') || '1630'),
+    account_seller_liability: String(map.get('account_seller_liability') || '2890'),
+    account_output_vat: String(map.get('account_output_vat') || '2610'),
+    account_output_vat_reverse: String(map.get('account_output_vat_reverse') || '2614'),
+    account_input_vat: String(map.get('account_input_vat') || '2640'),
+    account_commission_revenue: String(map.get('account_commission_revenue') || '3001'),
+    account_stripe_fees: String(map.get('account_stripe_fees') || '6040'),
+    account_bank_costs: String(map.get('account_bank_costs') || '6570'),
     email_address: String(map.get('email_address') || config.EMAIL.address || ''),
     company_organization_number: String(map.get('company_organization_number') || config.COMPANY_ORGANIZATION_NUMBER || ''),
     postnord_customer_number: String(map.get('postnord_customer_number') || config.POSTNORD.customerNumber || ''),
@@ -1343,6 +1488,30 @@ const ensureSupportMessagesTable = async () => {
   } catch (error) {
     hasSupportMessagesTableCache = null
     console.error('Failed ensuring support_messages table:', error)
+  }
+}
+
+const ensureAccountingStepChecksTable = async () => {
+  try {
+    if (hasAccountingStepChecksTableCache === true) return
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS accounting_step_checks (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        selection_key VARCHAR(255) NOT NULL,
+        step_name VARCHAR(255) NOT NULL,
+        is_checked TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_selection_step (selection_key, step_name),
+        INDEX idx_selection_key (selection_key)
+      )
+    `)
+
+    hasAccountingStepChecksTableCache = true
+  } catch (error) {
+    hasAccountingStepChecksTableCache = null
+    console.error('Failed ensuring accounting step checks table:', error)
+    throw error
   }
 }
 
@@ -1457,6 +1626,72 @@ const getCommissionSettings = async (): Promise<{ percent: number; fixed: number
 
 const calculateCommissionAmount = (baseAmount: number, commissionRate: number, commissionFixed: number): number => {
   return roundToTwo(Number(baseAmount || 0) * Number(commissionRate || 0) + Number(commissionFixed || 0))
+}
+
+const getPaymentProviderFromReference = (paymentReferenceId?: string | null): 'stripe' | 'swish' | 'unknown' => {
+  const reference = String(paymentReferenceId || '').trim()
+  if (!reference) return 'unknown'
+  if (/^[0-9A-F]{32}$/i.test(reference)) return 'swish'
+  if (reference.startsWith('pi_')) return 'stripe'
+  return 'unknown'
+}
+
+const calculatePaymentProcessorFee = (
+  grandTotal: number,
+  fixedCost: number,
+  percentCost: number,
+): number => {
+  const safeGrandTotal = Number.isFinite(Number(grandTotal)) ? Number(grandTotal) : 0
+  const safeFixed = Number.isFinite(Number(fixedCost)) ? Number(fixedCost) : 0
+  const safePercent = Number.isFinite(Number(percentCost)) ? Number(percentCost) : 0
+  return roundToTwo(safeFixed + (safeGrandTotal * (safePercent / 100)))
+}
+
+const getPaymentProviderCost = (
+  grandTotal: number,
+  paymentIntentId: string | null | undefined,
+  settings: RuntimeSettings,
+): number => {
+  const provider = getPaymentProviderFromReference(paymentIntentId)
+  if (provider === 'stripe') {
+    return calculatePaymentProcessorFee(grandTotal, settings.stripe_payment_fixed_cost, settings.stripe_payment_percent_cost)
+  }
+  if (provider === 'swish') {
+    return calculatePaymentProcessorFee(grandTotal, settings.swish_payment_fixed_cost, settings.swish_payment_percent_cost)
+  }
+  return 0
+}
+
+const allocateGroupFeeAcrossOrders = <T extends { id: number; group_order_id: string; grand_total: number }>(
+  orders: T[],
+  groupFee: number,
+): Map<number, number> => {
+  const totalGrand = orders.reduce((sum, order) => sum + Number(order.grand_total || 0), 0)
+  const allocation = new Map<number, number>()
+
+  if (orders.length === 0) return allocation
+
+  if (groupFee <= 0 || totalGrand <= 0) {
+    for (const order of orders) allocation.set(order.id, 0)
+    return allocation
+  }
+
+  let remainingFee = roundToTwo(groupFee)
+  const ordered = [...orders].sort((a, b) => a.id - b.id)
+
+  ordered.forEach((order, index) => {
+    if (index === ordered.length - 1) {
+      allocation.set(order.id, roundToTwo(Math.max(0, remainingFee)))
+      return
+    }
+
+    const share = Number(order.grand_total || 0) / totalGrand
+    const orderFee = roundToTwo(groupFee * share)
+    remainingFee = roundToTwo(remainingFee - orderFee)
+    allocation.set(order.id, orderFee)
+  })
+
+  return allocation
 }
 
 interface OrderProduct {
@@ -3054,8 +3289,63 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
 
   const payload = req.body || {}
   const vatShippingRate = Number(payload.vat_shipping_rate)
+  const stripePaymentFixedCost = Number(payload.stripe_payment_fixed_cost)
+  const stripePaymentPercentCost = Number(payload.stripe_payment_percent_cost)
+  const swishPaymentFixedCost = Number(payload.swish_payment_fixed_cost)
+  const swishPaymentPercentCost = Number(payload.swish_payment_percent_cost)
+  const normalizeAccountCode = (value: unknown, fallback: string): string => {
+    const code = String(value ?? '').trim()
+    return code || fallback
+  }
+  const accountMainBank = normalizeAccountCode(payload.account_main_bank, '1930')
+  const accountStripeClearing = normalizeAccountCode(payload.account_stripe_clearing, '1580')
+  const accountTax = normalizeAccountCode(payload.account_tax, '1630')
+  const accountSellerLiability = normalizeAccountCode(payload.account_seller_liability, '2890')
+  const accountOutputVat = normalizeAccountCode(payload.account_output_vat, '2610')
+  const accountOutputVatReverse = normalizeAccountCode(payload.account_output_vat_reverse, '2614')
+  const accountInputVat = normalizeAccountCode(payload.account_input_vat, '2640')
+  const accountCommissionRevenue = normalizeAccountCode(payload.account_commission_revenue, '3001')
+  const accountStripeFees = normalizeAccountCode(payload.account_stripe_fees, '6040')
+  const accountBankCosts = normalizeAccountCode(payload.account_bank_costs, '6570')
+
   if (!Number.isFinite(vatShippingRate) || vatShippingRate < 0 || vatShippingRate > 1) {
     return res.status(400).json({ message: 'vat_shipping_rate must be between 0 and 1' })
+  }
+
+  const validateNonNegative = (value: number, fieldName: string) => {
+    if (!Number.isFinite(value) || value < 0) {
+      return `${fieldName} must be a non-negative number`
+    }
+    return null
+  }
+
+  const invalidField =
+    validateNonNegative(stripePaymentFixedCost, 'stripe_payment_fixed_cost') ||
+    validateNonNegative(stripePaymentPercentCost, 'stripe_payment_percent_cost') ||
+    validateNonNegative(swishPaymentFixedCost, 'swish_payment_fixed_cost') ||
+    validateNonNegative(swishPaymentPercentCost, 'swish_payment_percent_cost')
+
+  if (invalidField) {
+    return res.status(400).json({ message: invalidField })
+  }
+
+  const accountFields: Array<[string, string]> = [
+    ['account_main_bank', accountMainBank],
+    ['account_stripe_clearing', accountStripeClearing],
+    ['account_tax', accountTax],
+    ['account_seller_liability', accountSellerLiability],
+    ['account_output_vat', accountOutputVat],
+    ['account_output_vat_reverse', accountOutputVatReverse],
+    ['account_input_vat', accountInputVat],
+    ['account_commission_revenue', accountCommissionRevenue],
+    ['account_stripe_fees', accountStripeFees],
+    ['account_bank_costs', accountBankCosts],
+  ]
+
+  for (const [name, value] of accountFields) {
+    if (!/^\d{3,10}$/.test(String(value))) {
+      return res.status(400).json({ message: `${name} must be 3-10 digits` })
+    }
   }
 
   try {
@@ -3063,6 +3353,20 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
 
     const values: Array<[string, string]> = [
       ['vat_shipping_rate', String(vatShippingRate)],
+      ['stripe_payment_fixed_cost', String(stripePaymentFixedCost)],
+      ['stripe_payment_percent_cost', String(stripePaymentPercentCost)],
+      ['swish_payment_fixed_cost', String(swishPaymentFixedCost)],
+      ['swish_payment_percent_cost', String(swishPaymentPercentCost)],
+      ['account_main_bank', accountMainBank],
+      ['account_stripe_clearing', accountStripeClearing],
+      ['account_tax', accountTax],
+      ['account_seller_liability', accountSellerLiability],
+      ['account_output_vat', accountOutputVat],
+      ['account_output_vat_reverse', accountOutputVatReverse],
+      ['account_input_vat', accountInputVat],
+      ['account_commission_revenue', accountCommissionRevenue],
+      ['account_stripe_fees', accountStripeFees],
+      ['account_bank_costs', accountBankCosts],
       ['email_address', String(payload.email_address || '').trim()],
       ['company_organization_number', String(payload.company_organization_number || '').trim()],
       ['postnord_customer_number', String(payload.postnord_customer_number || '').trim()],
@@ -3087,6 +3391,277 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Admin runtime settings update error:', error)
     return res.status(500).json({ message: 'Failed to update runtime settings' })
+  }
+})
+
+app.post('/api/admin/orders/accounting-preview', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const orderIdsRaw = Array.isArray(req.body?.order_ids) ? req.body.order_ids : []
+  const orderIds = Array.from(new Set(orderIdsRaw
+    .map((value: any) => Number(value))
+    .filter((value: number) => Number.isFinite(value) && value > 0)))
+
+  if (orderIds.length === 0) {
+    return res.status(400).json({ message: 'order_ids is required and must contain valid order ids' })
+  }
+
+  try {
+    await ensureSalesPaymentIntentIdColumn()
+    await ensureAccountingStepChecksTable()
+    const runtimeSettings = await getRuntimeSettings()
+    const placeholders = orderIds.map(() => '?').join(', ')
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT id, order_id, grand_total, commission_amount, payment_intent_id
+       FROM sales
+       WHERE id IN (${placeholders})
+       ORDER BY order_date DESC, id DESC`,
+      orderIds,
+    )
+
+    if (!rows.length) {
+      return res.status(404).json({ message: 'No matching orders found' })
+    }
+
+    const COMMISSION_VAT_RATE = 0.25
+    const REVERSE_CHARGE_VAT_RATE = 0.25
+
+    const accounts = {
+      main_bank: runtimeSettings.account_main_bank,
+      stripe_clearing: runtimeSettings.account_stripe_clearing,
+      tax: runtimeSettings.account_tax,
+      seller_liability: runtimeSettings.account_seller_liability,
+      output_vat: runtimeSettings.account_output_vat,
+      output_vat_reverse: runtimeSettings.account_output_vat_reverse,
+      input_vat: runtimeSettings.account_input_vat,
+      commission_revenue: runtimeSettings.account_commission_revenue,
+      stripe_fees: runtimeSettings.account_stripe_fees,
+      bank_costs: runtimeSettings.account_bank_costs,
+    }
+
+    const vouchers = rows.map((row) => {
+      const saleId = Number(row.id || 0)
+      const orderId = String(row.order_id || '')
+      const grandTotal = roundToTwo(Number(row.grand_total || 0))
+      const commissionGross = roundToTwo(Number(row.commission_amount || 0))
+      const commissionExVat = roundToTwo(commissionGross / (1 + COMMISSION_VAT_RATE))
+      const outputVat = roundToTwo(commissionGross - commissionExVat)
+      const sellerLiability = roundToTwo(grandTotal - commissionGross)
+      const paymentMethod = getPaymentProviderFromReference(String(row.payment_intent_id || ''))
+      const paymentProviderCost = roundToTwo(getPaymentProviderCost(grandTotal, row.payment_intent_id, runtimeSettings))
+      const stripeFeeExVat = roundToTwo(paymentProviderCost / (1 + REVERSE_CHARGE_VAT_RATE))
+      const stripeReverseVat = roundToTwo(paymentProviderCost - stripeFeeExVat)
+      const stripePayoutToBank = roundToTwo(grandTotal - paymentProviderCost)
+
+      const lines: Array<{
+        step: string
+        account: string
+        description: string
+        debit: number
+        credit: number
+      }> = []
+
+      const addLine = (step: string, account: string, description: string, debit = 0, credit = 0) => {
+        lines.push({
+          step,
+          account,
+          description,
+          debit: roundToTwo(Number(debit || 0)),
+          credit: roundToTwo(Number(credit || 0)),
+        })
+      }
+
+      if (paymentMethod === 'swish' || paymentMethod === 'unknown') {
+        addLine('Step 1 Buyer payment', accounts.main_bank, 'Main company bank account', grandTotal, 0)
+        addLine('Step 1 Buyer payment', accounts.seller_liability, 'Seller liability', 0, sellerLiability)
+        addLine('Step 1 Buyer payment', accounts.commission_revenue, 'Commission revenue', 0, commissionExVat)
+        addLine('Step 1 Buyer payment', accounts.output_vat, 'Output VAT 25 percent', 0, outputVat)
+
+        addLine('Step 2 Seller payout', accounts.seller_liability, 'Seller liability', sellerLiability, 0)
+        addLine('Step 2 Seller payout', accounts.main_bank, 'Main company bank account', 0, sellerLiability)
+      } else {
+        addLine('Step 1 Buyer payment to Stripe', accounts.stripe_clearing, 'Fordringar kontokort/kuponger', grandTotal, 0)
+        addLine('Step 1 Buyer payment to Stripe', accounts.seller_liability, 'Seller liability', 0, sellerLiability)
+        addLine('Step 1 Buyer payment to Stripe', accounts.commission_revenue, 'Commission revenue', 0, commissionExVat)
+        addLine('Step 1 Buyer payment to Stripe', accounts.output_vat, 'Output VAT 25 percent', 0, outputVat)
+
+        if (paymentProviderCost > 0) {
+          addLine('Step 2 Stripe fee (reverse charge)', accounts.stripe_fees, 'Kontokortsavgifter', stripeFeeExVat, 0)
+          addLine('Step 2 Stripe fee (reverse charge)', accounts.input_vat, 'Input VAT', stripeReverseVat, 0)
+          addLine('Step 2 Stripe fee (reverse charge)', accounts.output_vat_reverse, 'Output VAT reverse charge', 0, stripeReverseVat)
+          addLine('Step 2 Stripe fee (reverse charge)', accounts.stripe_clearing, 'Fordringar kontokort/kuponger', 0, stripeFeeExVat)
+        }
+
+        addLine('Step 3 Stripe payout to bank', accounts.main_bank, 'Main company bank account', stripePayoutToBank, 0)
+        addLine('Step 3 Stripe payout to bank', accounts.stripe_clearing, 'Fordringar kontokort/kuponger', 0, stripePayoutToBank)
+
+        addLine('Step 4 Seller payout', accounts.seller_liability, 'Seller liability', sellerLiability, 0)
+        addLine('Step 4 Seller payout', accounts.main_bank, 'Main company bank account', 0, sellerLiability)
+      }
+
+      const totalDebit = roundToTwo(lines.reduce((sum, line) => sum + Number(line.debit || 0), 0))
+      const totalCredit = roundToTwo(lines.reduce((sum, line) => sum + Number(line.credit || 0), 0))
+
+      return {
+        sale_id: saleId,
+        order_id: orderId,
+        payment_method: paymentMethod,
+        grand_total: grandTotal,
+        commission_gross: commissionGross,
+        commission_ex_vat: commissionExVat,
+        output_vat: outputVat,
+        seller_liability: sellerLiability,
+        payment_provider_cost: paymentProviderCost,
+        lines,
+        totals: {
+          debit: totalDebit,
+          credit: totalCredit,
+          delta: roundToTwo(totalDebit - totalCredit),
+        },
+      }
+    })
+
+    const combineVoucherLines = (lines: Array<{
+      step: string
+      account: string
+      description: string
+      debit: number
+      credit: number
+    }>) => {
+      const map = new Map<string, {
+        step: string
+        account: string
+        description: string
+        debit: number
+        credit: number
+      }>()
+
+      for (const line of lines) {
+        const key = `${line.step}__${line.account}__${line.description}`
+        const existing = map.get(key)
+        if (!existing) {
+          map.set(key, {
+            step: line.step,
+            account: line.account,
+            description: line.description,
+            debit: roundToTwo(Number(line.debit || 0)),
+            credit: roundToTwo(Number(line.credit || 0)),
+          })
+          continue
+        }
+
+        existing.debit = roundToTwo(existing.debit + Number(line.debit || 0))
+        existing.credit = roundToTwo(existing.credit + Number(line.credit || 0))
+      }
+
+      return Array.from(map.values())
+        .sort((a, b) => {
+          const stepCompare = a.step.localeCompare(b.step)
+          if (stepCompare !== 0) return stepCompare
+          const accountCompare = String(a.account).localeCompare(String(b.account))
+          if (accountCompare !== 0) return accountCompare
+          return String(a.description).localeCompare(String(b.description))
+        })
+    }
+
+    const combinedVoucher = vouchers.length > 1
+      ? (() => {
+        const mergedLines = combineVoucherLines(vouchers.flatMap((voucher) => voucher.lines))
+        const totalDebit = roundToTwo(mergedLines.reduce((sum, line) => sum + Number(line.debit || 0), 0))
+        const totalCredit = roundToTwo(mergedLines.reduce((sum, line) => sum + Number(line.credit || 0), 0))
+
+        return {
+          sale_id: 0,
+          order_id: `COMBINED (${vouchers.length} orders)`,
+          payment_method: 'combined',
+          grand_total: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.grand_total || 0), 0)),
+          commission_gross: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.commission_gross || 0), 0)),
+          commission_ex_vat: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.commission_ex_vat || 0), 0)),
+          output_vat: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.output_vat || 0), 0)),
+          seller_liability: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.seller_liability || 0), 0)),
+          payment_provider_cost: roundToTwo(vouchers.reduce((sum, voucher) => sum + Number(voucher.payment_provider_cost || 0), 0)),
+          lines: mergedLines,
+          totals: {
+            debit: totalDebit,
+            credit: totalCredit,
+            delta: roundToTwo(totalDebit - totalCredit),
+          },
+        }
+      })()
+      : null
+
+    const selectedSaleIds = rows
+      .map((row) => Number(row.id || 0))
+      .filter((id) => id > 0)
+      .sort((a, b) => a - b)
+    const selectionKey = `orders:${selectedSaleIds.join('-')}`
+
+    const stepNames = Array.from(new Set((combinedVoucher ? combinedVoucher.lines : vouchers.flatMap((voucher) => voucher.lines)).map((line) => String(line.step))))
+    const stepChecks: Record<string, boolean> = {}
+    for (const stepName of stepNames) {
+      stepChecks[stepName] = false
+    }
+
+    if (stepNames.length > 0) {
+      const [checkRows] = await db.query<RowDataPacket[]>(
+        `SELECT step_name, is_checked
+         FROM accounting_step_checks
+         WHERE selection_key = ?
+           AND step_name IN (?)`,
+        [selectionKey, stepNames],
+      )
+
+      for (const row of checkRows) {
+        const stepName = String(row.step_name || '')
+        if (!stepName) continue
+        stepChecks[stepName] = Number(row.is_checked || 0) === 1
+      }
+    }
+
+    return res.status(200).json({
+      order_count: vouchers.length,
+      accounts,
+      vouchers,
+      combined_voucher: combinedVoucher,
+      selection_key: selectionKey,
+      step_checks: stepChecks,
+    })
+  } catch (error) {
+    console.error('Admin accounting preview error:', error)
+    return res.status(500).json({ message: 'Failed to generate accounting preview' })
+  }
+})
+
+app.post('/api/admin/orders/accounting-step-check', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const selectionKey = String(req.body?.selection_key || '').trim()
+  const stepName = String(req.body?.step_name || '').trim()
+  const checked = Boolean(req.body?.checked)
+
+  if (!selectionKey) {
+    return res.status(400).json({ message: 'selection_key is required' })
+  }
+
+  if (!stepName) {
+    return res.status(400).json({ message: 'step_name is required' })
+  }
+
+  try {
+    await ensureAccountingStepChecksTable()
+    await db.query(
+      `INSERT INTO accounting_step_checks (selection_key, step_name, is_checked)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE is_checked = VALUES(is_checked)`,
+      [selectionKey, stepName, checked ? 1 : 0],
+    )
+
+    return res.status(200).json({ success: true })
+  } catch (error) {
+    console.error('Admin accounting step check update error:', error)
+    return res.status(500).json({ message: 'Failed to update accounting step status' })
   }
 })
 
@@ -4855,6 +5430,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
 
   try {
     await Promise.all([ensureSalesPayoutColumns(), ensureSalesPaymentIntentIdColumn()])
+    const runtimeSettings = await getRuntimeSettings()
     const [paymentDateColumnExists, paymentIntentIdColumnExists] = await Promise.all([
       hasSalesPayoutPaymentDateColumn(),
       hasSalesPaymentIntentIdColumn(),
@@ -4972,6 +5548,8 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
           discount_amount: Number(row.discount_amount || 0),
           grand_total: Number(row.grand_total || 0),
           commission_amount: Number(row.commission_amount || 0),
+          payment_provider_cost: getPaymentProviderCost(Number(row.grand_total || 0), row.payment_intent_id, runtimeSettings),
+          profit: roundToTwo(Number(row.commission_amount || 0) - getPaymentProviderCost(Number(row.grand_total || 0), row.payment_intent_id, runtimeSettings)),
           payout_status: row.payout_status,
           payout_payment_date: row.payout_payment_date || (row.payout_status === 'paid' ? row.updated_at : null),
           seller_net_amount: calculateNetEarning(row.grand_total, row.tax_amount, row.commission_amount),
@@ -5757,6 +6335,63 @@ app.delete('/api/admin/sellers/:sellerId', async (req: Request, res: Response) =
   } catch (error) {
     console.error('Failed to delete seller by id:', error)
     return res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Admin Bulk Email Sellers =====
+app.post('/api/admin/sellers/bulk-email', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const sellerIdsRaw = Array.isArray(req.body?.seller_ids) ? req.body.seller_ids : []
+  const subject = String(req.body?.subject || '').trim()
+  const body = String(req.body?.body || '').trim()
+
+  const sellerIds = sellerIdsRaw
+    .map((v: unknown) => Number(v))
+    .filter((v: number) => Number.isFinite(v) && v > 0)
+
+  if (sellerIds.length === 0) {
+    return res.status(400).json({ message: 'seller_ids is required and must contain valid seller ids' })
+  }
+  if (!subject) {
+    return res.status(400).json({ message: 'subject is required' })
+  }
+  if (!body) {
+    return res.status(400).json({ message: 'body is required' })
+  }
+
+  try {
+    const placeholders = sellerIds.map(() => '?').join(', ')
+    const [sellerRows] = await db.query<RowDataPacket[]>(
+      `SELECT email FROM users WHERE id IN (${placeholders}) AND role = 'seller' AND email IS NOT NULL AND email <> ''`,
+      sellerIds,
+    )
+
+    const sellerEmails = sellerRows.map((row) => String(row.email || '').trim()).filter(Boolean)
+
+    // Get admin email
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const adminEmail = companyInfo.company_email
+
+    const allRecipients = Array.from(new Set([...sellerEmails, ...(adminEmail ? [adminEmail] : [])]))
+
+    let sent = 0
+    let failed = 0
+    for (const email of allRecipients) {
+      try {
+        await sendEmail(email, subject, body)
+        sent++
+      } catch (err) {
+        console.error(`[bulk-email] Failed to send to ${email}:`, err)
+        failed++
+      }
+    }
+
+    return res.json({ success: true, sent, failed })
+  } catch (error) {
+    console.error('Admin bulk email sellers error:', error)
+    return res.status(500).json({ message: 'Failed to send emails' })
   }
 })
 
