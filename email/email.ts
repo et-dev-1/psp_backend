@@ -3,10 +3,23 @@ import path from 'path'
 const nodemailer = require('nodemailer')
 import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER } from '../config'
 
-const host = SMTP.host
-const port = SMTP.port
-const secure = SMTP.secure
+// Do NOT capture host/port/secure at module load — read live from SMTP object at call time
 const organizationNumber = COMPANY_ORGANIZATION_NUMBER || 'N/A'
+
+type EmailAccountInfo = { email_address: string; plain_password: string }
+type EmailAccountResolver = (purpose: string) => Promise<EmailAccountInfo | null>
+type SmtpSettingsResolver = () => Promise<{ host: string; port: number; secure: boolean } | null>
+
+let emailAccountResolver: EmailAccountResolver | null = null
+let smtpSettingsResolver: SmtpSettingsResolver | null = null
+
+export const setEmailAccountResolver = (fn: EmailAccountResolver): void => {
+  emailAccountResolver = fn
+}
+
+export const setSmtpSettingsResolver = (fn: SmtpSettingsResolver): void => {
+  smtpSettingsResolver = fn
+}
 
 const stripHtml = (value: string): string => {
   return value
@@ -68,6 +81,42 @@ const getEmailFooterTemplate = (): string => {
   return emailFooterTemplateCache
 }
 
+const sellerVerificationTemplatePath = path.join(__dirname, 'SellerVerification.hbs')
+let sellerVerificationTemplateCache: string | null = null
+
+const getSellerVerificationTemplate = (): string => {
+  if (sellerVerificationTemplateCache) return sellerVerificationTemplateCache
+  sellerVerificationTemplateCache = fs.readFileSync(sellerVerificationTemplatePath, 'utf8')
+  return sellerVerificationTemplateCache
+}
+
+const sellerPasswordResetTemplatePath = path.join(__dirname, 'SellerPasswordReset.hbs')
+let sellerPasswordResetTemplateCache: string | null = null
+
+const getSellerPasswordResetTemplate = (): string => {
+  if (sellerPasswordResetTemplateCache) return sellerPasswordResetTemplateCache
+  sellerPasswordResetTemplateCache = fs.readFileSync(sellerPasswordResetTemplatePath, 'utf8')
+  return sellerPasswordResetTemplateCache
+}
+
+const sellerProfileStatusTemplatePath = path.join(__dirname, 'SellerProfileStatus.hbs')
+let sellerProfileStatusTemplateCache: string | null = null
+
+const getSellerProfileStatusTemplate = (): string => {
+  if (sellerProfileStatusTemplateCache) return sellerProfileStatusTemplateCache
+  sellerProfileStatusTemplateCache = fs.readFileSync(sellerProfileStatusTemplatePath, 'utf8')
+  return sellerProfileStatusTemplateCache
+}
+
+const productStatusTemplatePath = path.join(__dirname, 'ProductStatus.hbs')
+let productStatusTemplateCache: string | null = null
+
+const getProductStatusTemplate = (): string => {
+  if (productStatusTemplateCache) return productStatusTemplateCache
+  productStatusTemplateCache = fs.readFileSync(productStatusTemplatePath, 'utf8')
+  return productStatusTemplateCache
+}
+
 const renderTemplate = (template: string, values: Record<string, string>): string => {
   return template.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '')
 }
@@ -87,6 +136,51 @@ export const createEmailFooterHtml = (input: {
     footer_intro_text: String(input.introText || 'If you have any questions, please contact:').trim(),
   })
 }
+
+type EmailCompanyInfo = {
+  company_logo_url: string
+  company_name: string
+  company_email: string
+  company_address: string
+  organization_number: string
+}
+
+export const createSellerVerificationEmailHtml = (input: { company: EmailCompanyInfo; verification_url: string }): string => {
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+  return renderTemplate(getSellerVerificationTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: String(input.company.organization_number || '').trim(),
+    verification_url: String(input.verification_url || '').trim(),
+    email_footer: footer,
+  })
+}
+
+export const createSellerPasswordResetEmailHtml = (input: { company: EmailCompanyInfo; reset_url: string }): string => {
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+  return renderTemplate(getSellerPasswordResetTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: String(input.company.organization_number || '').trim(),
+    reset_url: String(input.reset_url || '').trim(),
+    email_footer: footer,
+  })
+}
+
 
 type InvoiceItemInput = {
   product_name: string
@@ -127,8 +221,8 @@ export const createDigitalProductEmailHtml = (input: CreateDigitalProductEmailHt
 
       return `<tr style="background-color:${rowBg};">
         <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${item.product_name}</td>
-        <td align="left" style="padding:14px 16px;">
-          <a href="${item.download_url}" style="display:inline-block; padding:8px 16px; background-color:#111827; color:#ffffff; font-size:12px; font-weight:700; text-decoration:none; border-radius:8px;">Download</a>
+        <td align="left" style="padding:12px 16px;">
+          <a href="${item.download_url}" style="display:inline-block; padding:8px 20px; background-color:#111827; color:#ffffff; text-decoration:none; border-radius:8px; font-size:13px; font-weight:600;">Download</a>
         </td>
       </tr>`
     })
@@ -391,29 +485,101 @@ export const createSellerPayoutReceiptEmailHtml = (input: CreateSellerPayoutRece
   })
 }
 
+type SendEmailOptions = {
+  useTestSender?: boolean
+  testSenderEmail?: string
+  attachments?: Array<{
+    filename: string
+    path: string
+    contentType?: string
+  }>
+  purpose?: 'sellers' | 'customers' | 'newsletters' | 'contact_form'
+}
+
 export const sendEmail = async (
   receiverEmail: string,
   subject: string,
   body: string,
-  options?: {
-    useTestSender?: boolean
-    testSenderEmail?: string
-    attachments?: Array<{
-      filename: string
-      path: string
-      contentType?: string
-    }>
-  },
+  options?: SendEmailOptions,
 ): Promise<{ success: true; messageId: string }> => {
   if (!receiverEmail || !subject || !body) {
     throw new Error('receiverEmail, subject, and body are required')
   }
 
   const useTestSender = Boolean(options?.useTestSender)
-  const smtpUser = String(SMTP.user || EMAIL.address || '').trim()
-  const smtpPass = String(SMTP.pass || '').trim()
-  const defaultTestSender = String(EMAIL.address || '').trim()
   const fromName = String(SMTP.fromName || 'SellingPlatform').trim()
+
+  // When a purpose is provided, try to load from the email_accounts table
+  if (options?.purpose && !useTestSender) {
+    try {
+      if (emailAccountResolver) {
+        const account = await emailAccountResolver(options.purpose)
+
+        if (account) {
+          const senderEmail = String(account.email_address)
+
+          // Prefer runtime DB settings over env config
+          const runtimeSmtp = smtpSettingsResolver ? await smtpSettingsResolver() : null
+          const smtpHost = runtimeSmtp?.host ?? SMTP.host
+          const smtpPort = runtimeSmtp?.port ?? SMTP.port
+          const smtpSecure = runtimeSmtp?.secure ?? SMTP.secure
+
+          const looksLikeHtml = /<[^>]+>/.test(body)
+          const htmlBody = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
+          const textBody = looksLikeHtml ? stripHtml(body) : body
+
+          const transporter = nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: smtpSecure,
+            ...(smtpPort === 587 && !smtpSecure ? { requireTLS: true } : {}),
+            authMethod: 'LOGIN',
+            auth: {
+              user: senderEmail,
+              pass: account.plain_password,
+            },
+          })
+
+          const info = await transporter.sendMail({
+            from: `"${fromName}" <${senderEmail}>`,
+            to: receiverEmail,
+            subject,
+            text: textBody,
+            html: htmlBody,
+            attachments: options?.attachments,
+          })
+
+          return {
+            success: true,
+            messageId: String(info.messageId || ''),
+          }
+        }
+      }
+    } catch (purposeError) {
+      console.warn(`[sendEmail] Failed to use purpose account (${options.purpose}), falling back to default:`, purposeError)
+    }
+  }
+
+  // Default / fallback behavior
+  let smtpUser = String(SMTP.user || EMAIL.address || '').trim()
+  let smtpPass = String(SMTP.pass || '').trim()
+  const defaultTestSender = String(EMAIL.address || '').trim()
+
+  // If env SMTP not configured, try any active DB account as last resort
+  if ((!smtpUser || !smtpPass) && emailAccountResolver && !useTestSender) {
+    try {
+      const fallbackAccount = await emailAccountResolver('sellers')
+        ?? await emailAccountResolver('customers')
+        ?? await emailAccountResolver('contact_form')
+      if (fallbackAccount) {
+        smtpUser = fallbackAccount.email_address
+        smtpPass = fallbackAccount.plain_password
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   const senderEmail = useTestSender
     ? String(options?.testSenderEmail || defaultTestSender).trim()
     : smtpUser
@@ -443,25 +609,25 @@ export const sendEmail = async (
   const looksLikeHtml = /<[^>]+>/.test(body)
   const htmlBody = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
   const textBody = looksLikeHtml ? stripHtml(body) : body
+
+  // Read live from SMTP config (prefer runtime DB settings over env)
+  const runtimeSmtpFb = smtpSettingsResolver ? await smtpSettingsResolver().catch(() => null) : null
+  const liveHost = runtimeSmtpFb?.host ?? SMTP.host
+  const livePort = runtimeSmtpFb?.port ?? SMTP.port
+  const liveSecure = runtimeSmtpFb?.secure ?? SMTP.secure
+
   const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
+    host: liveHost,
+    port: livePort,
+    secure: liveSecure,
+    // For STARTTLS (port 587, secure=false): require TLS upgrade after connect
+    ...(livePort === 587 && !liveSecure ? { requireTLS: true } : {}),
+    authMethod: 'LOGIN',
     auth: {
       user: smtpUser,
       pass: smtpPass,
     },
   })
-
-  const emailData = {
-    ...{
-      to: receiverEmail,
-      subject,
-      from: senderEmail,
-      organizationNumber,
-    },
-    ...options,
-  }
 
   const info = await transporter.sendMail({
     from: `"${fromName}" <${senderEmail}>`,
@@ -476,6 +642,141 @@ export const sendEmail = async (
     success: true,
     messageId: String(info.messageId || ''),
   }
+}
+
+type SellerProfileStatusEmailInput = {
+  company: EmailCompanyInfo
+  seller_name: string
+  seller_email: string
+  status: 'verified' | 'pending' | 'rejected' | 'blocked'
+  reason?: string | null
+  updated_at: string
+  cta_url: string
+}
+
+export const createSellerProfileStatusEmailHtml = (input: SellerProfileStatusEmailInput): string => {
+  const statusMap: Record<string, { label: string; bg: string; color: string; intro: string; ctaLabel: string; ctaBg: string }> = {
+    verified: {
+      label: 'Approved',
+      bg: '#dcfce7', color: '#15803d',
+      intro: `Great news — your seller profile has been reviewed and approved. You can now list products and start selling on the platform.`,
+      ctaLabel: 'Go to Dashboard',
+      ctaBg: '#16a34a',
+    },
+    pending: {
+      label: 'Pending Review',
+      bg: '#fef9c3', color: '#854d0e',
+      intro: `Thank you for submitting your seller profile. Our admin team will review it shortly. Once approved, you will be able to add products and start selling on the platform.`,
+      ctaLabel: 'View Profile',
+      ctaBg: '#d97706',
+    },
+    rejected: {
+      label: 'Requires Update',
+      bg: '#fee2e2', color: '#b91c1c',
+      intro: `Your seller profile has been reviewed and requires updates before it can be approved. Please read the admin's message below, update your profile, and resubmit.`,
+      ctaLabel: 'Update Profile',
+      ctaBg: '#dc2626',
+    },
+    blocked: {
+      label: 'Account Suspended',
+      bg: '#fff7ed', color: '#c2410c',
+      intro: `Your seller account has been suspended by an administrator. While suspended, all your products are hidden from customers and you cannot list new products. Please contact support if you believe this is a mistake.`,
+      ctaLabel: 'Contact Support',
+      ctaBg: '#ea580c',
+    },
+  }
+  const s = statusMap[input.status] || statusMap['pending']
+  const reason = String(input.reason || '').trim()
+  const reasonBlock = reason
+    ? `<tr><td style="padding:0 32px 20px 32px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-left:4px solid ${s.color}; background:${s.bg}; border-radius:4px; padding:14px 18px;">
+          <tr><td><p style="margin:0 0 4px 0; font-size:12px; font-weight:700; color:${s.color}; text-transform:uppercase; letter-spacing:0.5px;">Message from admin</p>
+          <p style="margin:0; font-size:14px; color:#374151; white-space:pre-wrap;">${reason}</p></td></tr>
+        </table>
+      </td></tr>`
+    : ''
+
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+
+  return renderTemplate(getSellerProfileStatusTemplate(), {
+    company_name: String(input.company.company_name || '').trim(),
+    seller_name: String(input.seller_name || 'Seller').trim(),
+    seller_email: String(input.seller_email || '').trim(),
+    intro_text: s.intro,
+    status_label: s.label,
+    status_bg: s.bg,
+    status_color: s.color,
+    reason_block: reasonBlock,
+    updated_at: input.updated_at,
+    cta_url: input.cta_url,
+    cta_label: s.ctaLabel,
+    cta_bg: s.ctaBg,
+    email_footer: footer,
+  })
+}
+
+type ProductStatusEmailInput = {
+  company: EmailCompanyInfo
+  seller_name: string
+  product_name: string
+  product_id: string | number
+  product_category: string
+  status: 'approved' | 'rejected'
+  rejection_message?: string | null
+  updated_at: string
+  cta_url: string
+}
+
+export const createProductStatusEmailHtml = (input: ProductStatusEmailInput): string => {
+  const isApproved = input.status === 'approved'
+  const statusLabel = isApproved ? 'Approved' : 'Requires Update'
+  const statusBg = isApproved ? '#dcfce7' : '#fee2e2'
+  const statusColor = isApproved ? '#15803d' : '#b91c1c'
+  const intro = isApproved
+    ? `Good news — your product has been reviewed and approved. It is now visible to customers on the platform.`
+    : `Your product requires changes before it can be approved. Please review the feedback below and update your listing.`
+  const ctaLabel = isApproved ? 'View Your Products' : 'Edit Product'
+  const ctaBg = isApproved ? '#16a34a' : '#dc2626'
+
+  const reason = String(input.rejection_message || '').trim()
+  const reasonBlock = reason
+    ? `<tr><td style="padding:0 32px 20px 32px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-left:4px solid #dc2626; background:#fee2e2; border-radius:4px; padding:14px 18px;">
+          <tr><td><p style="margin:0 0 4px 0; font-size:12px; font-weight:700; color:#b91c1c; text-transform:uppercase; letter-spacing:0.5px;">Reason for rejection</p>
+          <p style="margin:0; font-size:14px; color:#374151; white-space:pre-wrap;">${reason}</p></td></tr>
+        </table>
+      </td></tr>`
+    : ''
+
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+
+  return renderTemplate(getProductStatusTemplate(), {
+    company_name: String(input.company.company_name || '').trim(),
+    seller_name: String(input.seller_name || 'Seller').trim(),
+    intro_text: intro,
+    status_label: statusLabel,
+    status_bg: statusBg,
+    status_color: statusColor,
+    product_name: String(input.product_name || '').trim(),
+    product_id: String(input.product_id || '').trim(),
+    product_category: String(input.product_category || '—').trim(),
+    reason_block: reasonBlock,
+    updated_at: input.updated_at,
+    cta_url: input.cta_url,
+    cta_label: ctaLabel,
+    cta_bg: ctaBg,
+    email_footer: footer,
+  })
 }
 
 export default sendEmail

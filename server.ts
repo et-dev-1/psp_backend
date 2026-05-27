@@ -10,7 +10,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { RowDataPacket, ResultSetHeader } from 'mysql2'
-import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, sendEmail } from './email/email'
+import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, sendEmail, setEmailAccountResolver, setSmtpSettingsResolver } from './email/email'
 import { emitToAdmin, emitToSeller, setupWebSocket } from './websocket'
 import { estimateShipmentCost, generateShipmentLabel, trackShipment, type ShipmentAddressInput } from './shipment/shipment'
 import Handlebars from 'handlebars'
@@ -109,6 +109,7 @@ type PlatformCompanyEmailInfo = {
 }
 
 const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> => {
+  // Read admin profile for fallback values
   const [rows] = await db.query<RowDataPacket[]>(
     `SELECT
       u.email AS admin_email,
@@ -122,14 +123,66 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
      ORDER BY p.created_at DESC, u.id ASC
      LIMIT 1`,
   )
-
   const row = rows[0] || {}
+
+  // Read authoritative values from app_settings (set by admin in UI)
+  const settingKeys = ['email_company_name', 'email_company_address', 'email_company_logo_url', 'company_organization_number']
+  const [settingRows] = await db.query<RowDataPacket[]>(
+    `SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN (?)`,
+    [settingKeys],
+  )
+  const settingsMap = new Map<string, string>()
+  for (const sr of settingRows) {
+    settingsMap.set(String(sr.setting_key), String(sr.setting_value || ''))
+  }
+
+  // Resolve logo: prefer app_settings, fallback to profile, then config
+  const rawLogoUrl = (
+    settingsMap.get('email_company_logo_url') ||
+    String(row.company_logo_url || '').trim() ||
+    config.EMAIL.companyLogoUrl ||
+    ''
+  ).trim()
+
+  // Convert relative logo paths to absolute URLs using the configured public base URL
+  let resolvedLogoUrl = rawLogoUrl
+  if (rawLogoUrl && rawLogoUrl.startsWith('/')) {
+    const base = String(config.BACKEND_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
+    if (base) {
+      resolvedLogoUrl = `${base}${rawLogoUrl}`
+    }
+  }
+
   return {
-    company_logo_url: String(row.company_logo_url || config.EMAIL.companyLogoUrl || '').trim(),
-    company_name: String(row.company_name || config.EMAIL.companyName || 'Smart Embedded System').trim(),
-    company_email: String(config.EMAIL.address || config.SMTP.user || row.admin_email || '').trim(),
-    company_address: String(row.company_address || config.EMAIL.companyAddress || '').trim(),
-    organization_number: String(row.company_org_number || config.COMPANY_ORGANIZATION_NUMBER || '').trim(),
+    company_logo_url: resolvedLogoUrl,
+    company_name: (
+      settingsMap.get('email_company_name') ||
+      String(row.company_name || '').trim() ||
+      config.EMAIL.companyName ||
+      ''
+    ).trim(),
+    company_email: await (async () => {
+      // Use the active email account's address as the contact email in the footer
+      try {
+        const [acctRows] = await db.query<RowDataPacket[]>(
+          `SELECT email_address FROM email_accounts WHERE is_active = 1 ORDER BY id ASC LIMIT 1`,
+        )
+        if (acctRows.length) return String(acctRows[0].email_address).trim()
+      } catch { /* ignore */ }
+      return String(config.EMAIL.address || config.SMTP.user || row.admin_email || '').trim()
+    })(),
+    company_address: (
+      settingsMap.get('email_company_address') ||
+      String(row.company_address || '').trim() ||
+      config.EMAIL.companyAddress ||
+      ''
+    ).trim(),
+    organization_number: (
+      settingsMap.get('company_organization_number') ||
+      String(row.company_org_number || '').trim() ||
+      config.COMPANY_ORGANIZATION_NUMBER ||
+      ''
+    ).trim(),
   }
 }
 
@@ -359,6 +412,10 @@ let hasUsersNotifyProductApprovedColumnCache: boolean | null = null
 let hasUsersPreferredThemeColumnCache: boolean | null = null
 let hasProfilePictureUrlColumnCache: boolean | null = null
 let hasProfileDisplayNameColumnCache: boolean | null = null
+let hasUsersPendingDeletionColumnCache: boolean | null = null
+let hasProductSeoMetaColumnCache: boolean | null = null
+let hasProductGenderColumnCache: boolean | null = null
+let hasProductTagsColumnCache: boolean | null = null
 let hasProfilesStatusColumnCache: boolean | null = null
 let hasProfilesStatusReasonColumnCache: boolean | null = null
 let hasProfilesRejectionReasonColumnCache: boolean | null = null
@@ -371,6 +428,8 @@ let hasCommissionSettingsTableCache: boolean | null = null
 let hasSupportMessagesTableCache: boolean | null = null
 let hasShipmentLabelsTableCache: boolean | null = null
 let hasAccountingStepChecksTableCache: boolean | null = null
+let hasEmailAccountsTableCache: boolean | null = null
+let hasEmailAccountPurposesColumnCache: boolean | null = null
 
 const pendingTwoFaSecrets = new Map<number, { secret: string; expiresAt: number }>()
 const authCaptchaChallenges = new Map<string, { answer: string; expiresAt: number }>()
@@ -602,6 +661,23 @@ const ensureUserPreferenceColumns = async () => {
   }
 }
 
+const ensureAccountDeletionColumns = async () => {
+  try {
+    if (hasUsersPendingDeletionColumnCache !== true) {
+      const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM users LIKE 'pending_deletion'")
+      if (rows.length === 0) {
+        await db.query('ALTER TABLE users ADD COLUMN pending_deletion BOOLEAN NOT NULL DEFAULT FALSE')
+        await db.query('ALTER TABLE users ADD COLUMN pending_deletion_requested_at DATETIME NULL')
+      }
+      hasUsersPendingDeletionColumnCache = true
+    }
+  } catch (error) {
+    hasUsersPendingDeletionColumnCache = null
+    console.error('Failed ensuring account deletion columns:', error)
+    throw error
+  }
+}
+
 const hasProductSkuColumn = async (): Promise<boolean> => {
   if (hasProductSkuColumnCache !== null) {
     return hasProductSkuColumnCache
@@ -648,6 +724,57 @@ const hasProductIsPromotedColumn = async (): Promise<boolean> => {
   } catch (error) {
     console.error('Unable to check products.is_promoted column:', error)
     hasProductIsPromotedColumnCache = false
+    return false
+  }
+}
+
+const hasProductSeoMetaColumn = async (): Promise<boolean> => {
+  if (hasProductSeoMetaColumnCache !== null) return hasProductSeoMetaColumnCache
+  try {
+    const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM products LIKE 'seo_meta'")
+    hasProductSeoMetaColumnCache = rows.length > 0
+    if (!hasProductSeoMetaColumnCache) {
+      await db.query("ALTER TABLE products ADD COLUMN seo_meta TEXT NULL")
+      hasProductSeoMetaColumnCache = true
+    }
+    return hasProductSeoMetaColumnCache
+  } catch (error) {
+    console.error('Unable to ensure products.seo_meta column:', error)
+    hasProductSeoMetaColumnCache = null
+    return false
+  }
+}
+
+const hasProductGenderColumn = async (): Promise<boolean> => {
+  if (hasProductGenderColumnCache !== null) return hasProductGenderColumnCache
+  try {
+    const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM products LIKE 'gender'")
+    hasProductGenderColumnCache = rows.length > 0
+    if (!hasProductGenderColumnCache) {
+      await db.query("ALTER TABLE products ADD COLUMN gender VARCHAR(20) NULL")
+      hasProductGenderColumnCache = true
+    }
+    return hasProductGenderColumnCache
+  } catch (error) {
+    console.error('Unable to ensure products.gender column:', error)
+    hasProductGenderColumnCache = null
+    return false
+  }
+}
+
+const hasProductTagsColumn = async (): Promise<boolean> => {
+  if (hasProductTagsColumnCache !== null) return hasProductTagsColumnCache
+  try {
+    const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM products LIKE 'tags'")
+    hasProductTagsColumnCache = rows.length > 0
+    if (!hasProductTagsColumnCache) {
+      await db.query("ALTER TABLE products ADD COLUMN tags JSON NULL")
+      hasProductTagsColumnCache = true
+    }
+    return hasProductTagsColumnCache
+  } catch (error) {
+    console.error('Unable to ensure products.tags column:', error)
+    hasProductTagsColumnCache = null
     return false
   }
 }
@@ -1270,7 +1397,7 @@ const ensureCommissionSettingsTable = async () => {
       `INSERT INTO app_settings (setting_key, setting_value)
        VALUES ('email_company_name', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.EMAIL.companyName || 'Smart Embedded System')],
+      [String(config.EMAIL.companyName || '')],
     )
 
     await db.query(
@@ -1337,6 +1464,51 @@ const ensureCommissionSettingsTable = async () => {
   }
 }
 
+const ensureEmailAccountsTable = async () => {
+  try {
+    if (hasEmailAccountsTableCache === true) return
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS email_accounts (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        email_address VARCHAR(255) NOT NULL,
+        encrypted_password TEXT NOT NULL,
+        purpose ENUM('sellers','customers','newsletters','contact_form') NOT NULL,
+        is_active TINYINT(1) DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_email_accounts_purpose (purpose)
+      )
+    `)
+
+    hasEmailAccountsTableCache = true
+  } catch (error) {
+    hasEmailAccountsTableCache = null
+    console.error('Failed ensuring email accounts table:', error)
+    throw error
+  }
+}
+
+const ensureEmailAccountPurposesColumn = async () => {
+  if (hasEmailAccountPurposesColumnCache === true) return
+  try {
+    await ensureEmailAccountsTable()
+    const [cols] = await db.query<RowDataPacket[]>(
+      `SHOW COLUMNS FROM email_accounts LIKE 'purposes'`,
+    )
+    if (!cols.length) {
+      await db.query(`ALTER TABLE email_accounts ADD COLUMN purposes JSON NULL AFTER purpose`)
+      // Migrate existing single-purpose rows into the new JSON array column
+      await db.query(`UPDATE email_accounts SET purposes = JSON_ARRAY(purpose) WHERE purposes IS NULL AND purpose IS NOT NULL`)
+    }
+    hasEmailAccountPurposesColumnCache = true
+  } catch (error) {
+    hasEmailAccountPurposesColumnCache = null
+    console.error('Failed ensuring email_accounts.purposes column:', error)
+    throw error
+  }
+}
+
 type RuntimeSettings = {
   platform_commission_percent: number
   platform_commission_fixed: number
@@ -1363,6 +1535,9 @@ type RuntimeSettings = {
   postnord_use_portal_pricing: boolean
   postnord_enable_transit_time: boolean
   google_client_id: string
+  smtp_host: string
+  smtp_port: number
+  smtp_secure: string
 }
 
 const applyRuntimeSettings = (settings: RuntimeSettings) => {
@@ -1381,6 +1556,10 @@ const applyRuntimeSettings = (settings: RuntimeSettings) => {
   config.POSTNORD.debugLogs = settings.postnord_debug_logs
   config.POSTNORD.usePortalPricing = settings.postnord_use_portal_pricing
   config.POSTNORD.enableTransitTime = settings.postnord_enable_transit_time
+  config.SMTP.host = settings.smtp_host || config.SMTP.host
+  config.SMTP.port = settings.smtp_port || config.SMTP.port
+  config.SMTP.secure = settings.smtp_secure === 'ssl'
+  config.SMTP.user = settings.email_address || config.SMTP.user
 }
 
 const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
@@ -1412,6 +1591,9 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     'postnord_use_portal_pricing',
     'postnord_enable_transit_time',
     'google_client_id',
+    'smtp_host',
+    'smtp_port',
+    'smtp_secure',
   ]
 
   const [rows] = await db.query<RowDataPacket[]>(
@@ -1459,6 +1641,9 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     postnord_use_portal_pricing: toBoolSetting(map.get('postnord_use_portal_pricing'), Boolean(config.POSTNORD.usePortalPricing)),
     postnord_enable_transit_time: toBoolSetting(map.get('postnord_enable_transit_time'), Boolean(config.POSTNORD.enableTransitTime)),
     google_client_id: String(map.get('google_client_id') || config.GOOGLE_CLIENT_ID || ''),
+    smtp_host: String(map.get('smtp_host') || config.SMTP.host || ''),
+    smtp_port: Number(map.get('smtp_port')) || config.SMTP.port || 587,
+    smtp_secure: String(map.get('smtp_secure') || (config.SMTP.secure ? 'ssl' : 'starttls')),
   }
 }
 
@@ -1952,7 +2137,7 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
 
   const html = renderTemplate(getCommissionUpdateTemplate(), {
     company_logo_url: String(companyInfo.company_logo_url || '').trim(),
-    company_name: String(companyInfo.company_name || 'Smart Embedded System').trim(),
+    company_name: String(companyInfo.company_name || '').trim(),
     company_email: String(companyInfo.company_email || '').trim(),
     company_address: String(companyInfo.company_address || '').trim(),
     organization_number: String(companyInfo.organization_number || '').trim(),
@@ -2346,40 +2531,48 @@ const normalizeVariantsFromRequest = (
 }
 
 // ===== Rate limiter for login/register =====
-const loginRateLimiter: Map<string, number[]> = new Map()
+const signinRateLimiter: Map<string, number[]> = new Map()
+const signupRateLimiter: Map<string, number[]> = new Map()
 const isAuthRateLimitDisabled = config.DISABLE_AUTH_RATE_LIMIT
 
-const checkLoginRateLimit = (ip: string): boolean => {
+const SIGNIN_WINDOW_MS = config.SIGNIN_RATE_LIMIT_WINDOW_MINUTES * 60 * 1000
+const SIGNUP_WINDOW_MS = config.SIGNUP_RATE_LIMIT_WINDOW_MINUTES * 60 * 1000
+
+const checkRateLimit = (limiter: Map<string, number[]>, ip: string, maxAttempts: number, windowMs: number): boolean => {
   if (isAuthRateLimitDisabled) {
     return true
   }
 
   const now = Date.now()
-  const MAX_ATTEMPTS = 5
-  const TIME_WINDOW = 15 * 60 * 1000 // 15 minutes
+  let timestamps = limiter.get(ip) || []
+  timestamps = timestamps.filter(t => now - t < windowMs)
 
-  let timestamps = loginRateLimiter.get(ip) || []
-  timestamps = timestamps.filter(t => now - t < TIME_WINDOW)
-
-  if (timestamps.length >= MAX_ATTEMPTS) {
+  if (timestamps.length >= maxAttempts) {
     return false // Rate limited
   }
 
   timestamps.push(now)
-  loginRateLimiter.set(ip, timestamps)
+  limiter.set(ip, timestamps)
   return true
 }
+
+const checkSigninRateLimit = (ip: string): boolean =>
+  checkRateLimit(signinRateLimiter, ip, config.SIGNIN_MAX_ATTEMPTS, SIGNIN_WINDOW_MS)
+
+const checkSignupRateLimit = (ip: string): boolean =>
+  checkRateLimit(signupRateLimiter, ip, config.SIGNUP_MAX_ATTEMPTS, SIGNUP_WINDOW_MS)
 
 // Cleanup old rate limit entries every hour
 setInterval(() => {
   const now = Date.now()
-  const TIME_WINDOW = 15 * 60 * 1000
-  for (const [ip, timestamps] of loginRateLimiter.entries()) {
-    const active = timestamps.filter(t => now - t < TIME_WINDOW)
-    if (active.length === 0) {
-      loginRateLimiter.delete(ip)
-    } else {
-      loginRateLimiter.set(ip, active)
+  for (const [limiter, windowMs] of [[signinRateLimiter, SIGNIN_WINDOW_MS], [signupRateLimiter, SIGNUP_WINDOW_MS]] as [Map<string, number[]>, number][]) {
+    for (const [ip, timestamps] of limiter.entries()) {
+      const active = timestamps.filter(t => now - t < windowMs)
+      if (active.length === 0) {
+        limiter.delete(ip)
+      } else {
+        limiter.set(ip, active)
+      }
     }
   }
 }, 60 * 60 * 1000)
@@ -2401,30 +2594,6 @@ const getServerBaseUrl = (req: Request): string => {
   return `${protocol}://${host}`
 }
 
-const createSellerVerificationEmailHtml = (verificationUrl: string): string => {
-  return `
-  <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#111827;">
-    <h2 style="margin:0 0 12px;">Verify your seller email</h2>
-    <p style="margin:0 0 12px;line-height:1.5;">Thanks for signing up. Verify your email address before logging in.</p>
-    <p style="margin:0 0 20px;line-height:1.5;">Click the button below to verify your account:</p>
-    <a href="${verificationUrl}" style="display:inline-block;padding:10px 16px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Verify Email</a>
-    <p style="margin:20px 0 8px;line-height:1.5;font-size:13px;color:#4b5563;">If the button does not work, open this link:</p>
-    <p style="margin:0;word-break:break-all;font-size:13px;color:#1f2937;">${verificationUrl}</p>
-  </div>`
-}
-
-const createSellerPasswordResetEmailHtml = (resetUrl: string): string => {
-  return `
-  <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#111827;">
-    <h2 style="margin:0 0 12px;">Reset your seller password</h2>
-    <p style="margin:0 0 12px;line-height:1.5;">We received a request to reset the password for your seller account.</p>
-    <p style="margin:0 0 20px;line-height:1.5;">Click the button below to set a new password. This link expires in 1 hour.</p>
-    <a href="${resetUrl}" style="display:inline-block;padding:10px 16px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">Reset Password</a>
-    <p style="margin:20px 0 8px;line-height:1.5;font-size:13px;color:#4b5563;">If the button does not work, open this link:</p>
-    <p style="margin:0;word-break:break-all;font-size:13px;color:#1f2937;">${resetUrl}</p>
-    <p style="margin:20px 0 0;line-height:1.5;font-size:13px;color:#6b7280;">If you did not request this change, you can safely ignore this email.</p>
-  </div>`
-}
 
 const trimEmail = (value: unknown): string => String(value || '').trim().toLowerCase()
 
@@ -2482,7 +2651,7 @@ app.post('/api/register', async (req: Request, res: Response) => {
   const clientIp = String(req.ip || 'unknown')
 
   // Rate limiting
-  if (!checkLoginRateLimit(clientIp)) {
+  if (!checkSignupRateLimit(clientIp)) {
     return res.status(429).json({ message: 'Too many registration attempts. Please try again later.' })
   }
 
@@ -2509,16 +2678,24 @@ app.post('/api/register', async (req: Request, res: Response) => {
     const hashedPassword = await bcrypt.hash(password, 10)
     const verificationToken = crypto.randomBytes(32).toString('hex')
 
+    // Send verification email first — only insert if email succeeds
+    const verifyUrl = `${getServerBaseUrl(req)}/api/email/verify?token=${verificationToken}`
+    try {
+      const companyInfo = await getPlatformCompanyEmailInfo()
+      await sendEmail(
+        String(email),
+        'Verify your seller account email',
+        createSellerVerificationEmailHtml({ company: companyInfo, verification_url: verifyUrl }),
+        { purpose: 'sellers' },
+      )
+    } catch (emailErr) {
+      console.error('Registration verification email failed:', emailErr)
+      return res.status(500).json({ message: 'Registration failed: could not send verification email. Please try again later.' })
+    }
+
     const [result] = await db.query<ResultSetHeader>(
       'INSERT INTO users (email, password, role, email_is_verified, email_verification_token) VALUES (?, ?, ?, ?, ?)',
       [email, hashedPassword, 'seller', false, verificationToken],
-    )
-
-    const verifyUrl = `${getServerBaseUrl(req)}/api/email/verify?token=${verificationToken}`
-    await sendEmail(
-      String(email),
-      'Verify your seller account email',
-      createSellerVerificationEmailHtml(verifyUrl),
     )
 
     res.status(201).json({
@@ -2591,7 +2768,7 @@ app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
     await ensurePasswordResetColumns()
 
     const [rows] = await db.query<RowDataPacket[]>(
-      "SELECT id, email FROM users WHERE LOWER(email) = LOWER(?) AND role = 'seller' LIMIT 1",
+      'SELECT id, email, role FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
       [email],
     )
 
@@ -2607,15 +2784,18 @@ app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
         [tokenHash, expiresAt, user.id],
       )
 
+      const companyInfo = await getPlatformCompanyEmailInfo()
+      const emailPurpose = user.role === 'seller' ? 'sellers' : user.role === 'buyer' ? 'customers' : undefined
       await sendEmail(
         String(user.email),
-        'Reset your seller account password',
-        createSellerPasswordResetEmailHtml(resetUrl),
+        'Reset your account password',
+        createSellerPasswordResetEmailHtml({ company: companyInfo, reset_url: resetUrl }),
+        emailPurpose ? { purpose: emailPurpose as 'sellers' | 'customers' } : undefined,
       )
     }
 
     return res.json({
-      message: 'If the seller account exists, a password reset email has been sent.',
+      message: 'If an account with that email exists, a password reset link has been sent.',
     })
   } catch (error) {
     console.error('Forgot password error:', error)
@@ -2755,7 +2935,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
   const clientIp = String(req.ip || 'unknown')
 
   // Rate limiting
-  if (!checkLoginRateLimit(clientIp)) {
+  if (!checkSigninRateLimit(clientIp)) {
     return res.status(429).json({ message: 'Too many login attempts. Please try again later.' })
   }
   const email = trimEmail(req.body?.email)
@@ -2802,6 +2982,14 @@ app.post('/api/login', async (req: Request, res: Response) => {
       return res.status(403).json({
         message: 'Please verify your email before logging in.',
         requires_email_verification: true,
+      })
+    }
+
+    await ensureAccountDeletionColumns()
+    if (Boolean(user.pending_deletion)) {
+      return res.status(403).json({
+        pending_deletion: true,
+        message: 'This account is scheduled for deletion. Sign in to reactivate it.',
       })
     }
 
@@ -3145,6 +3333,192 @@ app.post('/api/settings/change-password', async (req: Request, res: Response) =>
   }
 })
 
+app.post('/api/settings/test-email', async (req: Request, res: Response) => {
+  const auth = await requireSellerOrAdmin(req, res)
+  if (!auth) return
+
+  try {
+    const [rows] = await db.query<RowDataPacket[]>('SELECT email FROM users WHERE id = ? LIMIT 1', [auth.id])
+    if (!rows.length || !rows[0].email) {
+      return res.status(404).json({ message: 'User email not found.' })
+    }
+
+    const recipientEmail = String(rows[0].email)
+    const smtpUser = String(config.SMTP.user || config.EMAIL.address || '').trim()
+    const smtpPass = String(config.SMTP.pass || '').trim()
+
+    if (!smtpUser || !smtpPass) {
+      return res.status(503).json({
+        message: 'Email server is not configured. Please set SMTP credentials in the admin settings.',
+        smtp_configured: false,
+      })
+    }
+
+    const platformName = config.SMTP.fromName || 'SellingPlatform'
+    const subject = `${platformName} — Email Connection Test`
+    const body = `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
+        <h2 style="color:#111827;margin-bottom:8px">✅ Email connection is working</h2>
+        <p style="color:#4b5563;line-height:1.6">
+          This is a test message from <strong>${platformName}</strong>.<br/>
+          Your email server is correctly configured and able to send emails.
+        </p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0"/>
+        <p style="color:#9ca3af;font-size:12px">Sent to: ${recipientEmail}<br/>Sender: ${smtpUser}</p>
+      </div>
+    `
+
+    await sendEmail(recipientEmail, subject, body)
+
+    return res.json({
+      success: true,
+      message: `Test email sent successfully to ${recipientEmail}.`,
+      smtp_configured: true,
+      sender_email: smtpUser,
+      recipient_email: recipientEmail,
+    })
+  } catch (error) {
+    console.error('Test email error:', error)
+    const message = error instanceof Error ? error.message : 'Failed to send test email.'
+    return res.status(500).json({ message, smtp_configured: false })
+  }
+})
+
+app.get('/api/seller/account/check-deletion-eligibility', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res)
+  if (!auth) return
+  try {
+    const [activeOrders] = await db.query<RowDataPacket[]>(
+      `SELECT id, order_id, order_status, created_at FROM sales
+       WHERE seller_id = ?
+       AND (order_status IS NULL OR order_status NOT IN ('delivered', 'cancelled', 'returned'))
+       ORDER BY created_at DESC`,
+      [auth.id],
+    )
+    if (activeOrders.length > 0) {
+      return res.status(409).json({
+        has_pending_orders: true,
+        orders: activeOrders.map((o) => ({
+          id: o.id,
+          order_id: o.order_id,
+          order_status: o.order_status || 'processing',
+          created_at: o.created_at,
+        })),
+      })
+    }
+    return res.status(200).json({ eligible: true })
+  } catch (error) {
+    console.error('Check deletion eligibility error:', error)
+    return res.status(500).json({ message: 'Failed to check eligibility.' })
+  }
+})
+
+app.post('/api/seller/account/request-deletion', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res)
+  if (!auth) return
+
+  try {
+    await ensureAccountDeletionColumns()
+
+    const [userRows] = await db.query<RowDataPacket[]>('SELECT role, pending_deletion FROM users WHERE id = ? LIMIT 1', [auth.id])
+    if (!userRows.length || userRows[0].role !== 'seller') {
+      return res.status(403).json({ message: 'Only seller accounts can be deleted through this endpoint.' })
+    }
+    if (Boolean(userRows[0].pending_deletion)) {
+      return res.status(409).json({ message: 'Account is already pending deletion.' })
+    }
+
+    const [activeOrders] = await db.query<RowDataPacket[]>(
+      `SELECT id, order_id, order_status, created_at FROM sales
+       WHERE seller_id = ?
+       AND (order_status IS NULL OR order_status NOT IN ('delivered', 'cancelled', 'returned'))
+       ORDER BY created_at DESC`,
+      [auth.id],
+    )
+
+    if (activeOrders.length > 0) {
+      return res.status(409).json({
+        has_pending_orders: true,
+        message: 'You have pending or undelivered orders. Complete all orders before deleting your account.',
+        orders: activeOrders.map((o) => ({
+          id: o.id,
+          order_id: o.order_id,
+          order_status: o.order_status || 'processing',
+          created_at: o.created_at,
+        })),
+      })
+    }
+
+    await db.query(
+      'UPDATE users SET pending_deletion = TRUE, pending_deletion_requested_at = NOW() WHERE id = ?',
+      [auth.id],
+    )
+
+    await db.query(
+      "UPDATE products SET approval_status = 'pending_deletion' WHERE seller_id = ? AND approval_status = 'approved'",
+      [auth.id],
+    )
+
+    return res.status(200).json({ message: 'Account marked for deletion. You will be logged out.' })
+  } catch (error) {
+    console.error('Account deletion request error:', error)
+    return res.status(500).json({ message: 'Failed to process account deletion request.' })
+  }
+})
+
+app.post('/api/seller/account/reactivate', async (req: Request, res: Response) => {
+  const email = String(req.body?.email || '').trim().toLowerCase()
+  const password = String(req.body?.password || '')
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required.' })
+  }
+
+  try {
+    await ensureAccountDeletionColumns()
+
+    const [rows] = await db.query<RowDataPacket[]>(
+      'SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
+      [email],
+    )
+
+    if (!rows.length) {
+      return res.status(400).json({ message: 'Invalid credentials.' })
+    }
+
+    const user = rows[0]
+    const match = await bcrypt.compare(password, user.password)
+    if (!match) {
+      return res.status(400).json({ message: 'Invalid credentials.' })
+    }
+
+    if (!Boolean(user.pending_deletion)) {
+      return res.status(400).json({ message: 'This account is not pending deletion.' })
+    }
+
+    await db.query(
+      'UPDATE users SET pending_deletion = FALSE, pending_deletion_requested_at = NULL WHERE id = ?',
+      [user.id],
+    )
+
+    await db.query(
+      "UPDATE products SET approval_status = 'approved' WHERE seller_id = ? AND approval_status = 'pending_deletion'",
+      [user.id],
+    )
+
+    const token = issueAuthToken(Number(user.id))
+
+    return res.status(200).json({
+      message: 'Account reactivated successfully.',
+      token,
+      user: { id: user.id, email: user.email, role: user.role },
+    })
+  } catch (error) {
+    console.error('Account reactivation error:', error)
+    return res.status(500).json({ message: 'Failed to reactivate account.' })
+  }
+})
+
 app.get('/api/admin/settings/commission', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
   if (!auth) return
@@ -3374,6 +3748,9 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
       ['postnord_use_portal_pricing', String(Boolean(payload.postnord_use_portal_pricing))],
       ['postnord_enable_transit_time', String(Boolean(payload.postnord_enable_transit_time))],
       ['google_client_id', String(payload.google_client_id || '').trim()],
+      ['smtp_host', String(payload.smtp_host || '').trim()],
+      ['smtp_port', String(Number(payload.smtp_port) || 587)],
+      ['smtp_secure', String(payload.smtp_secure || 'starttls')],
     ]
 
     for (const [key, value] of values) {
@@ -3697,6 +4074,159 @@ app.post('/api/admin/settings/runtime/email-password', async (req: Request, res:
   } catch (error) {
     console.error('Admin email password update error:', error)
     return res.status(500).json({ message: 'Failed to update email password' })
+  }
+})
+
+// --- Email Accounts CRUD ---
+
+app.get('/api/admin/email-accounts', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  try {
+    await ensureEmailAccountPurposesColumn()
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT id, email_address, purposes, is_active, created_at, updated_at FROM email_accounts ORDER BY id ASC`,
+    )
+    const result = rows.map((r) => ({
+      ...r,
+      purposes: (() => {
+        try { return Array.isArray(r.purposes) ? r.purposes : JSON.parse(String(r.purposes || '[]')) }
+        catch { return [] }
+      })(),
+    }))
+    return res.json(result)
+  } catch (error) {
+    console.error('Email accounts list error:', error)
+    return res.status(500).json({ message: 'Failed to load email accounts' })
+  }
+})
+
+app.post('/api/admin/email-accounts', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const emailAddress = String(req.body?.email_address || '').trim()
+  const password = String(req.body?.password || '').trim()
+  const rawPurposes = Array.isArray(req.body?.purposes) ? req.body.purposes : []
+  const validPurposes = ['sellers', 'customers', 'newsletters', 'contact_form']
+  const purposes = rawPurposes.filter((p: string) => validPurposes.includes(p))
+
+  if (!emailAddress) return res.status(400).json({ message: 'email_address is required' })
+  if (!password) return res.status(400).json({ message: 'password is required' })
+  if (!purposes.length) return res.status(400).json({ message: 'At least one purpose must be selected' })
+
+  try {
+    await ensureEmailAccountPurposesColumn()
+    const encryptedPassword = encryptSmtpPassword(password)
+    const [result] = await db.query<any>(
+      `INSERT INTO email_accounts (email_address, encrypted_password, purpose, purposes) VALUES (?, ?, ?, ?)`,
+      [emailAddress, encryptedPassword, purposes[0], JSON.stringify(purposes)],
+    )
+    return res.status(201).json({ id: result.insertId, email_address: emailAddress, purposes })
+  } catch (error) {
+    console.error('Email account create error:', error)
+    return res.status(500).json({ message: 'Failed to create email account' })
+  }
+})
+
+app.put('/api/admin/email-accounts/:id', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: 'Invalid id' })
+
+  const emailAddress = String(req.body?.email_address || '').trim()
+  const rawPurposes = Array.isArray(req.body?.purposes) ? req.body.purposes : []
+  const validPurposes = ['sellers', 'customers', 'newsletters', 'contact_form']
+  const purposes = rawPurposes.filter((p: string) => validPurposes.includes(p))
+  const password = String(req.body?.password || '').trim()
+
+  if (!emailAddress) return res.status(400).json({ message: 'email_address is required' })
+  if (!purposes.length) return res.status(400).json({ message: 'At least one purpose must be selected' })
+
+  try {
+    await ensureEmailAccountPurposesColumn()
+
+    if (password) {
+      const encryptedPassword = encryptSmtpPassword(password)
+      await db.query(
+        `UPDATE email_accounts SET email_address = ?, purpose = ?, purposes = ?, encrypted_password = ? WHERE id = ?`,
+        [emailAddress, purposes[0], JSON.stringify(purposes), encryptedPassword, id],
+      )
+    } else {
+      await db.query(
+        `UPDATE email_accounts SET email_address = ?, purpose = ?, purposes = ? WHERE id = ?`,
+        [emailAddress, purposes[0], JSON.stringify(purposes), id],
+      )
+    }
+
+    return res.json({ success: true })
+  } catch (error) {
+    console.error('Email account update error:', error)
+    return res.status(500).json({ message: 'Failed to update email account' })
+  }
+})
+
+app.delete('/api/admin/email-accounts/:id', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: 'Invalid id' })
+
+  try {
+    await ensureEmailAccountsTable()
+    await db.query(`DELETE FROM email_accounts WHERE id = ?`, [id])
+    return res.json({ success: true })
+  } catch (error) {
+    console.error('Email account delete error:', error)
+    return res.status(500).json({ message: 'Failed to delete email account' })
+  }
+})
+
+app.post('/api/admin/email-accounts/:id/test', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ message: 'Invalid id' })
+
+  try {
+    await ensureEmailAccountsTable()
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT email_address, encrypted_password FROM email_accounts WHERE id = ? LIMIT 1`,
+      [id],
+    )
+    if (!rows.length) return res.status(404).json({ message: 'Email account not found' })
+
+    const account = rows[0]
+    const decryptedPassword = decryptSmtpPassword(String(account.encrypted_password))
+
+    const settings = await getRuntimeSettings()
+    const smtpHost = settings.smtp_host || config.SMTP.host
+    const smtpPort = settings.smtp_port || config.SMTP.port
+    const smtpSecure = settings.smtp_secure === 'ssl'
+
+    const nodemailer = require('nodemailer')
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      ...(smtpPort === 587 && !smtpSecure ? { requireTLS: true } : {}),
+      authMethod: 'LOGIN',
+      auth: {
+        user: String(account.email_address),
+        pass: decryptedPassword,
+      },
+    })
+
+    await transporter.verify()
+    return res.json({ success: true, message: 'Connection successful' })
+  } catch (error) {
+    console.error('Email account test error:', error)
+    return res.status(200).json({ success: false, message: String((error as Error).message || 'Connection failed') })
   }
 })
 
@@ -4931,6 +5461,37 @@ app.post('/api/profiles', profileUpload.fields([{ name: 'companyLogo', maxCount:
       seller_id: auth.id,
       action: 'created',
     })
+
+    // Send "profile pending review" email to the seller
+    try {
+      const [userRows] = await db.query<RowDataPacket[]>(
+        'SELECT email FROM users WHERE id = ? LIMIT 1',
+        [auth.id],
+      )
+      if (userRows.length && userRows[0].email) {
+        const companyInfo = await getPlatformCompanyEmailInfo()
+        const platformName = companyInfo.company_name || config.SMTP.fromName || 'Platform'
+        const sellerDisplayName = String(profileData.display_name || profileData.first_name || '').trim() || 'Seller'
+        const now = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' })
+        sendEmail(
+          String(userRows[0].email),
+          `⏳ Your seller profile is under review — ${platformName}`,
+          createSellerProfileStatusEmailHtml({
+            company: companyInfo,
+            seller_name: sellerDisplayName,
+            seller_email: String(userRows[0].email),
+            status: 'pending',
+            reason: null,
+            updated_at: now,
+            cta_url: `${config.CLIENT_URL}/profile-registration`,
+          }),
+          { purpose: 'sellers' },
+        ).catch((err) => console.error('[Profile create] Pending email failed (non-blocking):', err))
+      }
+    } catch (emailErr) {
+      console.error('[Profile create] Failed to send pending email (non-blocking):', emailErr)
+    }
+
     res.status(201).json({ id: result.insertId, ...profileData, ...buildSellerProfileCompatFields({ status: 'pending', status_reason: null }) })
   } catch (err) {
     console.error(err)
@@ -5372,6 +5933,7 @@ app.get('/api/admin/sellers', async (req: Request, res: Response) => {
 
   try {
     await ensureProfilesStatusColumns()
+    await ensureAccountDeletionColumns()
     const [rows] = await db.query<RowDataPacket[]>(
       `SELECT
         u.id AS seller_id,
@@ -5398,7 +5960,8 @@ app.get('/api/admin/sellers', async (req: Request, res: Response) => {
         p.is_blocked,
         p.blocked_reason,
         p.last_login,
-        p.created_at AS profile_created_at
+        p.created_at AS profile_created_at,
+        u.pending_deletion
       FROM users u
       LEFT JOIN profiles p
         ON p.id = (
@@ -5966,77 +6529,33 @@ const notifySellerProfileStatusChange = async (
   }
 
   try {
-    if (target.status === 'verified') {
-      const dashboardUrl = `${config.CLIENT_URL}/dashboard`
-      await sendEmail(
-        target.profile.email,
-        `Your seller account has been approved — ${platformName}`,
-        `
-<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;">
-  <h2 style="color:#16a34a;margin:0 0 12px;">Welcome aboard, ${sellerName}!</h2>
-  <p style="color:#374151;margin:0 0 12px;">Great news — your seller profile on <strong>${platformName}</strong> has been reviewed and <strong style="color:#16a34a;">approved</strong>.</p>
-  <p style="color:#374151;margin:0 0 20px;">You can now list products and start selling on the platform.</p>
-  <a href="${dashboardUrl}" style="display:inline-block;padding:10px 24px;background:#16a34a;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">Go to Dashboard</a>
-</div>`,
-      )
-      return
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const now = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' })
+    const profileUrl = `${config.CLIENT_URL}/profile-registration`
+    const dashboardUrl = `${config.CLIENT_URL}/dashboard`
+
+    const subjectMap: Record<string, string> = {
+      verified: `✅ Your seller account has been approved — ${platformName}`,
+      pending: `⏳ Your seller profile is under review — ${platformName}`,
+      rejected: `❌ Action required: update your seller profile — ${platformName}`,
+      blocked: `🚫 Your seller account has been suspended — ${platformName}`,
     }
 
-    if (target.status === 'pending') {
-      const profileUrl = `${config.CLIENT_URL}/profile-registration`
-      await sendEmail(
-        target.profile.email,
-        `Seller profile set to pending review — ${platformName}`,
-        `
-<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;">
-  <h2 style="color:#d97706;margin:0 0 12px;">Profile Review Pending</h2>
-  <p style="color:#374151;margin:0 0 12px;">Hi ${sellerName},</p>
-  <p style="color:#374151;margin:0 0 12px;">Your seller profile on <strong>${platformName}</strong> has been moved to <strong>pending review</strong>.</p>
-  <div style="background:#fffbeb;border-left:4px solid #d97706;padding:12px 16px;border-radius:4px;margin:16px 0;">
-    <strong style="color:#b45309;font-size:13px;">Message from admin:</strong>
-    <p style="color:#92400e;margin:8px 0 0;font-size:14px;white-space:pre-wrap;">${target.reason || 'No reason provided.'}</p>
-  </div>
-  <p style="color:#374151;margin:0 0 20px;">While your status is pending, you cannot add products and your products are hidden from customers.</p>
-  <a href="${profileUrl}" style="display:inline-block;padding:10px 24px;background:#d97706;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">Review Profile</a>
-</div>`,
-      )
-      return
-    }
-
-    if (target.status === 'rejected') {
-      const profileUrl = `${config.CLIENT_URL}/profile-registration`
-      await sendEmail(
-        target.profile.email,
-        `Action required: seller profile verification — ${platformName}`,
-        `
-<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;">
-  <h2 style="color:#dc2626;margin:0 0 12px;">Profile Verification Update</h2>
-  <p style="color:#374151;margin:0 0 12px;">Hi ${sellerName},</p>
-  <p style="color:#374151;margin:0 0 12px;">We reviewed your seller profile on <strong>${platformName}</strong> and it requires updates before approval.</p>
-  <div style="background:#fef2f2;border-left:4px solid #dc2626;padding:12px 16px;border-radius:4px;margin:16px 0;">
-    <strong style="color:#b91c1c;font-size:13px;">Message from admin:</strong>
-    <p style="color:#7f1d1d;margin:8px 0 0;font-size:14px;white-space:pre-wrap;">${target.reason || 'No reason provided.'}</p>
-  </div>
-  <a href="${profileUrl}" style="display:inline-block;padding:10px 24px;background:#dc2626;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">Update Profile</a>
-</div>`,
-      )
-      return
-    }
+    const ctaUrl = target.status === 'verified' ? dashboardUrl : profileUrl
 
     await sendEmail(
       target.profile.email,
-      `Your seller account has been suspended — ${platformName}`,
-      `
-<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;">
-  <h2 style="color:#ea580c;margin:0 0 12px;">Account Suspended</h2>
-  <p style="color:#374151;margin:0 0 12px;">Hi ${sellerName},</p>
-  <p style="color:#374151;margin:0 0 12px;">Your seller account on <strong>${platformName}</strong> has been <strong style="color:#ea580c;">suspended</strong>.</p>
-  <div style="background:#fff7ed;border-left:4px solid #ea580c;padding:12px 16px;border-radius:4px;margin:16px 0;">
-    <strong style="color:#c2410c;font-size:13px;">Reason:</strong>
-    <p style="color:#7c2d12;margin:8px 0 0;font-size:14px;white-space:pre-wrap;">${target.reason || 'No reason provided.'}</p>
-  </div>
-  <p style="color:#374151;margin:0 0 20px;">While suspended, your products are hidden from customers and you cannot list new products.</p>
-</div>`,
+      subjectMap[target.status] || `Seller profile update — ${platformName}`,
+      createSellerProfileStatusEmailHtml({
+        company: companyInfo,
+        seller_name: sellerName,
+        seller_email: String(target.profile.email || '').trim(),
+        status: target.status as 'verified' | 'pending' | 'rejected' | 'blocked',
+        reason: target.reason,
+        updated_at: now,
+        cta_url: ctaUrl,
+      }),
+      { purpose: 'sellers' },
     )
   } catch (emailErr) {
     console.error('Seller status email failed (non-blocking):', emailErr)
@@ -6322,6 +6841,8 @@ app.delete('/api/admin/sellers/:sellerId', async (req: Request, res: Response) =
       return res.status(400).json({ message: 'Target user is not a seller' })
     }
 
+    await db.query('DELETE FROM products WHERE seller_id = ?', [sellerId])
+
     const [result] = await db.query<ResultSetHeader>(
       'DELETE FROM users WHERE id = ?',
       [sellerId],
@@ -6338,7 +6859,56 @@ app.delete('/api/admin/sellers/:sellerId', async (req: Request, res: Response) =
   }
 })
 
-// ===== Admin Bulk Email Sellers =====
+// ===== Admin Database Reset =====
+app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  // The tables to truncate — everything except users (admin row preserved)
+  const tablesToClear = [
+    'accounting_step_checks',
+    'app_settings',
+    'bank_accounts',
+    'customers',
+    'digital_download_tokens',
+    'email_accounts',
+    'newsletter_subscribers',
+    'payment_methods',
+    'payouts',
+    'product_images',
+    'product_reviews',
+    'product_variants',
+    'products',
+    'profiles',
+    'sale_items',
+    'sales',
+    'shipment_labels',
+    'shipment_policies',
+    'support_messages',
+    'website_reviews',
+  ]
+
+  try {
+    await db.query('SET FOREIGN_KEY_CHECKS = 0')
+    for (const table of tablesToClear) {
+      try {
+        await db.query(`TRUNCATE TABLE \`${table}\``)
+      } catch {
+        // Table may not exist yet — skip silently
+      }
+    }
+    // Remove all non-admin users from users table
+    await db.query(`DELETE FROM users WHERE role != 'admin'`)
+    await db.query('SET FOREIGN_KEY_CHECKS = 1')
+
+    console.log(`[DB Reset] Database cleared by admin user ${auth.id}`)
+    return res.json({ success: true, message: 'Database reset complete. Admin account preserved.' })
+  } catch (error) {
+    await db.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => {})
+    console.error('[DB Reset] Failed:', error)
+    return res.status(500).json({ message: 'Database reset failed.' })
+  }
+})
 app.post('/api/admin/sellers/bulk-email', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
   if (!auth) return
@@ -6407,7 +6977,13 @@ app.post('/api/admin/products/:id/approve', async (req: Request, res: Response) 
 
   try {
     const [productRows] = await db.query<RowDataPacket[]>(
-      'SELECT seller_id, name FROM products WHERE id = ? LIMIT 1',
+      `SELECT p.seller_id, p.name, p.category,
+              u.email AS seller_email,
+              COALESCE(sp.display_name, sp.first_name, SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name
+       FROM products p
+       LEFT JOIN users u ON u.id = p.seller_id
+       LEFT JOIN profiles sp ON sp.user_id = p.seller_id
+       WHERE p.id = ? LIMIT 1`,
       [productId],
     )
 
@@ -6436,6 +7012,26 @@ app.post('/api/admin/products/:id/approve', async (req: Request, res: Response) 
         seller_id: Number(productRows[0].seller_id),
         product_name: String(productRows[0].name || ''),
       })
+      // Send email notification to seller
+      if (productRows[0].seller_email) {
+        const companyInfo = await getPlatformCompanyEmailInfo()
+        const now = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' })
+        sendEmail(
+          String(productRows[0].seller_email),
+          `Your product has been approved — ${companyInfo.company_name || 'Platform'}`,
+          createProductStatusEmailHtml({
+            company: companyInfo,
+            seller_name: String(productRows[0].seller_name || 'Seller'),
+            product_name: String(productRows[0].name || ''),
+            product_id: productId,
+            product_category: String(productRows[0].category || ''),
+            status: 'approved',
+            updated_at: now,
+            cta_url: `${config.CLIENT_URL}/seller/products`,
+          }),
+          { purpose: 'sellers' },
+        ).catch((err) => console.error('[Product approve] Email failed (non-blocking):', err))
+      }
     }
 
     res.status(200).json({ message: 'Product approved' })
@@ -6463,7 +7059,13 @@ app.post('/api/admin/products/:id/reject', async (req: Request, res: Response) =
 
   try {
     const [productRows] = await db.query<RowDataPacket[]>(
-      'SELECT seller_id, name FROM products WHERE id = ? LIMIT 1',
+      `SELECT p.seller_id, p.name, p.category,
+              u.email AS seller_email,
+              COALESCE(sp.display_name, sp.first_name, SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name
+       FROM products p
+       LEFT JOIN users u ON u.id = p.seller_id
+       LEFT JOIN profiles sp ON sp.user_id = p.seller_id
+       WHERE p.id = ? LIMIT 1`,
       [productId],
     )
 
@@ -6491,6 +7093,27 @@ app.post('/api/admin/products/:id/reject', async (req: Request, res: Response) =
         seller_id: Number(productRows[0].seller_id),
         product_name: String(productRows[0].name || ''),
       })
+      // Send email notification to seller
+      if (productRows[0].seller_email) {
+        const companyInfo = await getPlatformCompanyEmailInfo()
+        const now = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' })
+        sendEmail(
+          String(productRows[0].seller_email),
+          `Your product requires updates — ${companyInfo.company_name || 'Platform'}`,
+          createProductStatusEmailHtml({
+            company: companyInfo,
+            seller_name: String(productRows[0].seller_name || 'Seller'),
+            product_name: String(productRows[0].name || ''),
+            product_id: productId,
+            product_category: String(productRows[0].category || ''),
+            status: 'rejected',
+            rejection_message: rejectionMessage,
+            updated_at: now,
+            cta_url: `${config.CLIENT_URL}/seller/products`,
+          }),
+          { purpose: 'sellers' },
+        ).catch((err) => console.error('[Product reject] Email failed (non-blocking):', err))
+      }
     }
 
     res.status(200).json({ message: 'Product rejected', rejection_message: rejectionMessage })
@@ -6651,6 +7274,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     metadata,
     variants,
   } = req.body
+  const { seo_meta, gender, tags } = req.body
 
   const imageFiles = uploadedFiles?.images || []
   const variantImageFiles = uploadedFiles?.variant_images || []
@@ -6773,6 +7397,16 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
         const variantIndex = variantFileIndices[i] || i
         variantFilesMap[variantIndex] = fileUrl
       }
+    }
+
+    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn()])
+    if (seo_meta) productData.seo_meta = String(seo_meta).trim() || null
+    if (gender) productData.gender = String(gender).trim() || null
+    if (tags) {
+      try {
+        const parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags
+        if (Array.isArray(parsedTags)) productData.tags = JSON.stringify(parsedTags.map(String).filter(Boolean))
+      } catch { /* skip */ }
     }
 
     const [result] = await db.query<ResultSetHeader>('INSERT INTO products SET ?', productData)
@@ -6902,6 +7536,7 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
     metadata,
     variants,
   } = req.body
+  const { seo_meta, gender, tags } = req.body
   const uploadedFiles = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined
   const imageFiles = uploadedFiles?.images || []
   const variantImageFiles = uploadedFiles?.variant_images || []
@@ -6954,6 +7589,29 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
         productId,
       ],
     )
+
+    // Update new optional fields if present
+    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn()])
+    const extraUpdates: string[] = []
+    const extraValues: unknown[] = []
+    if (seo_meta !== undefined) {
+      extraUpdates.push('seo_meta = ?')
+      extraValues.push(seo_meta ? String(seo_meta).trim() || null : null)
+    }
+    if (gender !== undefined) {
+      extraUpdates.push('gender = ?')
+      extraValues.push(gender ? String(gender).trim() || null : null)
+    }
+    if (tags !== undefined) {
+      try {
+        const parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags
+        extraUpdates.push('tags = ?')
+        extraValues.push(Array.isArray(parsedTags) ? JSON.stringify(parsedTags.map(String).filter(Boolean)) : null)
+      } catch { /* skip */ }
+    }
+    if (extraUpdates.length > 0) {
+      await db.query(`UPDATE products SET ${extraUpdates.join(', ')} WHERE id = ?`, [...extraValues, productId])
+    }
 
     const shouldReplaceVariants = variants != null || metadata != null
     if (shouldReplaceVariants) {
@@ -7112,6 +7770,29 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
 })
 
 // ===== Get Products =====
+// GET /api/products/tags/suggestions — returns distinct tags for autocomplete
+app.get('/api/products/tags/suggestions', requireAuth, async (req, res) => {
+  try {
+    await hasProductTagsColumn()
+    const [rows] = await db.query<RowDataPacket[]>(
+      "SELECT tags FROM products WHERE tags IS NOT NULL AND tags != 'null'"
+    )
+    const tagSet = new Set<string>()
+    for (const row of rows) {
+      try {
+        const parsed = typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags
+        if (Array.isArray(parsed)) {
+          parsed.forEach((t: unknown) => { if (typeof t === 'string' && t.trim()) tagSet.add(t.trim().toLowerCase()) })
+        }
+      } catch { /* skip invalid */ }
+    }
+    return res.json({ tags: Array.from(tagSet).sort() })
+  } catch (error) {
+    console.error('Error fetching tag suggestions:', error)
+    return res.status(500).json({ error: 'Failed to fetch tag suggestions' })
+  }
+})
+
 app.get('/api/products', async (req: Request, res: Response) => {
   const auth = requireAuth(req, res)
   if (!auth) return
@@ -7272,7 +7953,8 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
         p.status,
         p.created_at,
         p.updated_at,
-        u.email as seller_email,
+        ANY_VALUE(u.email) as seller_email,
+        ANY_VALUE(sp.profile_type) as seller_profile_type,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
@@ -7314,7 +7996,8 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
       .map((product) => {
         const rows = variantsByProduct.get(product.id) || []
         const grouped: Record<string, any[]> = {}
-        const taxRate = parseTaxRateFromDbValue(product.tax_class)
+        const isPrivateSeller = String(product.seller_profile_type || '').toLowerCase() === 'private'
+        const taxRate = isPrivateSeller ? 0 : parseTaxRateFromDbValue(product.tax_class)
 
         for (const row of rows) {
           if (!grouped[row.variant_name]) grouped[row.variant_name] = []
@@ -7387,7 +8070,7 @@ app.get('/api/public/products/promoted', async (req: Request, res: Response) => 
         p.main_image_url,
         p.tax_class,
         p.is_promoted,
-        u.email AS seller_email,
+        ANY_VALUE(u.email) AS seller_email,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) AS seller_display_name,
         MIN(pv.price) AS min_price,
         MIN(pv.discount_price) AS min_discount_price,
@@ -8022,9 +8705,12 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
              COALESCE(pv.discount_price, pv.price) AS effective_price,
              pv.stock_quantity,
              pv.type,
-             pv.file_url
+             pv.file_url,
+             pr.profile_type AS seller_profile_type
            FROM product_variants pv
            JOIN products p ON p.id = pv.product_id
+           LEFT JOIN profiles pr ON pr.user_id = p.seller_id
+             AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = p.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
            WHERE pv.product_id = ? AND pv.id = ?
            LIMIT 1`,
           [productId, variantId],
@@ -8045,9 +8731,12 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
              COALESCE(pv.discount_price, pv.price) AS effective_price,
              pv.stock_quantity,
              pv.type,
-             pv.file_url
+             pv.file_url,
+             pr.profile_type AS seller_profile_type
            FROM product_variants pv
            JOIN products p ON p.id = pv.product_id
+           LEFT JOIN profiles pr ON pr.user_id = p.seller_id
+             AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = p.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
            WHERE pv.product_id = ?
            ORDER BY pv.id ASC
            LIMIT 1`,
@@ -8070,7 +8759,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       const unitPrice = Number(variant.effective_price || variant.price || 0)
       const totalPrice = unitPrice * quantity
 
-      const taxRate = parseTaxRateFromDbValue(variant.tax_class)
+      const isPrivateSeller = String(variant.seller_profile_type || '').toLowerCase() === 'private'
+      const taxRate = isPrivateSeller ? 0 : parseTaxRateFromDbValue(variant.tax_class)
       const taxAmount = calculateTaxOnItem(totalPrice, taxRate)
       //const commissionAmount = calculateCommissionAmount(totalPrice, commissionSettings.rate, commissionSettings.fixed)
 
@@ -8097,6 +8787,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         total_price: totalPrice,
         tax_amount: taxAmount,
         commission_amount: 0,
+        is_private_seller: isPrivateSeller,
       })
     }
 
@@ -8146,6 +8837,9 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       let feeNoVat = 0
       let vatRateDecimal = VAT_SHIPPING_RATE
 
+      // Private sellers cannot charge VAT — zero out shipping VAT
+      const sellerIsPrivate = (ordersBySeller[sellerId] as any[]).some((item) => item.is_private_seller)
+
       if (shippingCountry && sellersWithPhysicalItems.has(sellerId)) {
         const [policyRows] = await db.query<RowDataPacket[]>(
           `SELECT fee${hasVatRateColumn ? ', vat_rate' : ''}
@@ -8157,12 +8851,14 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
         if (policyRows.length > 0) {
           feeNoVat = Number(policyRows[0].fee || 0)
-          if (hasVatRateColumn) {
+          if (hasVatRateColumn && !sellerIsPrivate) {
             const rawVatRate = Number(policyRows[0].vat_rate)
             vatRateDecimal = Number.isFinite(rawVatRate) ? rawVatRate / 100 : VAT_SHIPPING_RATE
           }
         }
       }
+
+      if (sellerIsPrivate) vatRateDecimal = 0
 
       const vatAmount = calculateTaxOnShipment(feeNoVat, vatRateDecimal)
       sellerShippingPolicyMap.set(sellerId, { feeNoVat, vatAmount })
@@ -9679,6 +10375,13 @@ app.put('/api/orders/:id', async (req: Request, res: Response) => {
       values.push(statusReason)
     }
 
+    if (resolvedOrderStatus === 'shipped') {
+      const tn = tracking_number ? String(tracking_number).trim() : null
+      if (!tn) {
+        return res.status(400).json({ message: 'A tracking number is required to mark an order as shipped.' })
+      }
+    }
+
     if (payout_status) {
       updates.push('payout_status = ?')
       values.push(payout_status)
@@ -10613,6 +11316,20 @@ app.post('/api/stripe/create-checkout-session', async (req: Request, res: Respon
   }
 })
 
+/** Returns the email address of the active contact_form account, or null if not configured */
+const getContactFormEmail = async (): Promise<string | null> => {
+  try {
+    await ensureEmailAccountPurposesColumn()
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT email_address FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE('contact_form')) AND is_active = 1 LIMIT 1`,
+    )
+    if (rows.length) return String(rows[0].email_address)
+  } catch {
+    // ignore — fall through to env fallback
+  }
+  return null
+}
+
 // ── Contact form ──────────────────────────────────────────────────────────────
 // Simple in-memory rate limiter: max 3 submissions per IP per 15 minutes
 const contactRateMap = new Map<string, { count: number; resetAt: number }>()
@@ -10698,9 +11415,10 @@ app.post('/api/seller/support', supportUpload, async (req: Request, res: Respons
     return res.status(400).json({ message: 'Description is too short (at least 10 characters).' })
   }
 
-  const supportEmail = config.EMAIL.address || config.SMTP.user || ''
+  const contactFormEmail = await getContactFormEmail()
+  const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
   if (!supportEmail) {
-    console.error('[Seller Support] EMAIL_ADDRESS env variable is not set.')
+    console.error('[Seller Support] No contact_form email account configured and EMAIL_ADDRESS env variable is not set.')
     return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
   }
 
@@ -10771,6 +11489,7 @@ app.post('/api/seller/support', supportUpload, async (req: Request, res: Respons
       `[Seller Support] ${supportTypeLabel} - ${subject}`,
       emailBody,
       {
+        purpose: 'contact_form',
         attachments: files.map((file) => ({
           filename: file.originalname,
           path: file.path,
@@ -10861,10 +11580,11 @@ app.post('/api/contact', async (req: Request, res: Response) => {
   if (!message || message.length < 10)
     return res.status(400).json({ message: 'Message is too short (at least 10 characters).' })
 
-  const supportEmail = config.EMAIL.address || config.SMTP.user || ''
+  const contactFormEmail = await getContactFormEmail()
+  const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
 
   if (!supportEmail) {
-    console.error('[Contact] EMAIL_ADDRESS env variable is not set.')
+    console.error('[Contact] No contact_form email account configured and EMAIL_ADDRESS env variable is not set.')
     return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
   }
 
@@ -10938,6 +11658,7 @@ app.post('/api/contact', async (req: Request, res: Response) => {
       supportEmail,
       `[Support] ${reason} – from ${name}`,
       emailBody,
+      { purpose: 'contact_form' },
     )
     console.log(`[Contact] Email forwarded to ${supportEmail} from ${email}${orderLine}`)
     return res.json({ success: true, message: 'Your message has been sent. We will be in touch soon.' })
@@ -10983,6 +11704,36 @@ const bootstrapAndStartServer = async () => {
   } catch (error) {
     console.error('Failed to preload runtime settings. Starting with environment defaults.', error)
   }
+
+  setEmailAccountResolver(async (purpose) => {
+    try {
+      await ensureEmailAccountPurposesColumn()
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT email_address, encrypted_password FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE(?)) AND is_active = 1 LIMIT 1`,
+        [purpose],
+      )
+      if (!rows || !rows.length) return null
+      return {
+        email_address: String(rows[0].email_address),
+        plain_password: decryptSmtpPassword(String(rows[0].encrypted_password)),
+      }
+    } catch {
+      return null
+    }
+  })
+
+  setSmtpSettingsResolver(async () => {
+    try {
+      const settings = await getRuntimeSettings()
+      const host = String(settings.smtp_host || '').trim()
+      const port = Number(settings.smtp_port) || 0
+      const secure = settings.smtp_secure === 'ssl'
+      if (!host || !port) return null
+      return { host, port, secure }
+    } catch {
+      return null
+    }
+  })
 
   startServer(DEFAULT_PORT)
 }

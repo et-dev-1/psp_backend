@@ -1,9 +1,9 @@
 ### ============================================
 ### CUSTOMER MANAGEMENT
 ### ============================================
-@baseUrl = https://api.barakahmart.se:3001
+@baseUrl = https://api.barakahmart.se
 
-#@baseUrl = http://localhost:3001
+#@baseUrl = http://172.25.38.242:3001
 
 ### Base URL
 # Use {{baseUrl}} in requests below

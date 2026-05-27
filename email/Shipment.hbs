@@ -19,11 +19,18 @@
                       <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:14px;">
                         <tr>
                           <td style="vertical-align:middle; padding-right:14px;">
-                            <img src="{{company_logo_url}}" alt="{{company_name}} logo" style="display:block; width:48px; height:48px; object-fit:contain; border-radius:10px; background-color:#ffffff; padding:6px;" />
+                            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                              <tr>
+                                <td style="width:44px;height:44px;background:#6d28d9;background:linear-gradient(135deg,#7c3aed,#4f46e5);border-radius:10px;text-align:center;vertical-align:middle;">
+                                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:10px auto;">
+                                    <path d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                                  </svg>
+                                </td>
+                              </tr>
+                            </table>
                           </td>
                           <td style="vertical-align:middle;">
                             <p style="margin:0; font-size:17px; font-weight:700; color:#ffffff;">{{company_name}}</p>
-                            <p style="margin:3px 0 0; font-size:12px; color:#bfdbfe;">{{company_email}}</p>
                           </td>
                         </tr>
                       </table>
@@ -65,10 +72,7 @@
                         <p style="margin:0; font-size:18px; font-weight:700; color:#1d4ed8; letter-spacing:1px; font-family:monospace;">{{tracking_number}}</p>
                       </td>
                       <td align="right" style="vertical-align:middle; white-space:nowrap;">
-                        <a href="{{tracking_url}}" target="_blank"
-                          style="display:inline-block; padding:10px 20px; background-color:#2563eb; color:#ffffff; font-size:13px; font-weight:700; text-decoration:none; border-radius:8px;">
-                          Track Shipment →
-                        </a>
+                        <a href="{{tracking_url}}" style="display:inline-block; padding:10px 20px; background-color:#1d4ed8; color:#ffffff; text-decoration:none; border-radius:8px; font-size:13px; font-weight:700;">Track Shipment</a>
                       </td>
                     </tr>
                   </table>
