@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 const nodemailer = require('nodemailer')
-import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER } from '../config'
+import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER, CLIENT_URL, BACKEND_PUBLIC_BASE_URL } from '../config'
 
 const resolveTemplatePath = (filename: string): string => {
   const candidates = [
@@ -17,6 +17,32 @@ const resolveTemplatePath = (filename: string): string => {
   }
 
   throw new Error(`Email template not found: ${filename}. Checked: ${candidates.join(', ')}`)
+}
+
+const getEmailBaseUrl = (): string => {
+  const clientBase = String(CLIENT_URL || '').replace(/\/+$/, '')
+  if (clientBase) return clientBase
+
+  const backendBase = String(BACKEND_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
+  if (backendBase) return backendBase
+
+  return ''
+}
+
+const normalizeEmailUrl = (value: string): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return '#'
+
+  if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(raw) || raw.startsWith('mailto:') || raw.startsWith('tel:')) {
+    return raw
+  }
+
+  const base = getEmailBaseUrl()
+  if (!base) {
+    return raw.startsWith('/') ? raw : `/${raw}`
+  }
+
+  return raw.startsWith('/') ? `${base}${raw}` : `${base}/${raw}`
 }
 
 // Do NOT capture host/port/secure at module load — read live from SMTP object at call time
@@ -174,7 +200,7 @@ export const createSellerVerificationEmailHtml = (input: { company: EmailCompany
     company_email: String(input.company.company_email || '').trim(),
     company_address: String(input.company.company_address || '').trim(),
     organization_number: String(input.company.organization_number || '').trim(),
-    verification_url: String(input.verification_url || '').trim(),
+    verification_url: normalizeEmailUrl(input.verification_url),
     email_footer: footer,
   })
 }
@@ -192,7 +218,7 @@ export const createSellerPasswordResetEmailHtml = (input: { company: EmailCompan
     company_email: String(input.company.company_email || '').trim(),
     company_address: String(input.company.company_address || '').trim(),
     organization_number: String(input.company.organization_number || '').trim(),
-    reset_url: String(input.reset_url || '').trim(),
+    reset_url: normalizeEmailUrl(input.reset_url),
     email_footer: footer,
   })
 }
@@ -238,7 +264,7 @@ export const createDigitalProductEmailHtml = (input: CreateDigitalProductEmailHt
       return `<tr style="background-color:${rowBg};">
         <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${item.product_name}</td>
         <td align="left" style="padding:12px 16px;">
-          <a href="${item.download_url}" style="display:inline-block; padding:8px 20px; background-color:#111827; color:#ffffff; text-decoration:none; border-radius:8px; font-size:13px; font-weight:600;">Download</a>
+          <a href="${normalizeEmailUrl(item.download_url)}" style="display:inline-block; padding:8px 20px; background-color:#111827; color:#ffffff; text-decoration:none; border-radius:8px; font-size:13px; font-weight:600;">Download</a>
         </td>
       </tr>`
     })
@@ -450,7 +476,7 @@ export const createShipmentNotificationEmailHtml = (input: CreateShipmentNotific
     order_id: String(input.order_id || ''),
     order_date: String(input.order_date || ''),
     tracking_number: String(input.tracking_number || ''),
-    tracking_url: String(input.tracking_url || '').trim(),
+    tracking_url: normalizeEmailUrl(input.tracking_url),
     shipping_address: String(input.shipping_address || 'N/A'),
     email_footer: createEmailFooterHtml({
       company_name: String(input.company.company_name || ''),
@@ -729,7 +755,7 @@ export const createSellerProfileStatusEmailHtml = (input: SellerProfileStatusEma
     status_color: s.color,
     reason_block: reasonBlock,
     updated_at: input.updated_at,
-    cta_url: input.cta_url,
+    cta_url: normalizeEmailUrl(input.cta_url),
     cta_label: s.ctaLabel,
     cta_bg: s.ctaBg,
     email_footer: footer,
@@ -788,7 +814,7 @@ export const createProductStatusEmailHtml = (input: ProductStatusEmailInput): st
     product_category: String(input.product_category || '—').trim(),
     reason_block: reasonBlock,
     updated_at: input.updated_at,
-    cta_url: input.cta_url,
+    cta_url: normalizeEmailUrl(input.cta_url),
     cta_label: ctaLabel,
     cta_bg: ctaBg,
     email_footer: footer,

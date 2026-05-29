@@ -2530,6 +2530,28 @@ const normalizeVariantsFromRequest = (
   return result
 }
 
+const validateVariantPricing = (variants: NormalizedVariant[]): string | null => {
+  for (const variant of variants) {
+    const price = Number(variant.price)
+    if (!Number.isFinite(price) || price <= 0) {
+      return `Invalid price for variant "${variant.variant_name}" / "${variant.variant_value}"`
+    }
+
+    if (variant.discount_price == null) continue
+
+    const discountPrice = Number(variant.discount_price)
+    if (!Number.isFinite(discountPrice) || discountPrice <= 0) {
+      return `Invalid discount price for variant "${variant.variant_name}" / "${variant.variant_value}"`
+    }
+
+    if (discountPrice >= price) {
+      return `Discount price must be less than the price for variant "${variant.variant_name}" / "${variant.variant_value}"`
+    }
+  }
+
+  return null
+}
+
 // ===== Rate limiter for login/register =====
 const signinRateLimiter: Map<string, number[]> = new Map()
 const signupRateLimiter: Map<string, number[]> = new Map()
@@ -2592,6 +2614,19 @@ const getServerBaseUrl = (req: Request): string => {
     throw new Error('Cannot resolve server host. Set BACKEND_PUBLIC_BASE_URL in environment.')
   }
   return `${protocol}://${host}`
+}
+
+const getClientBaseUrl = (): string => {
+  const clientBase = String(config.CLIENT_URL || '').replace(/\/+$/, '')
+  if (clientBase) {
+    return clientBase
+  }
+
+  if (config.BACKEND_PUBLIC_BASE_URL) {
+    return config.BACKEND_PUBLIC_BASE_URL.replace(/\/+$/, '')
+  }
+
+  throw new Error('Cannot resolve client host. Set CLIENT_URL in environment.')
 }
 
 
@@ -2714,7 +2749,7 @@ app.post('/api/register', async (req: Request, res: Response) => {
 
 app.get('/api/email/verify', async (req: Request, res: Response) => {
   const token = String(req.query?.token || '').trim()
-  const signinUrl = `${String(config.CLIENT_URL).replace(/\/$/, '')}/signin`
+  const signinUrl = `${getClientBaseUrl()}/signin`
 
   if (!token) {
     return res.redirect(`${signinUrl}?emailVerified=0&reason=invalid-link`)
@@ -2777,7 +2812,7 @@ app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
       const rawToken = crypto.randomBytes(32).toString('hex')
       const tokenHash = hashToken(rawToken)
       const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_MS)
-      const resetUrl = `${String(config.CLIENT_URL).replace(/\/$/, '')}/reset-password?token=${rawToken}`
+      const resetUrl = `${getClientBaseUrl()}/reset-password?token=${rawToken}`
 
       await db.query(
         'UPDATE users SET password_reset_token_hash = ?, password_reset_expires_at = ? WHERE id = ? LIMIT 1',
@@ -5483,7 +5518,7 @@ app.post('/api/profiles', profileUpload.fields([{ name: 'companyLogo', maxCount:
             status: 'pending',
             reason: null,
             updated_at: now,
-            cta_url: `${config.CLIENT_URL}/profile-registration`,
+            cta_url: `${getClientBaseUrl()}/profile-registration`,
           }),
           { purpose: 'sellers' },
         ).catch((err) => console.error('[Profile create] Pending email failed (non-blocking):', err))
@@ -6531,8 +6566,9 @@ const notifySellerProfileStatusChange = async (
   try {
     const companyInfo = await getPlatformCompanyEmailInfo()
     const now = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' })
-    const profileUrl = `${config.CLIENT_URL}/profile-registration`
-    const dashboardUrl = `${config.CLIENT_URL}/dashboard`
+    const clientBaseUrl = getClientBaseUrl()
+    const profileUrl = `${clientBaseUrl}/profile-registration`
+    const dashboardUrl = `${clientBaseUrl}/`
 
     const subjectMap: Record<string, string> = {
       verified: `✅ Your seller account has been approved — ${platformName}`,
@@ -7027,7 +7063,7 @@ app.post('/api/admin/products/:id/approve', async (req: Request, res: Response) 
             product_category: String(productRows[0].category || ''),
             status: 'approved',
             updated_at: now,
-            cta_url: `${config.CLIENT_URL}/seller/products`,
+            cta_url: `${getClientBaseUrl()}/seller/products`,
           }),
           { purpose: 'sellers' },
         ).catch((err) => console.error('[Product approve] Email failed (non-blocking):', err))
@@ -7109,7 +7145,7 @@ app.post('/api/admin/products/:id/reject', async (req: Request, res: Response) =
             status: 'rejected',
             rejection_message: rejectionMessage,
             updated_at: now,
-            cta_url: `${config.CLIENT_URL}/seller/products`,
+            cta_url: `${getClientBaseUrl()}/seller/products`,
           }),
           { purpose: 'sellers' },
         ).catch((err) => console.error('[Product reject] Email failed (non-blocking):', err))
@@ -7326,6 +7362,11 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
 
     if (normalizedVariants.length === 0) {
       return res.status(400).json({ error: 'At least one variant is required' })
+    }
+
+    const pricingError = validateVariantPricing(normalizedVariants)
+    if (pricingError) {
+      return res.status(400).json({ error: pricingError })
     }
 
     const resolvedProductType: 'digital' | 'physical' =
@@ -7630,6 +7671,11 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
 
       if (normalizedVariants.length === 0) {
         return res.status(400).json({ message: 'At least one variant is required' })
+      }
+
+      const pricingError = validateVariantPricing(normalizedVariants)
+      if (pricingError) {
+        return res.status(400).json({ message: pricingError })
       }
 
       // Process variant images if uploaded
@@ -8055,6 +8101,124 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Get Public Product by ID (No Auth Required) =====
+app.get('/api/public/products/:id', async (req: Request, res: Response) => {
+  const productId = Number(req.params.id)
+
+  if (!Number.isFinite(productId) || productId <= 0) {
+    return res.status(400).json({ message: 'Invalid product id' })
+  }
+
+  try {
+    await ensureProfilesStatusColumns()
+
+    const [products] = await db.query<RowDataPacket[]>(
+      `SELECT
+        p.id,
+        p.seller_id,
+        p.name,
+        p.subtitle,
+        p.description,
+        p.category,
+        p.brand,
+        p.age_category,
+        p.item_condition,
+        p.tax_class,
+        p.main_image_url,
+        p.status,
+        p.created_at,
+        p.updated_at,
+        ANY_VALUE(u.email) as seller_email,
+        ANY_VALUE(sp.profile_type) as seller_profile_type,
+        MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
+        GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
+      FROM products p
+      LEFT JOIN product_images pi ON p.id = pi.product_id
+      LEFT JOIN users u ON p.seller_id = u.id
+      LEFT JOIN profiles sp ON sp.id = (
+        SELECT p2.id
+        FROM profiles p2
+        WHERE p2.user_id = u.id
+        ORDER BY p2.created_at DESC, p2.id DESC
+        LIMIT 1
+      )
+      WHERE p.id = ?
+        AND p.status = 'active'
+        AND p.approval_status = 'approved'
+        AND COALESCE(sp.status, 'pending') = 'verified'
+      GROUP BY p.id
+      LIMIT 1`,
+      [productId],
+    )
+
+    if (!products.length) {
+      return res.status(404).json({ message: 'Product not found' })
+    }
+
+    const product = products[0]
+
+    const [variantRows] = await db.query<RowDataPacket[]>(
+      'SELECT * FROM product_variants WHERE product_id = ? ORDER BY id ASC',
+      [productId],
+    )
+
+    const grouped: Record<string, any[]> = {}
+    const isPrivateSeller = String(product.seller_profile_type || '').toLowerCase() === 'private'
+    const taxRate = isPrivateSeller ? 0 : parseTaxRateFromDbValue(product.tax_class)
+
+    for (const row of variantRows) {
+      if (!grouped[row.variant_name]) grouped[row.variant_name] = []
+      grouped[row.variant_name].push({
+        id: row.id,
+        value: row.variant_value,
+        stock: Number(row.stock_quantity || 0),
+        sku: row.sku,
+        length: row.length_cm,
+        width: row.width_cm,
+        height: row.height_cm,
+        weight: row.weight_kg,
+        price: row.price,
+        discount_price: row.discount_price,
+        type: row.type,
+        image: row.image_url,
+        file: row.file_url,
+      })
+    }
+
+    const metadata = {
+      variants: Object.entries(grouped).map(([className, values]) => ({ className, values })),
+    }
+
+    const stockQuantity = variantRows.reduce((sum, row) => sum + Number(row.stock_quantity || 0), 0)
+    const minPrice = variantRows.length > 0 ? Math.min(...variantRows.map((row) => Number(row.price || 0))) : null
+    const discountCandidates = variantRows
+      .map((row) => (row.discount_price == null ? null : Number(row.discount_price)))
+      .filter((value): value is number => value != null)
+    const minDiscount = discountCandidates.length > 0 ? Math.min(...discountCandidates) : null
+    const primary = variantRows[0]
+
+    const response = {
+      ...product,
+      type: primary?.type || 'physical',
+      tax_rate: taxRate,
+      price: minPrice,
+      discount_price: minDiscount,
+      stock_quantity: stockQuantity,
+      digital_product_url: null,
+      metadata: JSON.stringify(metadata),
+    }
+
+    if (response.type !== 'digital' && Number(response.stock_quantity || 0) <= 0) {
+      return res.status(404).json({ message: 'Product not found' })
+    }
+
+    return res.status(200).json(response)
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ message: 'Database error' })
   }
 })
 
