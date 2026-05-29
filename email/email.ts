@@ -3,6 +3,22 @@ import path from 'path'
 const nodemailer = require('nodemailer')
 import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER } from '../config'
 
+const resolveTemplatePath = (filename: string): string => {
+  const candidates = [
+    path.join(__dirname, filename),
+    path.join(__dirname, '..', '..', 'email', filename),
+    path.join(process.cwd(), 'email', filename),
+  ]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error(`Email template not found: ${filename}. Checked: ${candidates.join(', ')}`)
+}
+
 // Do NOT capture host/port/secure at module load — read live from SMTP object at call time
 const organizationNumber = COMPANY_ORGANIZATION_NUMBER || 'N/A'
 
@@ -36,7 +52,7 @@ const stripHtml = (value: string): string => {
     .trim()
 }
 
-const invoiceTemplatePath = path.join(__dirname, 'InvoiceCustomer.hbs')
+const invoiceTemplatePath = resolveTemplatePath('InvoiceCustomer.hbs')
 let invoiceTemplateCache: string | null = null
 
 const getInvoiceTemplate = (): string => {
@@ -45,7 +61,7 @@ const getInvoiceTemplate = (): string => {
   return invoiceTemplateCache
 }
 
-const digitalProductTemplatePath = path.join(__dirname, 'DigitalProduct.hbs')
+const digitalProductTemplatePath = resolveTemplatePath('DigitalProduct.hbs')
 let digitalProductTemplateCache: string | null = null
 
 const getDigitalProductTemplate = (): string => {
@@ -54,7 +70,7 @@ const getDigitalProductTemplate = (): string => {
   return digitalProductTemplateCache
 }
 
-const shipmentTemplatePath = path.join(__dirname, 'Shipment.hbs')
+const shipmentTemplatePath = resolveTemplatePath('Shipment.hbs')
 let shipmentTemplateCache: string | null = null
 
 const getShipmentTemplate = (): string => {
@@ -63,7 +79,7 @@ const getShipmentTemplate = (): string => {
   return shipmentTemplateCache
 }
 
-const sellerPayoutReceiptTemplatePath = path.join(__dirname, 'SellerPayoutReceipt.hbs')
+const sellerPayoutReceiptTemplatePath = resolveTemplatePath('SellerPayoutReceipt.hbs')
 let sellerPayoutReceiptTemplateCache: string | null = null
 
 const getSellerPayoutReceiptTemplate = (): string => {
@@ -72,7 +88,7 @@ const getSellerPayoutReceiptTemplate = (): string => {
   return sellerPayoutReceiptTemplateCache
 }
 
-const emailFooterTemplatePath = path.join(__dirname, 'EmailFooter.hbs')
+const emailFooterTemplatePath = resolveTemplatePath('EmailFooter.hbs')
 let emailFooterTemplateCache: string | null = null
 
 const getEmailFooterTemplate = (): string => {
@@ -81,7 +97,7 @@ const getEmailFooterTemplate = (): string => {
   return emailFooterTemplateCache
 }
 
-const sellerVerificationTemplatePath = path.join(__dirname, 'SellerVerification.hbs')
+const sellerVerificationTemplatePath = resolveTemplatePath('SellerVerification.hbs')
 let sellerVerificationTemplateCache: string | null = null
 
 const getSellerVerificationTemplate = (): string => {
@@ -90,7 +106,7 @@ const getSellerVerificationTemplate = (): string => {
   return sellerVerificationTemplateCache
 }
 
-const sellerPasswordResetTemplatePath = path.join(__dirname, 'SellerPasswordReset.hbs')
+const sellerPasswordResetTemplatePath = resolveTemplatePath('SellerPasswordReset.hbs')
 let sellerPasswordResetTemplateCache: string | null = null
 
 const getSellerPasswordResetTemplate = (): string => {
@@ -99,7 +115,7 @@ const getSellerPasswordResetTemplate = (): string => {
   return sellerPasswordResetTemplateCache
 }
 
-const sellerProfileStatusTemplatePath = path.join(__dirname, 'SellerProfileStatus.hbs')
+const sellerProfileStatusTemplatePath = resolveTemplatePath('SellerProfileStatus.hbs')
 let sellerProfileStatusTemplateCache: string | null = null
 
 const getSellerProfileStatusTemplate = (): string => {
@@ -108,7 +124,7 @@ const getSellerProfileStatusTemplate = (): string => {
   return sellerProfileStatusTemplateCache
 }
 
-const productStatusTemplatePath = path.join(__dirname, 'ProductStatus.hbs')
+const productStatusTemplatePath = resolveTemplatePath('ProductStatus.hbs')
 let productStatusTemplateCache: string | null = null
 
 const getProductStatusTemplate = (): string => {
