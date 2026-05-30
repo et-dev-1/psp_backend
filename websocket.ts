@@ -1,6 +1,8 @@
 import { Server } from 'socket.io'
 import { Server as HttpServer } from 'http'
 import jwt from 'jsonwebtoken'
+import { RowDataPacket } from 'mysql2'
+import db from './db'
 import { JWT_SECRET, CORS_ORIGINS } from './config'
 
 interface AuthableSocket {
@@ -27,6 +29,22 @@ export type WebhookEventType =
 
 let io: Server | null = null
 const activeConnections = new Map<number, Set<string>>() // userId -> Set of socketIds
+let hasUsersSessionVersionColumnCache: boolean | null = null
+
+const ensureUserSessionVersionColumn = async () => {
+  try {
+    if (hasUsersSessionVersionColumnCache !== true) {
+      const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM users LIKE 'session_version'")
+      if (rows.length === 0) {
+        await db.query('ALTER TABLE users ADD COLUMN session_version INT NOT NULL DEFAULT 1')
+      }
+      hasUsersSessionVersionColumnCache = true
+    }
+  } catch (error) {
+    hasUsersSessionVersionColumnCache = null
+    throw error
+  }
+}
 
 export const setupWebSocket = (httpServer: HttpServer): Server => {
   io = new Server(httpServer, {
@@ -38,15 +56,32 @@ export const setupWebSocket = (httpServer: HttpServer): Server => {
     transports: ['websocket', 'polling'],
   })
 
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth.token || socket.handshake.query.token
-    
+
     if (!token) {
       return next(new Error('Authentication error: Missing token'))
     }
 
     try {
-      const decoded = jwt.verify(token, JWT_SECRET) as { id: number }
+      const decoded = jwt.verify(String(token), JWT_SECRET) as { id: number; sv?: number }
+      await ensureUserSessionVersionColumn()
+
+      const [rows] = await db.query<RowDataPacket[]>(
+        'SELECT session_version FROM users WHERE id = ? LIMIT 1',
+        [decoded.id],
+      )
+
+      if (!rows.length) {
+        return next(new Error('Authentication error: Invalid session'))
+      }
+
+      const currentSessionVersion = Number(rows[0].session_version || 1)
+      const tokenSessionVersion = Number(decoded.sv || 1)
+      if (currentSessionVersion !== tokenSessionVersion) {
+        return next(new Error('Authentication error: Session expired'))
+      }
+
       ;(socket as AuthableSocket).userId = decoded.id
       return next()
     } catch (err) {

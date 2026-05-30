@@ -3,6 +3,7 @@ import cors from 'cors'
 import crypto from 'crypto'
 import db from './db'
 import bcrypt from 'bcrypt'
+import helmet from 'helmet'
 import jwt from 'jsonwebtoken'
 import * as config from './config'
 import Stripe from 'stripe'
@@ -205,6 +206,8 @@ interface PaymentMethod {
 
 const app = express()
 
+app.set('trust proxy', config.NODE_ENV === 'production' ? 1 : false)
+
 const uploadsRootDir = String(config.UPLOADS_DIR || '').trim() || path.join(__dirname, 'uploads')
 const ensureDir = (dirPath: string) => {
   if (!fs.existsSync(dirPath)) {
@@ -216,6 +219,66 @@ const uploadsDir = (...segments: string[]) => path.join(uploadsRootDir, ...segme
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true })
 })
+
+app.get('/sitemap.xml', async (_req: Request, res: Response) => {
+  try {
+    await ensureProfilesStatusColumns()
+
+    const baseUrl = getClientBaseUrl()
+
+    const [productRows] = await db.query<RowDataPacket[]>(
+      `SELECT
+        p.id,
+        p.created_at,
+        p.updated_at,
+        p.type,
+        p.stock_quantity
+      FROM products p
+      LEFT JOIN users u ON p.seller_id = u.id
+      LEFT JOIN profiles sp ON sp.id = (
+        SELECT p2.id
+        FROM profiles p2
+        WHERE p2.user_id = u.id
+        ORDER BY p2.created_at DESC, p2.id DESC
+        LIMIT 1
+      )
+      WHERE p.status = 'active'
+        AND p.approval_status = 'approved'
+        AND COALESCE(sp.status, 'pending') = 'verified'
+      ORDER BY p.created_at DESC`,
+    )
+
+    const productEntries = productRows
+      .filter((product) => String(product.type || '').toLowerCase() === 'digital' || Number(product.stock_quantity || 0) > 0)
+      .map((product) => ({
+        loc: buildAbsoluteUrl(baseUrl, `/shop-now?product=${encodeURIComponent(String(product.id))}`),
+        lastmod: new Date(product.updated_at || product.created_at || Date.now()).toISOString(),
+      }))
+
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      ...PUBLIC_SITEMAP_ROUTES.map((routePath) => `  <url><loc>${escapeXml(buildAbsoluteUrl(baseUrl, routePath))}</loc></url>`),
+      ...productEntries.map(({ loc, lastmod }) => `  <url><loc>${escapeXml(loc)}</loc><lastmod>${escapeXml(lastmod)}</lastmod></url>`),
+      '</urlset>',
+    ].join('\n')
+
+    res
+      .status(200)
+      .type('application/xml; charset=utf-8')
+      .set('Cache-Control', 'public, max-age=3600')
+      .send(xml)
+  } catch (error) {
+    console.error('Failed to generate sitemap:', error)
+    res.status(500).type('text/plain; charset=utf-8').send('Unable to generate sitemap')
+  }
+})
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  }),
+)
 
 // ✅ CORS MUST be before routes - use dynamic origin checker for private network support
 app.use(
@@ -349,6 +412,33 @@ const getAuthToken = (req: Request): string | null => {
   return authHeader ? authHeader.split(' ')[1] : null
 }
 
+const verifyAuthToken = async (token: string): Promise<AuthPayload | null> => {
+  try {
+    const decoded = jwt.verify(token, config.JWT_SECRET) as AuthPayload
+
+    await ensureUserSessionVersionColumn()
+    const [rows] = await db.query<RowDataPacket[]>(
+      'SELECT session_version FROM users WHERE id = ? LIMIT 1',
+      [decoded.id],
+    )
+
+    if (!rows.length) {
+      return null
+    }
+
+    const currentSessionVersion = Number(rows[0].session_version || 1)
+    const tokenSessionVersion = Number(decoded.sv || 1)
+
+    if (tokenSessionVersion !== currentSessionVersion) {
+      return null
+    }
+
+    return { id: decoded.id, sv: tokenSessionVersion }
+  } catch {
+    return null
+  }
+}
+
 const requireAuth = async (req: Request, res: Response): Promise<AuthPayload | null> => {
   // Skip token check if DISABLE_AUTH_CHECK is set (for testing)
   if (config.DISABLE_AUTH_CHECK) {
@@ -362,33 +452,13 @@ const requireAuth = async (req: Request, res: Response): Promise<AuthPayload | n
     return null
   }
 
-  try {
-    const decoded = jwt.verify(token, config.JWT_SECRET) as AuthPayload
-
-    await ensureUserSessionVersionColumn()
-    const [rows] = await db.query<RowDataPacket[]>(
-      'SELECT session_version FROM users WHERE id = ? LIMIT 1',
-      [decoded.id],
-    )
-
-    if (!rows.length) {
-      res.status(401).json({ message: 'Invalid session' })
-      return null
-    }
-
-    const currentSessionVersion = Number(rows[0].session_version || 1)
-    const tokenSessionVersion = Number(decoded.sv || 1)
-
-    if (tokenSessionVersion !== currentSessionVersion) {
-      res.status(401).json({ message: 'Session expired. Please sign in again.' })
-      return null
-    }
-
-    return { id: decoded.id, sv: tokenSessionVersion }
-  } catch {
+  const auth = await verifyAuthToken(token)
+  if (!auth) {
     res.status(401).json({ message: 'Invalid or expired token' })
     return null
   }
+
+  return auth
 }
 
 const toCETDateTime = (value?: Date | string): string | null => {
@@ -2673,6 +2743,51 @@ const getClientBaseUrl = (): string => {
 
   throw new Error('Cannot resolve client host. Set CLIENT_URL in environment.')
 }
+
+const escapeXml = (value: string): string =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+
+const buildAbsoluteUrl = (baseUrl: string, routePath: string): string => {
+  const normalizedBase = String(baseUrl || '').replace(/\/+$/, '')
+  const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`
+  return `${normalizedBase}${normalizedPath}`
+}
+
+const PUBLIC_SITEMAP_ROUTES = [
+  '/',
+  '/home',
+  '/shop-now',
+  '/about-us',
+  '/contact-us',
+  '/shipping-info',
+  '/privacy-policy',
+  '/seller-faq',
+  '/terms-of-service',
+  '/return-policy',
+  '/en/home',
+  '/en/shop-now',
+  '/en/about-us',
+  '/en/contact-us',
+  '/en/shipping-info',
+  '/en/privacy-policy',
+  '/en/seller-faq',
+  '/en/terms-of-service',
+  '/en/return-policy',
+  '/sv/home',
+  '/sv/shop-now',
+  '/sv/about-us',
+  '/sv/contact-us',
+  '/sv/shipping-info',
+  '/sv/privacy-policy',
+  '/sv/seller-faq',
+  '/sv/terms-of-service',
+  '/sv/return-policy',
+]
 
 
 const trimEmail = (value: unknown): string => String(value || '').trim().toLowerCase()
@@ -11569,8 +11684,7 @@ app.post('/api/seller/support', supportUpload, async (req: Request, res: Respons
   const auth = await requireSellerOrAdmin(req, res)
   if (!auth) return
 
-  const ip = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown')
-    .split(',')[0].trim()
+  const ip = String(req.ip || 'unknown').trim()
 
   if (!contactRateLimit(ip)) {
     return res.status(429).json({
@@ -11734,8 +11848,7 @@ app.post('/api/public/newsletter/subscribe', async (req: Request, res: Response)
 })
 
 app.post('/api/contact', async (req: Request, res: Response) => {
-  const ip = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown')
-    .split(',')[0].trim()
+  const ip = String(req.ip || 'unknown').trim()
 
   if (!contactRateLimit(ip)) {
     return res.status(429).json({
@@ -11799,7 +11912,10 @@ app.post('/api/contact', async (req: Request, res: Response) => {
 
     if (token) {
       try {
-        const decoded = jwt.verify(token, config.JWT_SECRET) as AuthPayload
+        const decoded = await verifyAuthToken(token)
+        if (!decoded) {
+          throw new Error('Invalid token')
+        }
         senderUserId = decoded.id
 
         const [userRows] = await db.query<RowDataPacket[]>(
