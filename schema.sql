@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS users (
   email_verification_token VARCHAR(128) NULL,
   password_reset_token_hash VARCHAR(128) NULL,
   password_reset_expires_at DATETIME NULL,
+  session_version INT NOT NULL DEFAULT 1,
   google_sub VARCHAR(255) NULL,
   is_2fa_enabled BOOLEAN DEFAULT FALSE,
   twofa_secret VARCHAR(255) NULL,

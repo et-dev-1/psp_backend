@@ -188,6 +188,7 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
 
 interface AuthPayload {
   id: number
+  sv?: number
 }
 
 interface AuthWithRole extends AuthPayload {
@@ -348,11 +349,11 @@ const getAuthToken = (req: Request): string | null => {
   return authHeader ? authHeader.split(' ')[1] : null
 }
 
-const requireAuth = (req: Request, res: Response): AuthPayload | null => {
+const requireAuth = async (req: Request, res: Response): Promise<AuthPayload | null> => {
   // Skip token check if DISABLE_AUTH_CHECK is set (for testing)
   if (config.DISABLE_AUTH_CHECK) {
     console.log('⚠️ WARNING: Authentication check is DISABLED for testing')
-    return { id: 1 } // Mock user ID for testing
+    return { id: 1, sv: 1 } // Mock user ID for testing
   }
 
   const token = getAuthToken(req)
@@ -360,8 +361,30 @@ const requireAuth = (req: Request, res: Response): AuthPayload | null => {
     res.status(401).json({ message: 'Access denied' })
     return null
   }
+
   try {
-    return jwt.verify(token, config.JWT_SECRET) as AuthPayload
+    const decoded = jwt.verify(token, config.JWT_SECRET) as AuthPayload
+
+    await ensureUserSessionVersionColumn()
+    const [rows] = await db.query<RowDataPacket[]>(
+      'SELECT session_version FROM users WHERE id = ? LIMIT 1',
+      [decoded.id],
+    )
+
+    if (!rows.length) {
+      res.status(401).json({ message: 'Invalid session' })
+      return null
+    }
+
+    const currentSessionVersion = Number(rows[0].session_version || 1)
+    const tokenSessionVersion = Number(decoded.sv || 1)
+
+    if (tokenSessionVersion !== currentSessionVersion) {
+      res.status(401).json({ message: 'Session expired. Please sign in again.' })
+      return null
+    }
+
+    return { id: decoded.id, sv: tokenSessionVersion }
   } catch {
     res.status(401).json({ message: 'Invalid or expired token' })
     return null
@@ -408,6 +431,7 @@ let hasUsersEmailIsVerifiedColumnCache: boolean | null = null
 let hasUsersEmailVerificationTokenColumnCache: boolean | null = null
 let hasUsersPasswordResetTokenHashColumnCache: boolean | null = null
 let hasUsersPasswordResetExpiresAtColumnCache: boolean | null = null
+let hasUsersSessionVersionColumnCache: boolean | null = null
 let hasUsersGoogleSubColumnCache: boolean | null = null
 let hasUsersNotifyOrderReceivedColumnCache: boolean | null = null
 let hasUsersNotifyPaymentReceivedColumnCache: boolean | null = null
@@ -585,6 +609,22 @@ const ensurePasswordResetColumns = async () => {
     hasUsersPasswordResetTokenHashColumnCache = null
     hasUsersPasswordResetExpiresAtColumnCache = null
     console.error('Failed ensuring password reset columns:', error)
+    throw error
+  }
+}
+
+const ensureUserSessionVersionColumn = async () => {
+  try {
+    if (hasUsersSessionVersionColumnCache !== true) {
+      const [rows] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM users LIKE 'session_version'")
+      if (rows.length === 0) {
+        await db.query('ALTER TABLE users ADD COLUMN session_version INT NOT NULL DEFAULT 1')
+      }
+      hasUsersSessionVersionColumnCache = true
+    }
+  } catch (error) {
+    hasUsersSessionVersionColumnCache = null
+    console.error('Failed ensuring users.session_version column:', error)
     throw error
   }
 }
@@ -1181,7 +1221,7 @@ const ensureSalesPayoutColumns = async () => {
 }
 
 const requireAdmin = async (req: Request, res: Response): Promise<AuthPayload | null> => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return null
 
   try {
@@ -1199,7 +1239,7 @@ const requireAdmin = async (req: Request, res: Response): Promise<AuthPayload | 
 }
 
 const requireSellerOrAdmin = async (req: Request, res: Response): Promise<AuthWithRole | null> => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return null
 
   try {
@@ -2664,8 +2704,8 @@ const validateAuthCaptchaChallenge = (challengeId: string, captchaAnswer: string
 
 const hashToken = (value: string): string => crypto.createHash('sha256').update(value).digest('hex')
 
-const issueAuthToken = (userId: number): string => {
-  return jwt.sign({ id: userId }, config.JWT_SECRET, {
+const issueAuthToken = (userId: number, sessionVersion: number): string => {
+  return jwt.sign({ id: userId, sv: sessionVersion }, config.JWT_SECRET, {
     expiresIn: '24h',
   })
 }
@@ -2852,6 +2892,7 @@ app.get('/api/auth/reset-password/validate', async (req: Request, res: Response)
 
   try {
     await ensurePasswordResetColumns()
+    await ensureUserSessionVersionColumn()
     const tokenHash = hashToken(rawToken)
     const [rows] = await db.query<RowDataPacket[]>(
       'SELECT id FROM users WHERE password_reset_token_hash = ? AND password_reset_expires_at IS NOT NULL AND password_reset_expires_at > NOW() LIMIT 1',
@@ -2879,6 +2920,7 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
 
   try {
     await ensurePasswordResetColumns()
+    await ensureUserSessionVersionColumn()
     const tokenHash = hashToken(rawToken)
     const [rows] = await db.query<RowDataPacket[]>(
       'SELECT id FROM users WHERE password_reset_token_hash = ? AND password_reset_expires_at IS NOT NULL AND password_reset_expires_at > NOW() LIMIT 1',
@@ -2891,11 +2933,14 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
 
     const hashedPassword = await bcrypt.hash(password, 10)
     await db.query(
-      'UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE id = ? LIMIT 1',
+      'UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL, session_version = session_version + 1 WHERE id = ? LIMIT 1',
       [hashedPassword, rows[0].id],
     )
 
-    return res.json({ message: 'Password updated successfully. You can now sign in.' })
+    return res.json({
+      message: 'Password updated successfully. You can now sign in.',
+      sessions_invalidated: true,
+    })
   } catch (error) {
     console.error('Reset password error:', error)
     return res.status(500).json({ message: 'Failed to reset password.' })
@@ -2912,6 +2957,7 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
   try {
     await ensureEmailVerificationColumns()
     await ensureGoogleAuthColumns()
+    await ensureUserSessionVersionColumn()
 
     const payload = await getGoogleUserPayload(credential)
     const email = trimEmail(payload?.email)
@@ -2954,7 +3000,7 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
       user = freshRows[0]
     }
 
-    const token = issueAuthToken(Number(user.id))
+    const token = issueAuthToken(Number(user.id), Number(user.session_version || 1))
     return res.json({
       message: 'Google authentication successful',
       token,
@@ -3001,6 +3047,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
   try {
     await ensureTwoFaColumns()
     await ensureEmailVerificationColumns()
+    await ensureUserSessionVersionColumn()
 
     const [rows] = await db.query<RowDataPacket[]>(
       'SELECT * FROM users WHERE LOWER(email) = LOWER(?)', [email]
@@ -3067,7 +3114,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
       }
     }
 
-    const token = issueAuthToken(Number(user.id))
+    const token = issueAuthToken(Number(user.id), Number(user.session_version || 1))
 
     res.json({
       message: 'Login successful',
@@ -3085,7 +3132,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
 })
 
 app.get('/api/settings/2fa/status', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -3108,7 +3155,7 @@ app.get('/api/settings/2fa/status', async (req: Request, res: Response) => {
 })
 
 app.post('/api/settings/2fa/setup', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -3154,7 +3201,7 @@ app.post('/api/settings/2fa/setup', async (req: Request, res: Response) => {
 })
 
 app.post('/api/settings/2fa/enable', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const token = String(req.body?.token || '').trim()
@@ -3190,7 +3237,7 @@ app.post('/api/settings/2fa/enable', async (req: Request, res: Response) => {
 })
 
 app.post('/api/settings/2fa/disable', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const token = String(req.body?.token || '').trim()
@@ -3234,7 +3281,7 @@ app.post('/api/settings/2fa/disable', async (req: Request, res: Response) => {
 })
 
 app.get('/api/settings/preferences', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -3274,7 +3321,7 @@ app.get('/api/settings/preferences', async (req: Request, res: Response) => {
 })
 
 app.put('/api/settings/preferences', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -3364,7 +3411,10 @@ app.post('/api/settings/change-password', async (req: Request, res: Response) =>
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10)
-    await db.query('UPDATE users SET password = ? WHERE id = ? LIMIT 1', [hashedPassword, auth.id])
+    await db.query(
+      'UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ? LIMIT 1',
+      [hashedPassword, auth.id],
+    )
 
     return res.json({ success: true, message: 'Password changed successfully.' })
   } catch (error) {
@@ -3425,7 +3475,7 @@ app.post('/api/settings/test-email', async (req: Request, res: Response) => {
 })
 
 app.get('/api/seller/account/check-deletion-eligibility', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
   try {
     const [activeOrders] = await db.query<RowDataPacket[]>(
@@ -3454,7 +3504,7 @@ app.get('/api/seller/account/check-deletion-eligibility', async (req: Request, r
 })
 
 app.post('/api/seller/account/request-deletion', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -3516,6 +3566,7 @@ app.post('/api/seller/account/reactivate', async (req: Request, res: Response) =
 
   try {
     await ensureAccountDeletionColumns()
+    await ensureUserSessionVersionColumn()
 
     const [rows] = await db.query<RowDataPacket[]>(
       'SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1',
@@ -3546,7 +3597,7 @@ app.post('/api/seller/account/reactivate', async (req: Request, res: Response) =
       [user.id],
     )
 
-    const token = issueAuthToken(Number(user.id))
+    const token = issueAuthToken(Number(user.id), Number(user.session_version || 1))
 
     return res.status(200).json({
       message: 'Account reactivated successfully.',
@@ -4306,17 +4357,10 @@ app.post('/api/admin/settings/runtime/company-logo', adminSettingsLogoUpload.sin
 
 // ===== Protected Route =====
 app.get('/api/profile', async (req: Request, res: Response) => {
-  const authHeader = req.headers['authorization']
-  const token = authHeader && authHeader.split(' ')[1]
+  const auth = await requireAuth(req, res)
+  if (!auth) return
 
-  if (!token) return res.status(401).json({ message: 'Access denied' })
-
-  try {
-    const decoded = jwt.verify(token, config.JWT_SECRET) as AuthPayload
-    res.json({ message: 'Profile info', user: decoded })
-  } catch (err) {
-    res.status(403).json({ message: 'Invalid token' })
-  }
+  return res.json({ message: 'Profile info', user: auth })
 })
 
 app.get('/api/notifications/summary', async (req: Request, res: Response) => {
@@ -4671,7 +4715,7 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
 
 // ===== Store Payment Method =====
 app.post('/api/payment-options', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const {
@@ -5269,7 +5313,7 @@ const profileUpload = multer({
 })
 
 app.post('/api/profiles', profileUpload.fields([{ name: 'companyLogo', maxCount: 1 }, { name: 'profilePicture', maxCount: 1 }]), async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   await ensureProfilesStatusColumns()
@@ -5514,7 +5558,7 @@ app.post('/api/profiles', profileUpload.fields([{ name: 'companyLogo', maxCount:
 
 // ===== Update Profile Picture Only =====
 app.put('/api/profiles/picture', profileUpload.fields([{ name: 'profilePicture', maxCount: 1 }]), async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   await ensureProfilePictureUrlColumn()
@@ -5555,7 +5599,7 @@ app.put('/api/profiles/picture', profileUpload.fields([{ name: 'profilePicture',
 
 // ===== Profile Lookup Route =====
 app.get('/api/profiles', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -5578,7 +5622,7 @@ app.get('/api/profiles', async (req: Request, res: Response) => {
 })
 
 app.get('/api/bank-account', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -5610,7 +5654,7 @@ app.get('/api/bank-account', async (req: Request, res: Response) => {
 })
 
 app.put('/api/bank-account', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -7227,7 +7271,7 @@ app.post('/api/admin/payments/approve', async (req: Request, res: Response) => {
 
 // ===== Product Registration Route =====
 app.post('/api/products', productUpload, async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   // Only verified sellers can create products.
@@ -7531,7 +7575,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
 
 // ===== Update Product =====
 app.put('/api/products/:id', productUpload, async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -7795,7 +7839,10 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
 
 // ===== Get Products =====
 // GET /api/products/tags/suggestions — returns distinct tags for autocomplete
-app.get('/api/products/tags/suggestions', requireAuth, async (req, res) => {
+app.get('/api/products/tags/suggestions', async (req, res) => {
+  const auth = await requireAuth(req, res)
+  if (!auth) return
+
   try {
     await hasProductTagsColumn()
     const [rows] = await db.query<RowDataPacket[]>(
@@ -7818,7 +7865,7 @@ app.get('/api/products/tags/suggestions', requireAuth, async (req, res) => {
 })
 
 app.get('/api/products', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -8292,7 +8339,7 @@ app.get('/api/public/reviews', async (req: Request, res: Response) => {
 
 // ===== Delete Product =====
 app.delete('/api/products/:id', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -8328,7 +8375,7 @@ app.delete('/api/products/:id', async (req: Request, res: Response) => {
 
 // ===== Restore Product (Admin only) =====
 app.put('/api/products/:id/restore', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -8365,7 +8412,7 @@ app.put('/api/products/:id/restore', async (req: Request, res: Response) => {
 
 // ===== Permanent Delete Product (Admin only, only if never ordered) =====
 app.delete('/api/products/:id/permanent', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -8413,7 +8460,7 @@ app.delete('/api/products/:id/permanent', async (req: Request, res: Response) =>
 
 // ===== Toggle Product Promotion =====
 app.put('/api/products/:id/promote', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -8456,7 +8503,7 @@ app.put('/api/products/:id/promote', async (req: Request, res: Response) => {
 
 // ===== Get Product by ID =====
 app.get('/api/products/:id', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const productId = req.params.id
@@ -8553,7 +8600,7 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
 
 // GET seller's shipment policies
 app.get('/api/seller/shipment-policies', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -8582,7 +8629,7 @@ app.get('/api/seller/shipment-policies', async (req: Request, res: Response) => 
 
 // POST create or update shipment policies
 app.post('/api/seller/shipment-policies', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const { policies } = req.body
@@ -9573,7 +9620,7 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
 
 // ===== Create Order (Manual - for Seller Use) =====
 app.post('/api/orders', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const {
@@ -9629,7 +9676,7 @@ app.post('/api/orders', async (req: Request, res: Response) => {
 
 // ===== Get Dashboard Metrics =====
 app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -9732,7 +9779,7 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
 
 // ===== Get Customer Demographics by Country =====
 app.get('/api/dashboard/customer-demographics', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -9794,7 +9841,7 @@ app.get('/api/dashboard/customer-demographics', async (req: Request, res: Respon
 
 // ===== Get Statistics Chart Data (Monthly, Quarterly, Annually) =====
 app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -9883,7 +9930,7 @@ app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
 
 // ===== Get Payments and Earnings Data =====
 app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -10072,7 +10119,7 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
 
 // ===== Get Orders =====
 app.get('/api/orders', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -10233,7 +10280,7 @@ app.get('/api/orders', async (req: Request, res: Response) => {
 
 // ===== Get Order by ID =====
 app.get('/api/orders/:id', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const orderId = req.params.id
@@ -10451,7 +10498,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
 
 // ===== Update Order/Shipment Status =====
 app.put('/api/orders/:id', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const orderId = req.params.id
@@ -10628,7 +10675,7 @@ app.put('/api/orders/:id', async (req: Request, res: Response) => {
 
 // ===== Shipment Cost Check =====
 app.post('/api/shipment/cost', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   try {
@@ -10832,7 +10879,7 @@ app.post('/api/shipment/cost', async (req: Request, res: Response) => {
 
 // ===== Shipment Label Generate + Store =====
 app.post('/api/shipment/label', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const payload = req.body || {}
@@ -11066,7 +11113,7 @@ app.post('/api/shipment/label', async (req: Request, res: Response) => {
 
 // ===== Shipment Track =====
 app.get('/api/shipment/track/:trackingNumber', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const trackingNumber = String(req.params.trackingNumber || '').trim()
@@ -11133,7 +11180,7 @@ app.get('/api/shipment/track/:trackingNumber', async (req: Request, res: Respons
 
 // ===== Generate Shipment Label (legacy endpoint, now backed by shipment module) =====
 app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const saleId = Number(req.params.id)
@@ -11269,7 +11316,7 @@ app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) =
 
 // ===== Get Seller's Order Items =====
 app.get('/api/orders/:id/products', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   const orderId = req.params.id
@@ -11318,7 +11365,7 @@ app.get('/api/orders/:id/products', async (req: Request, res: Response) => {
 
 // ===== Stripe PaymentIntent =====
 app.post('/api/stripe/create-payment-intent', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   console.log('create-payment-intent:')
@@ -11358,7 +11405,7 @@ app.post('/api/stripe/create-payment-intent', async (req: Request, res: Response
 
 // ===== Stripe Reserve Payment (Manual Capture) =====
 app.post('/api/stripe/reserve-payment', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   console.log('reserve-payment:')
@@ -11419,7 +11466,7 @@ app.post('/api/stripe/reserve-payment', async (req: Request, res: Response) => {
 
 // ===== Stripe Checkout Session =====
 app.post('/api/stripe/create-checkout-session', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res)
+  const auth = await requireAuth(req, res)
   if (!auth) return
 
   console.log('create-checkout-session:')
