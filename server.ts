@@ -5174,33 +5174,6 @@ app.post('/api/swish/callback', async (req: Request, res: Response) => {
   }
 })
 
-// ===== Dev Utility: Promote Current User to Admin =====
-app.post('/api/dev/promote-me-admin', async (req: Request, res: Response) => {
-  if (config.NODE_ENV === 'production') {
-    return res.status(404).json({ message: 'Not found' })
-  }
-
-  const auth = requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const [result] = await db.query<ResultSetHeader>('UPDATE users SET role = ? WHERE id = ?', [
-      'admin',
-      auth.id,
-    ])
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: 'User not found' })
-    }
-
-    res.status(200).json({ message: 'Current user promoted to admin', user_id: auth.id, role: 'admin' })
-  } catch (error) {
-    console.error('Failed to promote user to admin:', error)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
-
 // ===== Profile Registration Route =====
 
 const ensureProfilePictureUrlColumn = async () => {
