@@ -31,6 +31,7 @@ export const SIGNUP_MAX_ATTEMPTS = toNumber(process.env.SIGNUP_MAX_ATTEMPTS, 10)
 export const SIGNIN_RATE_LIMIT_WINDOW_MINUTES = toNumber(process.env.SIGNIN_RATE_LIMIT_WINDOW_MINUTES, 15)
 export const SIGNUP_RATE_LIMIT_WINDOW_MINUTES = toNumber(process.env.SIGNUP_RATE_LIMIT_WINDOW_MINUTES, 15)
 export const BACKEND_PUBLIC_BASE_URL = String(process.env.BACKEND_PUBLIC_BASE_URL || '').trim()
+export const UPLOADS_DIR = String(process.env.UPLOADS_DIR || '').trim()
 export const POSTNORD_TRACKING_BASE_URL = String(process.env.POSTNORD_TRACKING_BASE_URL || '').trim()
 
 export const SMTP = {

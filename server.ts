@@ -204,6 +204,14 @@ interface PaymentMethod {
 
 const app = express()
 
+const uploadsRootDir = String(config.UPLOADS_DIR || '').trim() || path.join(__dirname, 'uploads')
+const ensureDir = (dirPath: string) => {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true })
+  }
+}
+const uploadsDir = (...segments: string[]) => path.join(uploadsRootDir, ...segments)
+
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true })
 })
@@ -235,15 +243,11 @@ app.options('/{*splat}', cors())
 app.use(express.json())
 
 // Configure multer for file uploads
-const uploadDir = path.join(__dirname, 'uploads', 'products')
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true })
-}
+const uploadDir = uploadsDir('products')
+ensureDir(uploadDir)
 
-const supportUploadDir = path.join(__dirname, 'uploads', 'support')
-if (!fs.existsSync(supportUploadDir)) {
-  fs.mkdirSync(supportUploadDir, { recursive: true })
-}
+const supportUploadDir = uploadsDir('support')
+ensureDir(supportUploadDir)
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -316,8 +320,8 @@ const supportUpload = upload.array('attachments', 5)
 const adminSettingsLogoUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => {
-      const dir = path.join(__dirname, 'uploads', 'company_logos')
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const dir = uploadsDir('company_logos')
+      ensureDir(dir)
       cb(null, dir)
     },
     filename: (_req, file, cb) => {
@@ -336,7 +340,8 @@ const adminSettingsLogoUpload = multer({
 })
 
 // Serve static files for uploaded images
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
+ensureDir(uploadsRootDir)
+app.use('/uploads', express.static(uploadsRootDir))
 
 const getAuthToken = (req: Request): string | null => {
   const authHeader = req.headers['authorization']
@@ -5244,8 +5249,8 @@ const profileUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
       const subdir = file.fieldname === 'profilePicture' ? 'profile_pictures' : 'company_logos'
-      const dir = path.join(__dirname, 'uploads', subdir)
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const dir = uploadsDir(subdir)
+      ensureDir(dir)
       cb(null, dir)
     },
     filename: (req, file, cb) => {
@@ -9471,7 +9476,7 @@ app.get('/api/public/download/:token', async (req: Request, res: Response) => {
     )
 
     const relativePath = String(record.file_url || '').replace(/^\/uploads\//, '')
-    const filePath = path.join(__dirname, 'uploads', relativePath)
+    const filePath = uploadsDir(relativePath)
 
     if (!fs.existsSync(filePath)) {
       res.status(404).json({ message: 'File not found on server.' })
@@ -10942,10 +10947,8 @@ app.post('/api/shipment/label', async (req: Request, res: Response) => {
       })
     }
 
-    const labelsDir = path.join(__dirname, 'uploads', 'shipment_labels')
-    if (!fs.existsSync(labelsDir)) {
-      fs.mkdirSync(labelsDir, { recursive: true })
-    }
+    const labelsDir = uploadsDir('shipment_labels')
+    ensureDir(labelsDir)
 
     const ext = generated.fileName.includes('.')
       ? generated.fileName.split('.').pop()
@@ -11172,10 +11175,8 @@ app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) =
     })
 
     await ensureShipmentLabelsTable()
-    const labelsDir = path.join(__dirname, 'uploads', 'shipment_labels')
-    if (!fs.existsSync(labelsDir)) {
-      fs.mkdirSync(labelsDir, { recursive: true })
-    }
+    const labelsDir = uploadsDir('shipment_labels')
+    ensureDir(labelsDir)
 
     if (generated.contentBuffer) {
       const ext = generated.mimeType.includes('pdf') ? 'pdf' : generated.mimeType.startsWith('image/') ? 'png' : 'bin'
