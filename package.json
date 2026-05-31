@@ -7,20 +7,17 @@
     "dev": "nodemon --exec ts-node server.ts",
     "start": "node server.js",
     "db:init": "ts-node scripts/apply-schema.ts",
-    "start:prod": "npm run db:init && npm start",
+    "start:prod": "npm run build && node dist/scripts/apply-schema.js && npm start",
     "ship": "git add . && git commit -m \"update\" && git push",
     "build": "tsc",
     "build:hostinger": "npm run build",
     "start:hostinger": "node server.js",
-    "serve": "npm run build && node server.js",
-    "migrate:status-reason": "node migrate-merge-status-reasons.js"
+    "serve": "npm run build && node server.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@types/multer": "^2.1.0",
-    "@types/qrcode": "^1.5.6",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -43,6 +40,8 @@
     "@types/express": "^5.0.6",
     "@types/handlebars": "^4.1.0",
     "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.1.0",
+    "@types/qrcode": "^1.5.6",
     "@types/node": "^25.6.0",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",

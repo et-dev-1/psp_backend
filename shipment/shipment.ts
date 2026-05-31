@@ -1,6 +1,9 @@
 import util from 'node:util'
 import fs from 'node:fs'
 import path from 'node:path'
+import * as config from '../config'
+
+const getPlatformName = (): string => String(config.SMTP.fromName || config.PLATFORM_NAME || 'Platform').trim() || 'Platform'
 
 type LabelFormat = 'PDF' | 'PNG' | 'ZPL'
 
@@ -502,7 +505,7 @@ const buildLabelPayload = (input: GenerateShipmentLabelInput): Record<string, un
 		updateIndicator: 'Original',
 		application: {
 			applicationId,
-			name: 'SellingPlatform',
+			name: getPlatformName(),
 			version: '1.0',
 		},
 		shipment: [
@@ -625,7 +628,7 @@ const buildEdiShipmentPayload = (input: GenerateShipmentLabelInput): Record<stri
 		messageId: makeMessageId(),
 		application: {
 			applicationId: Number.isFinite(Number(applicationId)) ? Number(applicationId) : 0,
-			name: 'SellingPlatform',
+			name: getPlatformName(),
 			version: '1.0',
 		},
 		updateIndicator: 'Original',
@@ -763,7 +766,7 @@ const buildDeliveryOptionsPayload = (input: EstimateShipmentCostInput): Record<s
 		|| getEnv('POSTNORD_CUSTOMER_KEY')
 		|| getEnv('POSTNORD_SENDER_COMPANY')
 		|| getEnv('POSTNORD_CUSTOMER_NUMBER')
-		|| 'SellingPlatform'
+		|| getPlatformName()
 
 	return {
 		customer: {

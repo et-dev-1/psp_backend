@@ -11,7 +11,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { RowDataPacket, ResultSetHeader } from 'mysql2'
-import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, sendEmail, setEmailAccountResolver, setSmtpSettingsResolver } from './email/email'
+import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
 import { emitToAdmin, emitToSeller, setupWebSocket } from './websocket'
 import { estimateShipmentCost, generateShipmentLabel, trackShipment, type ShipmentAddressInput } from './shipment/shipment'
 import Handlebars from 'handlebars'
@@ -95,7 +95,6 @@ const applySmtpPasswordFromStorage = async (): Promise<void> => {
   try {
     const decrypted = decryptSmtpPassword(encrypted)
     config.SMTP.pass = decrypted
-    process.env.EMAIL_PASS = decrypted
   } catch (error) {
     console.error('Failed to decrypt stored SMTP password:', error)
   }
@@ -127,7 +126,7 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
   const row = rows[0] || {}
 
   // Read authoritative values from app_settings (set by admin in UI)
-  const settingKeys = ['email_company_name', 'email_company_address', 'email_company_logo_url', 'company_organization_number']
+  const settingKeys = ['email_company_name', 'company_address', 'email_company_address', 'email_company_logo_url', 'organization_number', 'company_organization_number']
   const [settingRows] = await db.query<RowDataPacket[]>(
     `SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN (?)`,
     [settingKeys],
@@ -173,12 +172,14 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
       return String(config.EMAIL.address || config.SMTP.user || row.admin_email || '').trim()
     })(),
     company_address: (
+      settingsMap.get('company_address') ||
       settingsMap.get('email_company_address') ||
       String(row.company_address || '').trim() ||
       config.EMAIL.companyAddress ||
       ''
     ).trim(),
     organization_number: (
+      settingsMap.get('organization_number') ||
       settingsMap.get('company_organization_number') ||
       String(row.company_org_number || '').trim() ||
       config.COMPANY_ORGANIZATION_NUMBER ||
@@ -223,6 +224,7 @@ app.get('/health', (_req, res) => {
 app.get('/sitemap.xml', async (_req: Request, res: Response) => {
   try {
     await ensureProfilesStatusColumns()
+    await ensureDeliveryReviewRequestsTable()
 
     const baseUrl = getClientBaseUrl()
 
@@ -526,6 +528,7 @@ let hasBankAccountsTableCache: boolean | null = null
 let hasCommissionSettingsTableCache: boolean | null = null
 let hasSupportMessagesTableCache: boolean | null = null
 let hasShipmentLabelsTableCache: boolean | null = null
+let hasDeliveryReviewRequestsTableCache: boolean | null = null
 let hasAccountingStepChecksTableCache: boolean | null = null
 let hasEmailAccountsTableCache: boolean | null = null
 let hasEmailAccountPurposesColumnCache: boolean | null = null
@@ -1517,7 +1520,7 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_company_address', ?)
+       VALUES ('company_address', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
       [String(config.EMAIL.companyAddress || '')],
     )
@@ -1531,7 +1534,7 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('company_organization_number', ?)
+       VALUES ('organization_number', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
       [String(config.COMPANY_ORGANIZATION_NUMBER || '')],
     )
@@ -1627,6 +1630,7 @@ const ensureEmailAccountPurposesColumn = async () => {
 type RuntimeSettings = {
   platform_commission_percent: number
   platform_commission_fixed: number
+  platform_name: string
   promotion_commission_percent: number
   vat_shipping_rate: number
   stripe_payment_fixed_cost: number
@@ -1644,7 +1648,8 @@ type RuntimeSettings = {
   account_stripe_fees: string
   account_bank_costs: string
   email_address: string
-  company_organization_number: string
+  company_address: string
+  organization_number: string
   postnord_customer_number: string
   postnord_debug_logs: boolean
   postnord_use_portal_pricing: boolean
@@ -1655,10 +1660,19 @@ type RuntimeSettings = {
   smtp_secure: string
 }
 
+const resolveSmtpSecure = (value: string, port: number): boolean => {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['ssl', 'tls', 'true', '1', 'yes', 'on'].includes(normalized)) return true
+  if (['starttls', 'false', '0', 'no', 'off'].includes(normalized)) return false
+  // Fallback by port convention when setting is absent/unknown.
+  return Number(port) === 465
+}
+
 const applyRuntimeSettings = (settings: RuntimeSettings) => {
   process.env.VAT_SHIPPING_RATE = String(settings.vat_shipping_rate)
-  process.env.EMAIL_ADDRESS = settings.email_address
-  process.env.COMPANY_ORGANIZATION_NUMBER = settings.company_organization_number
+  process.env.PLATFORM_NAME = settings.platform_name
+  process.env.SMTP_FROM_NAME = settings.platform_name
+  process.env.COMPANY_ORGANIZATION_NUMBER = settings.organization_number
   process.env.POSTNORD_CUSTOMER_NUMBER = settings.postnord_customer_number
   process.env.POSTNORD_DEBUG_LOGS = String(settings.postnord_debug_logs)
   process.env.POSTNORD_USE_PORTAL_PRICING = String(settings.postnord_use_portal_pricing)
@@ -1666,21 +1680,34 @@ const applyRuntimeSettings = (settings: RuntimeSettings) => {
   process.env.GOOGLE_CLIENT_ID = settings.google_client_id
 
   VAT_SHIPPING_RATE = settings.vat_shipping_rate
-  config.EMAIL.address = settings.email_address
+  config.SMTP.fromName = String(settings.platform_name || '').trim() || config.PLATFORM_NAME
+  const runtimeEmailAddress = String(settings.email_address || '').trim()
+  if (runtimeEmailAddress) {
+    config.EMAIL.address = runtimeEmailAddress
+    config.SMTP.user = runtimeEmailAddress
+  }
+  config.EMAIL.companyAddress = String(settings.company_address || '').trim()
+
   config.POSTNORD.customerNumber = settings.postnord_customer_number
   config.POSTNORD.debugLogs = settings.postnord_debug_logs
   config.POSTNORD.usePortalPricing = settings.postnord_use_portal_pricing
   config.POSTNORD.enableTransitTime = settings.postnord_enable_transit_time
-  config.SMTP.host = settings.smtp_host || config.SMTP.host
-  config.SMTP.port = settings.smtp_port || config.SMTP.port
-  config.SMTP.secure = settings.smtp_secure === 'ssl'
-  config.SMTP.user = settings.email_address || config.SMTP.user
+
+  const runtimeSmtpHost = String(settings.smtp_host || '').trim()
+  if (runtimeSmtpHost) {
+    config.SMTP.host = runtimeSmtpHost
+    if (Number.isFinite(settings.smtp_port) && settings.smtp_port > 0) {
+      config.SMTP.port = settings.smtp_port
+      config.SMTP.secure = resolveSmtpSecure(settings.smtp_secure, settings.smtp_port)
+    }
+  }
 }
 
 const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
   await ensureCommissionSettingsTable()
   await applySmtpPasswordFromStorage()
   const keys = [
+    'platform_name',
     'platform_commission_percent',
     'platform_commission_fixed',
     'promotion_commission_percent',
@@ -1700,6 +1727,9 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     'account_stripe_fees',
     'account_bank_costs',
     'email_address',
+    'company_address',
+    'organization_number',
+    'email_company_address',
     'company_organization_number',
     'postnord_customer_number',
     'postnord_debug_logs',
@@ -1731,6 +1761,7 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
   const swishPaymentPercentCost = Number(map.get('swish_payment_percent_cost'))
 
   return {
+    platform_name: String(map.get('platform_name') || config.SMTP.fromName || config.PLATFORM_NAME || 'Platform'),
     platform_commission_percent: Number.isFinite(platformPercent) ? platformPercent : DEFAULT_PLATFORM_COMMISSION_PERCENT,
     platform_commission_fixed: Number.isFinite(platformFixed) ? platformFixed : DEFAULT_PLATFORM_COMMISSION_FIXED,
     promotion_commission_percent: Number.isFinite(promotionPercent) ? promotionPercent : DEFAULT_PROMOTION_COMMISSION_PERCENT,
@@ -1749,16 +1780,17 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     account_commission_revenue: String(map.get('account_commission_revenue') || '3001'),
     account_stripe_fees: String(map.get('account_stripe_fees') || '6040'),
     account_bank_costs: String(map.get('account_bank_costs') || '6570'),
-    email_address: String(map.get('email_address') || config.EMAIL.address || ''),
-    company_organization_number: String(map.get('company_organization_number') || config.COMPANY_ORGANIZATION_NUMBER || ''),
+    email_address: String(map.get('email_address') || ''),
+    company_address: String(map.get('company_address') || map.get('email_company_address') || config.EMAIL.companyAddress || ''),
+    organization_number: String(map.get('organization_number') || map.get('company_organization_number') || config.COMPANY_ORGANIZATION_NUMBER || ''),
     postnord_customer_number: String(map.get('postnord_customer_number') || config.POSTNORD.customerNumber || ''),
     postnord_debug_logs: toBoolSetting(map.get('postnord_debug_logs'), Boolean(config.POSTNORD.debugLogs)),
     postnord_use_portal_pricing: toBoolSetting(map.get('postnord_use_portal_pricing'), Boolean(config.POSTNORD.usePortalPricing)),
     postnord_enable_transit_time: toBoolSetting(map.get('postnord_enable_transit_time'), Boolean(config.POSTNORD.enableTransitTime)),
     google_client_id: String(map.get('google_client_id') || config.GOOGLE_CLIENT_ID || ''),
-    smtp_host: String(map.get('smtp_host') || config.SMTP.host || ''),
-    smtp_port: Number(map.get('smtp_port')) || config.SMTP.port || 587,
-    smtp_secure: String(map.get('smtp_secure') || (config.SMTP.secure ? 'ssl' : 'starttls')),
+    smtp_host: String(map.get('smtp_host') || ''),
+    smtp_port: Number(map.get('smtp_port')) || 587,
+    smtp_secure: String(map.get('smtp_secure') || 'starttls'),
   }
 }
 
@@ -1849,6 +1881,190 @@ const ensureShipmentLabelsTable = async () => {
     hasShipmentLabelsTableCache = null
     console.error('Failed ensuring shipment_labels table:', error)
     throw error
+  }
+}
+
+const ensureDeliveryReviewRequestsTable = async () => {
+  try {
+    if (hasDeliveryReviewRequestsTableCache === true) return
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS delivery_review_requests (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        token VARCHAR(96) NOT NULL,
+        sale_id INT UNSIGNED NOT NULL,
+        seller_id INT UNSIGNED NOT NULL,
+        customer_id INT UNSIGNED NOT NULL,
+        product_id INT UNSIGNED NOT NULL,
+        customer_name VARCHAR(255) NULL,
+        customer_email VARCHAR(255) NULL,
+        language ENUM('en','sv') NOT NULL DEFAULT 'en',
+        rating TINYINT NULL,
+        comment TEXT NULL,
+        email_sent_at DATETIME NULL,
+        submitted_at DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_delivery_review_token (token),
+        UNIQUE KEY uq_delivery_review_sale_customer_product (sale_id, customer_id, product_id),
+        INDEX idx_delivery_review_sale (sale_id),
+        INDEX idx_delivery_review_seller (seller_id),
+        INDEX idx_delivery_review_submitted (submitted_at),
+        FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+        FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+      )
+    `)
+
+    hasDeliveryReviewRequestsTableCache = true
+  } catch (error) {
+    hasDeliveryReviewRequestsTableCache = null
+    console.error('Failed ensuring delivery_review_requests table:', error)
+    throw error
+  }
+}
+
+const resolveReviewLanguageFromCountry = (country: unknown): 'en' | 'sv' => {
+  const value = String(country || '').trim().toLowerCase()
+  if (!value) return 'en'
+  if (value === 'se' || value.includes('sweden') || value.includes('sverige') || value.includes('svensk')) {
+    return 'sv'
+  }
+  return 'en'
+}
+
+const buildDeliveryReviewLink = (baseUrl: string, token: string, language: 'en' | 'sv'): string => {
+  const normalizedBase = String(baseUrl || '').replace(/\/+$/, '')
+  const encodedToken = encodeURIComponent(token)
+  if (language === 'sv') {
+    return `${normalizedBase}/sv/delivery-review/${encodedToken}`
+  }
+  return `${normalizedBase}/delivery-review/${encodedToken}`
+}
+
+const triggerDeliveryReviewEmailForSales = async (saleIds: number[]): Promise<void> => {
+  const normalizedSaleIds = Array.from(new Set(
+    saleIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0),
+  ))
+
+  if (!normalizedSaleIds.length) return
+
+  try {
+    await ensureDeliveryReviewRequestsTable()
+
+    const placeholders = normalizedSaleIds.map(() => '?').join(',')
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT
+         s.id AS sale_id,
+         s.seller_id,
+         s.customer_id,
+         s.order_status,
+         s.order_id,
+         c.name AS customer_name,
+         c.email AS customer_email,
+         c.shipping_country,
+         si.product_id,
+         p.name AS product_name,
+         u.email AS seller_email,
+         COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name
+       FROM sales s
+       INNER JOIN customers c ON c.id = s.customer_id
+       INNER JOIN sale_items si ON si.sale_id = s.id AND si.product_type = 'item' AND si.product_id IS NOT NULL
+       INNER JOIN products p ON p.id = si.product_id
+       INNER JOIN users u ON u.id = s.seller_id
+       LEFT JOIN profiles sp ON sp.user_id = s.seller_id
+       WHERE s.id IN (${placeholders})
+         AND s.order_status = 'delivered'`,
+      normalizedSaleIds,
+    )
+
+    if (!rows.length) return
+
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const clientBaseUrl = getClientBaseUrl()
+
+    for (const row of rows) {
+      const saleId = Number(row.sale_id || 0)
+      const sellerId = Number(row.seller_id || 0)
+      const customerId = Number(row.customer_id || 0)
+      const productId = Number(row.product_id || 0)
+      const sellerEmail = String(row.seller_email || '').trim()
+      const customerName = String(row.customer_name || 'Customer').trim()
+      const productName = String(row.product_name || '').trim()
+      const sellerName = String(row.seller_name || 'Seller').trim()
+      const language = resolveReviewLanguageFromCountry(row.shipping_country)
+
+      if (!saleId || !sellerId || !customerId || !productId || !sellerEmail) {
+        continue
+      }
+
+      const [existingRows] = await db.query<RowDataPacket[]>(
+        `SELECT id, token, email_sent_at
+         FROM delivery_review_requests
+         WHERE sale_id = ? AND customer_id = ? AND product_id = ?
+         LIMIT 1`,
+        [saleId, customerId, productId],
+      )
+
+      const existing = existingRows[0]
+      const alreadySent = Boolean(existing?.email_sent_at)
+      if (alreadySent) continue
+
+      const token = String(existing?.token || crypto.randomBytes(24).toString('hex'))
+
+      if (!existing) {
+        await db.query<ResultSetHeader>(
+          `INSERT INTO delivery_review_requests (
+             token,
+             sale_id,
+             seller_id,
+             customer_id,
+             product_id,
+             customer_name,
+             customer_email,
+             language
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            token,
+            saleId,
+            sellerId,
+            customerId,
+            productId,
+            customerName || null,
+            String(row.customer_email || '').trim() || null,
+            language,
+          ],
+        )
+      }
+
+      const reviewUrl = buildDeliveryReviewLink(clientBaseUrl, token, language)
+      const subject = language === 'sv'
+        ? `Be om kundomdöme för order ${String(row.order_id || saleId)}`
+        : `Request customer review for order ${String(row.order_id || saleId)}`
+
+      const html = createDeliveryReviewRequestEmailHtml({
+        company: companyInfo,
+        seller_name: sellerName,
+        customer_name: customerName,
+        product_name: productName,
+        review_url: reviewUrl,
+        language,
+      })
+
+      await sendEmail(sellerEmail, subject, html, { purpose: 'sellers' })
+
+      await db.query(
+        `UPDATE delivery_review_requests
+         SET email_sent_at = NOW(), updated_at = NOW()
+         WHERE sale_id = ? AND customer_id = ? AND product_id = ?`,
+        [saleId, customerId, productId],
+      )
+    }
+  } catch (error) {
+    console.error('Failed to send delivery review request emails:', error)
   }
 }
 
@@ -2796,14 +3012,17 @@ const createAuthCaptchaChallenge = () => {
   const left = Math.floor(Math.random() * 8) + 2
   const right = Math.floor(Math.random() * 8) + 1
   const challengeId = crypto.randomUUID()
+  const expiresAt = Date.now() + AUTH_CAPTCHA_TTL_MS
   authCaptchaChallenges.set(challengeId, {
     answer: String(left + right),
-    expiresAt: Date.now() + AUTH_CAPTCHA_TTL_MS,
+    expiresAt,
   })
 
   return {
     challengeId,
     prompt: `What is ${left} + ${right}?`,
+    expiresAt,
+    expiresInSeconds: Math.floor(AUTH_CAPTCHA_TTL_MS / 1000),
   }
 }
 
@@ -3549,7 +3768,7 @@ app.post('/api/settings/test-email', async (req: Request, res: Response) => {
     }
 
     const recipientEmail = String(rows[0].email)
-    const smtpUser = String(config.SMTP.user || config.EMAIL.address || '').trim()
+    const smtpUser = String(config.SMTP.user || '').trim()
     const smtpPass = String(config.SMTP.pass || '').trim()
 
     if (!smtpUser || !smtpPass) {
@@ -3559,7 +3778,7 @@ app.post('/api/settings/test-email', async (req: Request, res: Response) => {
       })
     }
 
-    const platformName = config.SMTP.fromName || 'SellingPlatform'
+    const platformName = config.SMTP.fromName || config.PLATFORM_NAME || 'Platform'
     const subject = `${platformName} — Email Connection Test`
     const body = `
       <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
@@ -3932,6 +4151,7 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
     await ensureCommissionSettingsTable()
 
     const values: Array<[string, string]> = [
+      ['platform_name', String(payload.platform_name || '').trim()],
       ['vat_shipping_rate', String(vatShippingRate)],
       ['stripe_payment_fixed_cost', String(stripePaymentFixedCost)],
       ['stripe_payment_percent_cost', String(stripePaymentPercentCost)],
@@ -3948,7 +4168,8 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
       ['account_stripe_fees', accountStripeFees],
       ['account_bank_costs', accountBankCosts],
       ['email_address', String(payload.email_address || '').trim()],
-      ['company_organization_number', String(payload.company_organization_number || '').trim()],
+      ['company_address', String(payload.company_address || '').trim()],
+      ['organization_number', String(payload.organization_number || '').trim()],
       ['postnord_customer_number', String(payload.postnord_customer_number || '').trim()],
       ['postnord_debug_logs', String(Boolean(payload.postnord_debug_logs))],
       ['postnord_use_portal_pricing', String(Boolean(payload.postnord_use_portal_pricing))],
@@ -4274,7 +4495,6 @@ app.post('/api/admin/settings/runtime/email-password', async (req: Request, res:
     )
 
     config.SMTP.pass = plainTextPassword
-    process.env.EMAIL_PASS = plainTextPassword
 
     return res.json({ success: true, message: 'Email password updated successfully.' })
   } catch (error) {
@@ -4413,7 +4633,7 @@ app.post('/api/admin/email-accounts/:id/test', async (req: Request, res: Respons
     const settings = await getRuntimeSettings()
     const smtpHost = settings.smtp_host || config.SMTP.host
     const smtpPort = settings.smtp_port || config.SMTP.port
-    const smtpSecure = settings.smtp_secure === 'ssl'
+    const smtpSecure = resolveSmtpSecure(settings.smtp_secure, smtpPort)
 
     const nodemailer = require('nodemailer')
     const transporter = nodemailer.createTransport({
@@ -4421,7 +4641,6 @@ app.post('/api/admin/email-accounts/:id/test', async (req: Request, res: Respons
       port: smtpPort,
       secure: smtpSecure,
       ...(smtpPort === 587 && !smtpSecure ? { requireTLS: true } : {}),
-      authMethod: 'LOGIN',
       auth: {
         user: String(account.email_address),
         pass: decryptedPassword,
@@ -6677,7 +6896,7 @@ const notifySellerProfileStatusChange = async (
 ) => {
   const sellerId = Number(target.profile.user_id)
   const sellerName = String(target.profile.seller_name || 'Seller').trim() || 'Seller'
-  const platformName = config.SMTP.fromName || 'SellingPlatform'
+  const platformName = config.SMTP.fromName || config.PLATFORM_NAME || 'Platform'
 
   emitToSeller(sellerId, 'profile:updated', {
     profile_id: profileId,
@@ -7037,10 +7256,9 @@ app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
   if (!auth) return
 
-  // The tables to truncate — everything except users (admin row preserved)
+  // The tables to truncate — app_settings and admin user are preserved
   const tablesToClear = [
     'accounting_step_checks',
-    'app_settings',
     'bank_accounts',
     'customers',
     'digital_download_tokens',
@@ -7074,8 +7292,8 @@ app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
     await db.query(`DELETE FROM users WHERE role != 'admin'`)
     await db.query('SET FOREIGN_KEY_CHECKS = 1')
 
-    console.log(`[DB Reset] Database cleared by admin user ${auth.id}`)
-    return res.json({ success: true, message: 'Database reset complete. Admin account preserved.' })
+    console.log(`[DB Reset] Database cleared by admin user ${auth.id} (app_settings preserved)`)
+    return res.json({ success: true, message: 'Database reset complete. Admin account and app settings preserved.' })
   } catch (error) {
     await db.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => {})
     console.error('[DB Reset] Failed:', error)
@@ -8106,9 +8324,12 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
     await ensureProfilesStatusColumns()
     const pageRaw = Number(req.query.page)
     const limitRaw = Number(req.query.limit)
+    const sellerIdRaw = Number(req.query.seller_id)
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 60) : 24
     const offset = (page - 1) * limit
+    const sellerFilterSql = Number.isFinite(sellerIdRaw) && sellerIdRaw > 0 ? ' AND p.seller_id = ?' : ''
+    const sellerFilterParams = Number.isFinite(sellerIdRaw) && sellerIdRaw > 0 ? [Math.floor(sellerIdRaw)] : []
 
     const [countRows] = await db.query<RowDataPacket[]>(
       `SELECT COUNT(*) AS total
@@ -8119,7 +8340,8 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
        )
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'`,
+        AND COALESCE(sp.status, 'pending') = 'verified'${sellerFilterSql}`,
+      sellerFilterParams,
     )
     const total = Number(countRows[0]?.total || 0)
 
@@ -8156,10 +8378,11 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
         AND COALESCE(sp.status, 'pending') = 'verified'
+        ${sellerFilterSql}
       GROUP BY p.id
       ORDER BY p.created_at DESC
       LIMIT ? OFFSET ?`,
-      [limit, offset],
+      [...sellerFilterParams, limit, offset],
     )
 
     const productIds = products.map((p) => p.id)
@@ -8240,6 +8463,232 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
     })
   } catch (err) {
     console.error(err)
+    res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Search Public Sellers (No Auth Required) =====
+app.get('/api/public/sellers/search', async (req: Request, res: Response) => {
+  try {
+    await ensureProfilesStatusColumns()
+
+    const query = String(req.query.q || '').trim()
+    if (query.length < 2) {
+      return res.status(200).json([])
+    }
+
+    const like = `%${query}%`
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT
+        u.id AS seller_id,
+        MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) AS seller_display_name,
+        MAX(NULLIF(TRIM(sp.company_name), '')) AS company_name,
+        MAX(NULLIF(TRIM(sp.profile_picture_url), '')) AS profile_picture_url,
+        MAX(NULLIF(TRIM(sp.company_logo_url), '')) AS company_logo_url,
+        MAX(NULLIF(TRIM(sp.city), '')) AS city,
+        MAX(NULLIF(TRIM(sp.country), '')) AS country,
+        COUNT(DISTINCT p.id) AS product_count
+      FROM users u
+      INNER JOIN profiles sp ON sp.user_id = u.id
+      INNER JOIN products p ON p.seller_id = u.id
+      WHERE u.role = 'seller'
+        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND (
+          COALESCE(NULLIF(TRIM(sp.display_name), ''), '') LIKE ?
+          OR COALESCE(NULLIF(TRIM(sp.company_name), ''), '') LIKE ?
+          OR u.email LIKE ?
+        )
+      GROUP BY u.id
+      ORDER BY product_count DESC, seller_display_name ASC
+      LIMIT 20`,
+      [like, like, like],
+    )
+
+    res.status(200).json(
+      rows.map((row) => ({
+        seller_id: Number(row.seller_id || 0),
+        seller_display_name: String(row.seller_display_name || '').trim(),
+        company_name: String(row.company_name || '').trim(),
+        profile_picture_url: String(row.profile_picture_url || '').trim(),
+        company_logo_url: String(row.company_logo_url || '').trim(),
+        city: String(row.city || '').trim(),
+        country: String(row.country || '').trim(),
+        product_count: Number(row.product_count || 0),
+      })),
+    )
+  } catch (err) {
+    console.error('Public seller search error:', err)
+    res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Get Public Seller Shop Summary (No Auth Required) =====
+app.get('/api/public/sellers/:id', async (req: Request, res: Response) => {
+  const sellerId = Number(req.params.id)
+  if (!Number.isFinite(sellerId) || sellerId <= 0) {
+    return res.status(400).json({ message: 'Invalid seller id' })
+  }
+
+  try {
+    await ensureProfilesStatusColumns()
+
+    const [sellerRows] = await db.query<RowDataPacket[]>(
+      `SELECT
+        u.id AS seller_id,
+        u.email AS seller_email,
+        MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) AS seller_display_name,
+        MAX(NULLIF(TRIM(sp.company_name), '')) AS company_name,
+        MAX(NULLIF(TRIM(sp.company_org_number), '')) AS company_org_number,
+        MAX(NULLIF(TRIM(sp.company_address), '')) AS company_address,
+        MAX(NULLIF(TRIM(sp.profile_picture_url), '')) AS profile_picture_url,
+        MAX(NULLIF(TRIM(sp.company_logo_url), '')) AS company_logo_url,
+        MAX(NULLIF(TRIM(sp.city), '')) AS city,
+        MAX(NULLIF(TRIM(sp.country), '')) AS country
+      FROM users u
+      INNER JOIN profiles sp ON sp.user_id = u.id
+      WHERE u.id = ?
+        AND u.role = 'seller'
+        AND COALESCE(sp.status, 'pending') = 'verified'
+      GROUP BY u.id
+      LIMIT 1`,
+      [sellerId],
+    )
+
+    if (!sellerRows.length) {
+      return res.status(404).json({ message: 'Seller not found' })
+    }
+
+    const seller = sellerRows[0]
+
+    const [summaryRows] = await db.query<RowDataPacket[]>(
+      `SELECT
+        (
+          SELECT COUNT(DISTINCT p.id)
+          FROM products p
+          WHERE p.seller_id = ?
+            AND p.status = 'active'
+            AND p.approval_status = 'approved'
+        ) AS product_count,
+        (
+          SELECT COUNT(*)
+          FROM (
+            SELECT pr.id AS review_id
+            FROM product_reviews pr
+            INNER JOIN products p1 ON p1.id = pr.product_id
+            WHERE p1.seller_id = ?
+            UNION ALL
+            SELECT drr.id AS review_id
+            FROM delivery_review_requests drr
+            WHERE drr.seller_id = ?
+              AND drr.submitted_at IS NOT NULL
+              AND drr.rating IS NOT NULL
+          ) all_reviews
+        ) AS review_count,
+        (
+          SELECT COALESCE(ROUND(AVG(all_ratings.rating), 1), 0)
+          FROM (
+            SELECT pr.rating AS rating
+            FROM product_reviews pr
+            INNER JOIN products p2 ON p2.id = pr.product_id
+            WHERE p2.seller_id = ?
+            UNION ALL
+            SELECT drr.rating AS rating
+            FROM delivery_review_requests drr
+            WHERE drr.seller_id = ?
+              AND drr.submitted_at IS NOT NULL
+              AND drr.rating IS NOT NULL
+          ) all_ratings
+        ) AS average_rating`,
+      [sellerId, sellerId, sellerId, sellerId, sellerId],
+    )
+
+    const [reviewRows] = await db.query<RowDataPacket[]>(
+      `SELECT * FROM (
+        SELECT
+          pr.id AS id,
+          pr.rating AS rating,
+          pr.title AS title,
+          pr.comment AS review,
+          pr.created_at AS created_at,
+          COALESCE(
+            NULLIF(prf.display_name, ''),
+            NULLIF(CONCAT(COALESCE(prf.first_name,''), ' ', COALESCE(prf.last_name,'')), ' '),
+            SUBSTRING_INDEX(u.email, '@', 1)
+          ) AS reviewer_name,
+          CASE
+            WHEN prf.city IS NOT NULL AND prf.country IS NOT NULL
+              THEN CONCAT(prf.city, ', ', prf.country)
+            WHEN prf.city IS NOT NULL THEN prf.city
+            WHEN prf.country IS NOT NULL THEN prf.country
+            ELSE NULL
+          END AS reviewer_location,
+          p.name AS product_name
+        FROM product_reviews pr
+        INNER JOIN products p ON p.id = pr.product_id
+        INNER JOIN users u ON u.id = pr.user_id
+        LEFT JOIN profiles prf ON prf.user_id = pr.user_id
+        WHERE p.seller_id = ?
+
+        UNION ALL
+
+        SELECT
+          (1000000000 + drr.id) AS id,
+          drr.rating AS rating,
+          NULL AS title,
+          drr.comment AS review,
+          drr.submitted_at AS created_at,
+          COALESCE(NULLIF(TRIM(drr.customer_name), ''), SUBSTRING_INDEX(drr.customer_email, '@', 1), 'Customer') AS reviewer_name,
+          CASE
+            WHEN c.shipping_city IS NOT NULL AND c.shipping_country IS NOT NULL
+              THEN CONCAT(c.shipping_city, ', ', c.shipping_country)
+            WHEN c.shipping_city IS NOT NULL THEN c.shipping_city
+            WHEN c.shipping_country IS NOT NULL THEN c.shipping_country
+            ELSE NULL
+          END AS reviewer_location,
+          p2.name AS product_name
+        FROM delivery_review_requests drr
+        INNER JOIN products p2 ON p2.id = drr.product_id
+        LEFT JOIN customers c ON c.id = drr.customer_id
+        WHERE drr.seller_id = ?
+          AND drr.submitted_at IS NOT NULL
+          AND drr.rating IS NOT NULL
+      ) combined_reviews
+      ORDER BY combined_reviews.rating DESC, combined_reviews.created_at DESC
+      LIMIT 6`,
+      [sellerId, sellerId],
+    )
+
+    return res.json({
+      seller: {
+        seller_id: Number(seller.seller_id || 0),
+        seller_email: String(seller.seller_email || '').trim(),
+        seller_display_name: String(seller.seller_display_name || '').trim(),
+        company_name: String(seller.company_name || '').trim(),
+        company_org_number: String(seller.company_org_number || '').trim(),
+        company_address: String(seller.company_address || '').trim(),
+        profile_picture_url: String(seller.profile_picture_url || '').trim(),
+        company_logo_url: String(seller.company_logo_url || '').trim(),
+        city: String(seller.city || '').trim(),
+        country: String(seller.country || '').trim(),
+      },
+      summary: {
+        product_count: Number(summaryRows[0]?.product_count || 0),
+        review_count: Number(summaryRows[0]?.review_count || 0),
+        average_rating: Number(summaryRows[0]?.average_rating || 0),
+      },
+      reviews: reviewRows.map((row) => ({
+        id: Number(row.id || 0),
+        rating: Number(row.rating || 0),
+        title: row.title ? String(row.title) : null,
+        review: String(row.review || ''),
+        created_at: String(row.created_at || ''),
+        reviewer_name: String(row.reviewer_name || 'Customer').trim(),
+        reviewer_location: row.reviewer_location ? String(row.reviewer_location) : null,
+        product_name: String(row.product_name || '').trim(),
+      })),
+    })
+  } catch (err) {
+    console.error('Public seller shop error:', err)
     res.status(500).json({ message: 'Database error' })
   }
 })
@@ -8449,6 +8898,141 @@ app.get('/api/public/reviews', async (req: Request, res: Response) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Get Delivery Review Request (Public) =====
+app.get('/api/public/delivery-review/:token', async (req: Request, res: Response) => {
+  const token = String(req.params.token || '').trim()
+  if (!token) {
+    return res.status(400).json({ message: 'Invalid review link.' })
+  }
+
+  try {
+    await ensureDeliveryReviewRequestsTable()
+
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT
+         drr.id,
+         drr.sale_id,
+         drr.seller_id,
+         drr.customer_name,
+         drr.customer_email,
+         drr.language,
+         drr.rating,
+         drr.comment,
+         drr.submitted_at,
+         p.id AS product_id,
+         p.name AS product_name,
+         COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name
+       FROM delivery_review_requests drr
+       INNER JOIN products p ON p.id = drr.product_id
+       INNER JOIN users u ON u.id = drr.seller_id
+       LEFT JOIN profiles sp ON sp.user_id = drr.seller_id
+       WHERE drr.token = ?
+       LIMIT 1`,
+      [token],
+    )
+
+    if (!rows.length) {
+      return res.status(404).json({ message: 'Review request not found.' })
+    }
+
+    const row = rows[0]
+    return res.status(200).json({
+      id: Number(row.id || 0),
+      sale_id: Number(row.sale_id || 0),
+      seller_id: Number(row.seller_id || 0),
+      seller_name: String(row.seller_name || 'Seller').trim(),
+      customer_name: String(row.customer_name || 'Customer').trim(),
+      customer_email: String(row.customer_email || '').trim(),
+      language: String(row.language || 'en').trim().toLowerCase() === 'sv' ? 'sv' : 'en',
+      product: {
+        id: Number(row.product_id || 0),
+        name: String(row.product_name || '').trim(),
+      },
+      submitted: Boolean(row.submitted_at),
+      rating: row.rating != null ? Number(row.rating) : null,
+      comment: row.comment != null ? String(row.comment) : null,
+      submitted_at: row.submitted_at ? String(row.submitted_at) : null,
+    })
+  } catch (error) {
+    console.error('Get delivery review request error:', error)
+    return res.status(500).json({ message: 'Failed to load review request.' })
+  }
+})
+
+// ===== Submit Delivery Review (Public) =====
+app.post('/api/public/delivery-review/:token', async (req: Request, res: Response) => {
+  const token = String(req.params.token || '').trim()
+  const languageRaw = String(req.body?.language || req.query?.lang || 'en').trim().toLowerCase()
+  const language = languageRaw === 'sv' ? 'sv' : 'en'
+  const rating = Number(req.body?.rating)
+  const comment = String(req.body?.comment || '').trim()
+
+  const messages = language === 'sv'
+    ? {
+        invalidLink: 'Ogiltig omdömeslänk.',
+        notFound: 'Omdömesbegäran hittades inte.',
+        alreadySubmitted: 'Det här omdömet har redan skickats in.',
+        invalidRating: 'Välj ett betyg mellan 1 och 5 stjärnor.',
+        invalidComment: 'Skriv en kommentar innan du skickar.',
+        success: 'Tack! Ditt omdöme har skickats.',
+      }
+    : {
+        invalidLink: 'Invalid review link.',
+        notFound: 'Review request not found.',
+        alreadySubmitted: 'This review has already been submitted.',
+        invalidRating: 'Please select a rating between 1 and 5 stars.',
+        invalidComment: 'Please write a comment before submitting.',
+        success: 'Thank you! Your review has been submitted.',
+      }
+
+  if (!token) {
+    return res.status(400).json({ message: messages.invalidLink })
+  }
+
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ message: messages.invalidRating })
+  }
+
+  if (comment.length < 2) {
+    return res.status(400).json({ message: messages.invalidComment })
+  }
+
+  try {
+    await ensureDeliveryReviewRequestsTable()
+
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT id, submitted_at
+       FROM delivery_review_requests
+       WHERE token = ?
+       LIMIT 1`,
+      [token],
+    )
+
+    if (!rows.length) {
+      return res.status(404).json({ message: messages.notFound })
+    }
+
+    if (rows[0]?.submitted_at) {
+      return res.status(409).json({ message: messages.alreadySubmitted })
+    }
+
+    await db.query(
+      `UPDATE delivery_review_requests
+       SET rating = ?, comment = ?, language = ?, submitted_at = NOW(), updated_at = NOW()
+       WHERE id = ?`,
+      [Math.round(rating), comment, language, Number(rows[0].id)],
+    )
+
+    return res.status(200).json({
+      message: messages.success,
+      submitted: true,
+    })
+  } catch (error) {
+    console.error('Submit delivery review error:', error)
+    return res.status(500).json({ message: 'Failed to submit review.' })
   }
 })
 
@@ -9545,6 +10129,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
               `UPDATE sales SET order_status = 'delivered' WHERE id IN (${digitalOnlySaleIds.map(() => '?').join(',')})`,
               digitalOnlySaleIds,
             )
+            await triggerDeliveryReviewEmailForSales(digitalOnlySaleIds)
           }
         }
       }
@@ -10462,7 +11047,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
   if (!auth) return
 
   const orderId = Number(req.params.id)
-  const smtpConfigured = Boolean((config.SMTP.user || config.EMAIL.address) && config.SMTP.pass)
+  const smtpConfigured = Boolean(config.SMTP.host && config.SMTP.user && config.SMTP.pass)
 
   if (!Number.isFinite(orderId) || orderId <= 0) {
     return res.status(400).json({ message: 'Invalid order id' })
@@ -10602,7 +11187,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
       customer_email: order.customer_email,
       receiver_email: receiverEmail,
       smtp_configured: smtpConfigured,
-      sender_email: config.SMTP.user || config.EMAIL.address || null,
+      sender_email: config.SMTP.user || null,
     })
   } catch (error) {
     console.error('Failed to send invoice email:', error)
@@ -11273,12 +11858,21 @@ app.get('/api/shipment/track/:trackingNumber', async (req: Request, res: Respons
 
     let updatedOrderStatus: string | null = null
     if (targetSaleId) {
+      const [statusRows] = await db.query<RowDataPacket[]>(
+        'SELECT order_status FROM sales WHERE id = ? AND seller_id = ? LIMIT 1',
+        [targetSaleId, auth.id],
+      )
+      const previousStatus = String(statusRows[0]?.order_status || '').trim().toLowerCase()
       const nextStatus = resolveOrderStatusFromTracking(tracked)
       await db.query(
         'UPDATE sales SET order_status = ? WHERE id = ? AND seller_id = ?',
         [nextStatus, targetSaleId, auth.id],
       )
       updatedOrderStatus = nextStatus
+
+      if (nextStatus === 'delivered' && previousStatus !== 'delivered') {
+        await triggerDeliveryReviewEmailForSales([targetSaleId])
+      }
     }
 
     return res.status(200).json({
@@ -11717,7 +12311,7 @@ app.post('/api/seller/support', supportUpload, async (req: Request, res: Respons
   const contactFormEmail = await getContactFormEmail()
   const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
   if (!supportEmail) {
-    console.error('[Seller Support] No contact_form email account configured and EMAIL_ADDRESS env variable is not set.')
+    console.error('[Seller Support] No contact_form email account configured in the database.')
     return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
   }
 
@@ -11882,7 +12476,7 @@ app.post('/api/contact', async (req: Request, res: Response) => {
   const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
 
   if (!supportEmail) {
-    console.error('[Contact] No contact_form email account configured and EMAIL_ADDRESS env variable is not set.')
+    console.error('[Contact] No contact_form email account configured in the database.')
     return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
   }
 
@@ -12028,9 +12622,48 @@ const bootstrapAndStartServer = async () => {
       const settings = await getRuntimeSettings()
       const host = String(settings.smtp_host || '').trim()
       const port = Number(settings.smtp_port) || 0
-      const secure = settings.smtp_secure === 'ssl'
+      const secure = resolveSmtpSecure(settings.smtp_secure, port)
       if (!host || !port) return null
       return { host, port, secure }
+    } catch {
+      return null
+    }
+  })
+
+  setSmtpDefaultCredentialsResolver(async () => {
+    try {
+      await ensureEmailAccountPurposesColumn()
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT email_address, encrypted_password
+         FROM email_accounts
+         WHERE is_active = 1
+         ORDER BY
+           CASE
+             WHEN JSON_CONTAINS(purposes, JSON_QUOTE('sellers')) THEN 1
+             WHEN JSON_CONTAINS(purposes, JSON_QUOTE('customers')) THEN 2
+             WHEN JSON_CONTAINS(purposes, JSON_QUOTE('contact_form')) THEN 3
+             WHEN JSON_CONTAINS(purposes, JSON_QUOTE('newsletters')) THEN 4
+             ELSE 5
+           END,
+           id ASC`,
+      )
+
+      for (const row of rows) {
+        const user = String(row.email_address || '').trim()
+        const encryptedPassword = String(row.encrypted_password || '').trim()
+        if (!user || !encryptedPassword) continue
+
+        try {
+          const pass = decryptSmtpPassword(encryptedPassword)
+          if (pass) {
+            return { user, pass }
+          }
+        } catch {
+          // Skip invalid account rows and continue with the next active account.
+        }
+      }
+
+      return null
     } catch {
       return null
     }

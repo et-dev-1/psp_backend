@@ -13,6 +13,13 @@ const toNumber = (val: string | undefined, fallback: number): number => {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+const resolveSmtpSecureFromEnv = (raw: string | undefined, port: number): boolean => {
+  const normalized = String(raw || '').trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on', 'ssl', 'tls'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off', 'starttls'].includes(normalized)) return false
+  return port === 465
+}
+
 export const DATABASE_URL = String(process.env.DATABASE_URL || '').trim()
 
 export const JWT_SECRET = String(process.env.JWT_SECRET || '')
@@ -22,8 +29,6 @@ export const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || '').trim(
 export const NODE_ENV = process.env.NODE_ENV || 'development'
 export const DISABLE_AUTH_CHECK = toBool(process.env.DISABLE_AUTH_CHECK)
 export const DETAILED_LOGGING = toBool(process.env.DETAILED_LOGGING, false)
-// CONTACT_EMAIL is derived from EMAIL_ADDRESS — set EMAIL_ADDRESS in .env
-export const CONTACT_EMAIL = String(process.env.EMAIL_ADDRESS || '')
 export const PORT = Number(process.env.PORT || 3000)
 export const DISABLE_AUTH_RATE_LIMIT = toBool(process.env.DISABLE_AUTH_RATE_LIMIT, false)
 export const SIGNIN_MAX_ATTEMPTS = toNumber(process.env.SIGNIN_MAX_ATTEMPTS, 8)
@@ -34,20 +39,26 @@ export const BACKEND_PUBLIC_BASE_URL = String(process.env.BACKEND_PUBLIC_BASE_UR
 export const UPLOADS_DIR = String(process.env.UPLOADS_DIR || '').trim()
 export const POSTNORD_TRACKING_BASE_URL = String(process.env.POSTNORD_TRACKING_BASE_URL || '').trim()
 
+const SMTP_PORT = toNumber(process.env.SMTP_PORT, 587)
+const SMTP_SECURE = resolveSmtpSecureFromEnv(process.env.SMTP_SECURE, SMTP_PORT)
+const SMTP_USER = String(process.env.SMTP_USER || process.env.EMAIL_ADDRESS || '').trim()
+const SMTP_PASS = String(process.env.SMTP_PASS || '').trim()
+export const PLATFORM_NAME = String(process.env.PLATFORM_NAME || process.env.SMTP_FROM_NAME || 'Platform').trim() || 'Platform'
+
 export const SMTP = {
-  host: process.env.EMAIL_HOST || 'smtp.hostinger.com',
-  port: Number(process.env.EMAIL_PORT || 465),
-  secure: process.env.EMAIL_SECURE ? process.env.EMAIL_SECURE === 'true' : Number(process.env.EMAIL_PORT || 465) === 465,
-  user: process.env.EMAIL_ADDRESS || '',
-  pass: process.env.EMAIL_PASS || '',
-  fromName: process.env.EMAIL_FROM_NAME || 'Admin',
+  host: String(process.env.SMTP_HOST || '').trim(),
+  port: SMTP_PORT,
+  secure: SMTP_SECURE,
+  user: SMTP_USER,
+  pass: SMTP_PASS,
+  fromName: PLATFORM_NAME,
 }
 
 export const EMAIL = {
-  address: process.env.EMAIL_ADDRESS || '',
-  companyName: '',
-  companyAddress: '',
-  companyLogoUrl: '',
+  address: String(process.env.EMAIL_ADDRESS || SMTP_USER || '').trim(),
+  companyName: String(process.env.EMAIL_COMPANY_NAME || '').trim(),
+  companyAddress: String(process.env.EMAIL_COMPANY_ADDRESS || '').trim(),
+  companyLogoUrl: String(process.env.EMAIL_COMPANY_LOGO_URL || '').trim(),
 }
 
 export const COMPANY_ORGANIZATION_NUMBER = String(process.env.COMPANY_ORGANIZATION_NUMBER || '')

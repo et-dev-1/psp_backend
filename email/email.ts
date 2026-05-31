@@ -51,9 +51,11 @@ const organizationNumber = COMPANY_ORGANIZATION_NUMBER || 'N/A'
 type EmailAccountInfo = { email_address: string; plain_password: string }
 type EmailAccountResolver = (purpose: string) => Promise<EmailAccountInfo | null>
 type SmtpSettingsResolver = () => Promise<{ host: string; port: number; secure: boolean } | null>
+type SmtpDefaultCredentialsResolver = () => Promise<{ user: string; pass: string } | null>
 
 let emailAccountResolver: EmailAccountResolver | null = null
 let smtpSettingsResolver: SmtpSettingsResolver | null = null
+let smtpDefaultCredentialsResolver: SmtpDefaultCredentialsResolver | null = null
 
 export const setEmailAccountResolver = (fn: EmailAccountResolver): void => {
   emailAccountResolver = fn
@@ -61,6 +63,10 @@ export const setEmailAccountResolver = (fn: EmailAccountResolver): void => {
 
 export const setSmtpSettingsResolver = (fn: SmtpSettingsResolver): void => {
   smtpSettingsResolver = fn
+}
+
+export const setSmtpDefaultCredentialsResolver = (fn: SmtpDefaultCredentialsResolver): void => {
+  smtpDefaultCredentialsResolver = fn
 }
 
 const stripHtml = (value: string): string => {
@@ -163,6 +169,8 @@ const renderTemplate = (template: string, values: Record<string, string>): strin
   return template.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '')
 }
 
+const FOOTER_SENDER_EMAIL_TOKEN = '__SENDER_EMAIL__'
+
 export const createEmailFooterHtml = (input: {
   company_name: string
   company_email: string
@@ -172,7 +180,8 @@ export const createEmailFooterHtml = (input: {
 }): string => {
   return renderTemplate(getEmailFooterTemplate(), {
     company_name: String(input.company_name || '').trim(),
-    company_email: String(input.company_email || '').trim(),
+    // Resolve to actual sender at send time so footer email always matches From.
+    company_email: FOOTER_SENDER_EMAIL_TOKEN,
     company_address: String(input.company_address || '').trim(),
     organization_number: String(input.organization_number || '').trim(),
     footer_intro_text: String(input.introText || 'If you have any questions, please contact:').trim(),
@@ -549,7 +558,8 @@ export const sendEmail = async (
   }
 
   const useTestSender = Boolean(options?.useTestSender)
-  const fromName = String(SMTP.fromName || 'SellingPlatform').trim()
+  const fromName = String(SMTP.fromName || 'Platform').trim()
+  let purposeSendError: unknown = null
 
   // When a purpose is provided, try to load from the email_accounts table
   if (options?.purpose && !useTestSender) {
@@ -567,15 +577,15 @@ export const sendEmail = async (
           const smtpSecure = runtimeSmtp?.secure ?? SMTP.secure
 
           const looksLikeHtml = /<[^>]+>/.test(body)
-          const htmlBody = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
-          const textBody = looksLikeHtml ? stripHtml(body) : body
+          const htmlBodyRaw = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
+          const htmlBody = htmlBodyRaw.split(FOOTER_SENDER_EMAIL_TOKEN).join(senderEmail)
+          const textBody = looksLikeHtml ? stripHtml(htmlBody) : body
 
           const transporter = nodemailer.createTransport({
             host: smtpHost,
             port: smtpPort,
             secure: smtpSecure,
             ...(smtpPort === 587 && !smtpSecure ? { requireTLS: true } : {}),
-            authMethod: 'LOGIN',
             auth: {
               user: senderEmail,
               pass: account.plain_password,
@@ -598,13 +608,29 @@ export const sendEmail = async (
         }
       }
     } catch (purposeError) {
+      purposeSendError = purposeError
       console.warn(`[sendEmail] Failed to use purpose account (${options.purpose}), falling back to default:`, purposeError)
     }
   }
 
-  // Default / fallback behavior
-  let smtpUser = String(SMTP.user || EMAIL.address || '').trim()
-  let smtpPass = String(SMTP.pass || '').trim()
+  // Default / fallback behavior (DB-first via resolver)
+  let smtpUser = ''
+  let smtpPass = ''
+  if (!useTestSender && smtpDefaultCredentialsResolver) {
+    try {
+      const creds = await smtpDefaultCredentialsResolver()
+      smtpUser = String(creds?.user || '').trim()
+      smtpPass = String(creds?.pass || '').trim()
+    } catch {
+      // ignore and continue with static fallback
+    }
+  }
+
+  if (!smtpUser || !smtpPass) {
+    smtpUser = String(SMTP.user || EMAIL.address || '').trim()
+    smtpPass = String(SMTP.pass || '').trim()
+  }
+
   const defaultTestSender = String(EMAIL.address || '').trim()
 
   // If env SMTP not configured, try any active DB account as last resort
@@ -628,6 +654,9 @@ export const sendEmail = async (
   const smtpConfigured = Boolean(smtpUser && smtpPass)
 
   if (!smtpConfigured && !useTestSender) {
+    if (purposeSendError instanceof Error) {
+      throw new Error(`Failed to send email with purpose account '${String(options?.purpose || '')}': ${purposeSendError.message}`)
+    }
     throw new Error('SMTP_USER and SMTP_PASS must be configured')
   }
 
@@ -649,8 +678,9 @@ export const sendEmail = async (
   }
 
   const looksLikeHtml = /<[^>]+>/.test(body)
-  const htmlBody = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
-  const textBody = looksLikeHtml ? stripHtml(body) : body
+  const htmlBodyRaw = looksLikeHtml ? body : `<p>${body.replace(/\n/g, '<br/>')}</p>`
+  const htmlBody = htmlBodyRaw.split(FOOTER_SENDER_EMAIL_TOKEN).join(senderEmail)
+  const textBody = looksLikeHtml ? stripHtml(htmlBody) : body
 
   // Read live from SMTP config (prefer runtime DB settings over env)
   const runtimeSmtpFb = smtpSettingsResolver ? await smtpSettingsResolver().catch(() => null) : null
@@ -664,7 +694,6 @@ export const sendEmail = async (
     secure: liveSecure,
     // For STARTTLS (port 587, secure=false): require TLS upgrade after connect
     ...(livePort === 587 && !liveSecure ? { requireTLS: true } : {}),
-    authMethod: 'LOGIN',
     auth: {
       user: smtpUser,
       pass: smtpPass,
@@ -819,6 +848,91 @@ export const createProductStatusEmailHtml = (input: ProductStatusEmailInput): st
     cta_bg: ctaBg,
     email_footer: footer,
   })
+}
+
+type DeliveryReviewRequestEmailInput = {
+  company: EmailCompanyInfo
+  seller_name: string
+  customer_name: string
+  product_name: string
+  review_url: string
+  language?: 'en' | 'sv'
+}
+
+export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewRequestEmailInput): string => {
+  const language = input.language === 'sv' ? 'sv' : 'en'
+
+  const copy = language === 'sv'
+    ? {
+        title: 'Be kunden om omdöme',
+        intro: 'Den här beställningen är levererad. Dela länken nedan med kunden så att de kan lämna ett betyg och en kommentar.',
+        button: 'Öppna omdömessida',
+        helper: 'Om knappen inte fungerar kan du kopiera och dela länken manuellt:',
+        orderLineLabel: 'Produkt',
+        customerLineLabel: 'Kund',
+      }
+    : {
+        title: 'Request a customer review',
+        intro: 'This order has been delivered. Share the link below with your customer so they can leave a rating and a comment.',
+        button: 'Open review page',
+        helper: 'If the button does not work, copy and share this link manually:',
+        orderLineLabel: 'Product',
+        customerLineLabel: 'Customer',
+      }
+
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+
+  const normalizedReviewUrl = normalizeEmailUrl(input.review_url)
+  const sellerName = String(input.seller_name || 'Seller').trim()
+  const customerName = String(input.customer_name || 'Customer').trim()
+  const productName = String(input.product_name || '').trim()
+
+  return `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-family:Arial,Helvetica,sans-serif;background:#f3f4f6;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e5e7eb;">
+            <tr>
+              <td style="padding:24px 28px;background:#111827;color:#ffffff;">
+                <p style="margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#cbd5e1;">${String(input.company.company_name || '').trim()}</p>
+                <h1 style="margin:8px 0 0 0;font-size:24px;line-height:1.25;">${copy.title}</h1>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:24px 28px 8px 28px;">
+                <p style="margin:0 0 14px 0;font-size:15px;line-height:1.65;color:#374151;">${copy.intro}</p>
+                <p style="margin:0;font-size:14px;line-height:1.6;color:#111827;"><strong>${copy.customerLineLabel}:</strong> ${customerName}</p>
+                <p style="margin:6px 0 0 0;font-size:14px;line-height:1.6;color:#111827;"><strong>${copy.orderLineLabel}:</strong> ${productName || '—'}</p>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:20px 28px 10px 28px;">
+                <a href="${normalizedReviewUrl}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:14px;font-weight:700;">${copy.button}</a>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:8px 28px 24px 28px;">
+                <p style="margin:0 0 8px 0;font-size:12px;color:#6b7280;">${copy.helper}</p>
+                <p style="margin:0;font-size:12px;word-break:break-all;"><a href="${normalizedReviewUrl}" style="color:#2563eb;">${normalizedReviewUrl}</a></p>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:0 28px 28px 28px;">${footer}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  `
 }
 
 export default sendEmail
