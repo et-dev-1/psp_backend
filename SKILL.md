@@ -1,142 +1,137 @@
 ---
-name: frontend-typescript-role-routing
-description: "Generate and refactor frontend TypeScript code with reusable components, role-based route metadata, strict role view folders (AdminPages/SellerPages/CustomerPages), auth guards for admin/seller, and webhook-first real-time updates. Use for Vue + TypeScript feature work, route design, component architecture, and implementation reviews."
-argument-hint: "Describe the feature, target role (admin/seller/buyer), route path, and whether this is a new route, component, or refactor."
+name: backend-express-typescript-ecommerce
+description: "Build and maintain the Express + TypeScript backend for this eCommerce platform, including API endpoints, MySQL schema updates, email/SMTP behavior, shipping and payment integrations, deployment configuration, and environment setup."
+argument-hint: "Describe the backend task, affected API/domain (auth/orders/payments/email/shipment/settings), and whether deployment or env updates are needed."
 user-invocable: true
 ---
 
-# Frontend Development Guidelines (TypeScript + Role-Based Structure)
+# Backend Skill (Express + TypeScript + MySQL)
 
-## Enviroment
-- Expressjs and typescriprt
-- Deployment in Dokploy 
-- Deployment of database in dokploy and run the schema during deployment and build process.
-- use Dockerfile and .env for environment configuration and deployment settings.
-- Setup in Dokploy Backend = service application, Frontend = service application, Database = database service with schema applied during deployment.
+## Purpose
+Use this skill for backend work in this repository:
+- API implementation and refactors in `server.ts`
+- Database schema and migration-safe changes (`schema.sql`, `scripts/apply-schema.ts`)
+- Runtime settings and app settings behavior (`app_settings`)
+- Email/SMTP integration and troubleshooting
+- Stripe/Swish/PostNord integration changes
+- Deployment and environment configuration for Docker/Dokploy
 
+## Stack and Runtime
+- Node.js: `>=18`
+- Framework: Express `5.x`
+- Language: TypeScript (`tsc` outputs to `dist/`)
+- Database: MySQL (`mysql2`)
+- Real-time: Socket.io
+- Main runtime entry: `server.js` (loads `dist/server.js`)
 
-## Outcome
-Produce frontend code that is:
-- Type-safe and maintainable
-- Built from reusable components and shared logic
-- Organized around strict role-based routes
-- Auth-safe for protected areas
-- Webhook-first for real-time and event-driven updates
+## Key Files
+- Server routes and core logic: `server.ts`
+- Runtime config parsing: `config.ts`
+- DB pool/types: `db.ts`, `db.d.ts`
+- Schema source of truth: `schema.sql`
+- Schema apply script: `scripts/apply-schema.ts`
+- Email delivery and templates: `email/email.ts`, `email/*.hbs`
+- Shipment integration: `shipment/shipment.ts`
+- Swish integration: `swish/SwishApi.ts`
+- Container build/runtime: `Dockerfile`
 
-## When To Use
-Use this skill when implementing or modifying:
-- Vue + TypeScript components, views, composables, and routes
-- Admin, seller, or buyer route flows
-- Real-time update behavior (events, status updates, notifications)
-- Refactors where duplicate UI/logic should be consolidated
+## Local Development
+1. Install deps:
+```bash
+npm install
+```
+2. Configure env:
+- Copy `.env.example` to `.env`
+- Set required values (especially `DATABASE_URL`, `JWT_SECRET`, `CLIENT_URL`)
+3. Apply schema:
+```bash
+npm run db:init
+```
+4. Start dev server:
+```bash
+npm run dev
+```
+5. Build for production check:
+```bash
+npm run build
+```
 
-## Project Rules
-1. Use TypeScript for all new frontend code.
-2. Prefer explicit types and interfaces; avoid `any` unless there is no practical typed alternative.
-3. Keep business logic outside presentational components when possible.
-4. Reuse existing components and composables before creating new ones.
+## Build and Startup Commands
+- Dev: `npm run dev`
+- Build: `npm run build`
+- Run compiled app: `npm start`
+- Init schema manually: `npm run db:init`
+- Production helper: `npm run start:prod`
 
-## Repository Layout
+## Environment Configuration
+Use `.env.example` as baseline.
 
-- Backend
-	- Location: `./`
-	- Server entry: `/server.ts`
-	- Database schema / migrations: `/database.sql`
-	- Email logic: `/email/email.ts`
-	- Shipment logic: `/shipment/shipment.ts`
-	- Notes:
-		- When database parameters or schema change, update `/schema.sql` and run the project's migration scripts or SQL commands to apply changes.
-		- Document the exact migration commands in the PR and ensure CI/staging runs migrations before deployment.
+Required in production:
+- `NODE_ENV=production`
+- `PORT` (internal app port, default `3000`)
+- `DATABASE_URL`
+- `JWT_SECRET`
+- `CLIENT_URL`
+- `BACKEND_PUBLIC_BASE_URL`
+- `CORS_ORIGINS` (explicit allowlist)
+- `GOOGLE_CLIENT_ID` (if Google auth enabled)
+- `STRIPE_SECRET_KEY` (if Stripe enabled)
 
+Common optional/runtime env:
+- Rate limits: `SIGNIN_MAX_ATTEMPTS`, `SIGNIN_RATE_LIMIT_WINDOW_MINUTES`, `SIGNUP_MAX_ATTEMPTS`, `SIGNUP_RATE_LIMIT_WINDOW_MINUTES`
+- PostNord: `POSTNORD_*`, `POSTNORD_TRACKING_BASE_URL`
+- Swish: `SWISH_*`
+- Platform defaults: `DEFAULT_PLATFORM_COMMISSION_PERCENT`, `DEFAULT_PLATFORM_COMMISSION_FIXED`, `PROMOTION_COMMISSION_PERCENT`, `VAT_SHIPPING_RATE`
 
-## Database Parameter Changes
+Important behavior:
+- SMTP sender credentials are DB-driven (app settings + email accounts), not primarily static env.
+- `CORS_ORIGINS` is strict in production; missing values can block all origins.
 
-- Policy: Whenever database parameters change (columns, types, constraints, config values):
-	1. Update `/schema.sql` (or add an appropriate migration script in `/`).
-	2. Run the project's migration/apply scripts or execute the SQL commands against the development database to apply the change.
-	3. Include the commands used and reasoning in the PR description; add rollback notes where applicable.
-	4. Notify backend maintainers and ensure staging/production environments receive the migration as part of deployment.
+## Deployment (Docker / Dokploy)
+This project includes a multi-stage `Dockerfile`.
 
-## Role and Structure Mapping
-1. Admin:
-- View files must be under `Frontend/src/views/AdminPages`.
-- Route metadata should include admin role access.
-- Route requires authentication.
+Container flow:
+1. Build stage: install dependencies and run `npm run build`
+2. Runtime stage: install prod deps, copy `dist/`, `server.js`, `email/`, `swish/`, `schema.sql`
+3. Startup command runs schema reconcile then starts server:
+```sh
+node dist/scripts/apply-schema.js && exec node server.js
+```
 
-2. Seller:
-- View files must be under `Frontend/src/views/SellerPages`.
-- Route metadata should include seller role access.
-- Route requires authentication.
+Dokploy guidance:
+- Deploy backend as an app/service container using this `Dockerfile`
+- Set all production env vars in Dokploy service env UI
+- Keep backend listening on internal `PORT` (do not bind app directly to 80/443)
+- Route external traffic through Dokploy reverse proxy
+- Ensure DB service is reachable from backend container by `DATABASE_URL`
 
-3. Buyer (Customer):
-- View files must be under `Frontend/src/views/CustomerPages`.
-- Route is public by default unless feature sensitivity requires authentication.
-- Route metadata should explicitly mark public routes.
-- UX should prioritize customer-facing clarity.
+## Database and Migration Rules
+- Always update `schema.sql` for schema changes
+- Keep changes re-runnable and backward-safe when possible
+- Validate with:
+```bash
+npm run db:init
+npm run build
+```
+- If adding new columns, align DB typings (`db.d.ts`) and query logic
 
-## Authentication Requirements
-1. Every admin route must enforce login.
-2. Every seller route must enforce login.
-3. Unauthorized users must be redirected to login before route entry.
-4. Buyer routes default to public; require authentication for sensitive actions or data.
+## Email and App Settings Rules
+- Runtime email behavior is influenced by DB settings (`app_settings`, `email_accounts`)
+- When adding footer/company/platform settings, update:
+  - settings read/write endpoints in `server.ts`
+  - fallback logic for backward compatibility
+  - email footer context mapping in `email/email.ts` and templates
 
-## Webhook-First Strategy
-1. Prefer webhooks over polling for server-driven updates.
-2. Use webhook/event-driven updates for:
-- Real-time UI state changes
-- Backend completion events
-- Async process status propagation
-3. Use polling only when webhook/event integration is unavailable, and document why.
+## Security and Operations Notes
+- Never commit real secrets in `.env` or source code
+- Keep `JWT_SECRET` long/random (32+ chars)
+- Avoid disabling CORS/auth checks in production
+- Validate destructive admin operations carefully (e.g., DB reset behavior)
 
-## Workflow
-1. Identify feature scope.
-- Confirm role target: admin, seller, or buyer.
-- Confirm whether this is a new route, component, or logic refactor.
-
-2. Check for reusable building blocks first.
-- Search existing components, composables, and shared utilities.
-- If suitable pieces exist, compose from them instead of duplicating.
-
-3. Decide routing and auth.
-- Map views to `AdminPages`, `SellerPages`, or `CustomerPages` based on role.
-- Apply route metadata (`roles`, `public`) consistent with existing router patterns.
-- Add or verify auth guards for admin and seller routes.
-
-4. Implement with strong typing.
-- Define interfaces/types for props, payloads, API responses, and state.
-- Keep UI and domain logic separated (component vs composable/service).
-
-5. Choose real-time mechanism.
-- Prefer webhook/event-driven flow.
-- If using fallback polling, capture the reason in code and PR notes.
-
-6. Validate quality gates.
-- No avoidable `any` usage.
-- No duplicated UI blocks that could be shared.
-- Role mapping, route metadata, and auth behavior are correct.
-- New code follows existing folder conventions.
-
-## Decision Points
-1. Reuse vs create:
-- If existing component/composable satisfies >=80% of need, reuse and extend carefully.
-- Otherwise create a new generic reusable unit in shared/component-appropriate structure.
-
-2. Webhook vs polling:
-- If backend supports event delivery, use webhook/event-driven updates.
-- If not, use minimal polling with clear exit/cleanup behavior and a documented justification.
-
-3. Protected vs public buyer pages:
-- If sensitive customer data/actions are present, require authentication.
-- Otherwise allow public access with optional progressive auth prompts.
-
-## Completion Checklist
-- View path is in the correct role folder (`AdminPages`, `SellerPages`, `CustomerPages`).
-- Route metadata correctly represents role/public behavior.
-- Admin and seller routes enforce login and redirect unauthorized users.
-- Existing reusable components/composables were evaluated before adding new ones.
-- Any new component/composable is generic and reusable.
-- TypeScript types are explicit and maintainable.
-- Webhook/event-driven updates were used when feasible.
-- Business logic remains separated from display concerns.
-- Folder and naming conventions match the existing project style.
-
+## Definition of Done
+A backend task is complete when:
+1. Code compiles (`npm run build`)
+2. Schema/runtime changes are applied safely
+3. Required env vars are documented/updated
+4. Deployment impact is clear (Docker/Dokploy)
+5. Any changed API behavior is reflected in frontend expectations

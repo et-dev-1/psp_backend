@@ -318,6 +318,24 @@ CREATE TABLE IF NOT EXISTS website_reviews (
   INDEX idx_website_reviews_created_at (created_at)
 ) AUTO_INCREMENT = 100;
 
+-- Customer Search Keywords Table
+CREATE TABLE IF NOT EXISTS customer_search_keywords (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  keyword VARCHAR(255) NOT NULL,
+  normalized_keyword VARCHAR(255) NOT NULL,
+  source VARCHAR(50) NOT NULL DEFAULT 'shop-now',
+  ip_address VARCHAR(64) NULL,
+  country_code VARCHAR(8) NULL,
+  region VARCHAR(120) NULL,
+  city VARCHAR(120) NULL,
+  user_agent VARCHAR(255) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_customer_search_keywords_created_at (created_at),
+  INDEX idx_customer_search_keywords_normalized (normalized_keyword),
+  INDEX idx_customer_search_keywords_source (source),
+  INDEX idx_customer_search_keywords_country_code (country_code)
+) AUTO_INCREMENT = 100;
+
 -- Shipment Policies Table (Seller's shipping fees by country)
 CREATE TABLE IF NOT EXISTS shipment_policies (
   id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,

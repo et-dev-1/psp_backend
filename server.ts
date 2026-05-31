@@ -532,6 +532,7 @@ let hasDeliveryReviewRequestsTableCache: boolean | null = null
 let hasAccountingStepChecksTableCache: boolean | null = null
 let hasEmailAccountsTableCache: boolean | null = null
 let hasEmailAccountPurposesColumnCache: boolean | null = null
+let hasCustomerSearchKeywordsTableCache: boolean | null = null
 
 const pendingTwoFaSecrets = new Map<number, { secret: string; expiresAt: number }>()
 const authCaptchaChallenges = new Map<string, { answer: string; expiresAt: number }>()
@@ -1922,6 +1923,152 @@ const ensureDeliveryReviewRequestsTable = async () => {
     hasDeliveryReviewRequestsTableCache = null
     console.error('Failed ensuring delivery_review_requests table:', error)
     throw error
+  }
+}
+
+const ensureCustomerSearchKeywordsTable = async () => {
+  if (hasCustomerSearchKeywordsTableCache === true) return
+
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS customer_search_keywords (
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        keyword VARCHAR(255) NOT NULL,
+        normalized_keyword VARCHAR(255) NOT NULL,
+        source VARCHAR(50) NOT NULL DEFAULT 'shop-now',
+        ip_address VARCHAR(64) NULL,
+        country_code VARCHAR(8) NULL,
+        region VARCHAR(120) NULL,
+        city VARCHAR(120) NULL,
+        user_agent VARCHAR(255) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_customer_search_keywords_created_at (created_at),
+        INDEX idx_customer_search_keywords_normalized (normalized_keyword),
+        INDEX idx_customer_search_keywords_source (source),
+        INDEX idx_customer_search_keywords_country_code (country_code)
+      )
+    `)
+
+    const [countryCodeColumns] = await db.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM customer_search_keywords LIKE 'country_code'",
+    )
+    if (!countryCodeColumns.length) {
+      await db.query('ALTER TABLE customer_search_keywords ADD COLUMN country_code VARCHAR(8) NULL AFTER ip_address')
+      await db.query('ALTER TABLE customer_search_keywords ADD INDEX idx_customer_search_keywords_country_code (country_code)')
+    }
+
+    const [regionColumns] = await db.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM customer_search_keywords LIKE 'region'",
+    )
+    if (!regionColumns.length) {
+      await db.query('ALTER TABLE customer_search_keywords ADD COLUMN region VARCHAR(120) NULL AFTER country_code')
+    }
+
+    const [cityColumns] = await db.query<RowDataPacket[]>(
+      "SHOW COLUMNS FROM customer_search_keywords LIKE 'city'",
+    )
+    if (!cityColumns.length) {
+      await db.query('ALTER TABLE customer_search_keywords ADD COLUMN city VARCHAR(120) NULL AFTER region')
+    }
+
+    hasCustomerSearchKeywordsTableCache = true
+  } catch (error) {
+    hasCustomerSearchKeywordsTableCache = null
+    console.error('Failed ensuring customer_search_keywords table:', error)
+  }
+}
+
+const getRequestIpAddress = (req: Request): string => {
+  const forwardedFor = req.headers['x-forwarded-for']
+  const firstForwarded = Array.isArray(forwardedFor)
+    ? String(forwardedFor[0] || '').split(',')[0].trim()
+    : String(forwardedFor || '').split(',')[0].trim()
+
+  if (firstForwarded) return firstForwarded.slice(0, 64)
+
+  const remoteAddress = String(req.ip || req.socket.remoteAddress || '').trim()
+  return remoteAddress.slice(0, 64)
+}
+
+const getRequestHeaderValue = (req: Request, name: string): string => {
+  const raw = req.headers[name.toLowerCase()]
+  if (Array.isArray(raw)) {
+    return String(raw[0] || '').trim()
+  }
+  return String(raw || '').trim()
+}
+
+const getRequestLocation = (req: Request): { countryCode: string; region: string; city: string } => {
+  const countryCode = (
+    getRequestHeaderValue(req, 'cf-ipcountry')
+    || getRequestHeaderValue(req, 'x-vercel-ip-country')
+    || getRequestHeaderValue(req, 'cloudfront-viewer-country')
+    || getRequestHeaderValue(req, 'x-country-code')
+  ).slice(0, 8)
+
+  const region = (
+    getRequestHeaderValue(req, 'x-vercel-ip-country-region')
+    || getRequestHeaderValue(req, 'cloudfront-viewer-country-region')
+    || getRequestHeaderValue(req, 'x-region')
+  ).slice(0, 120)
+
+  const city = (
+    getRequestHeaderValue(req, 'x-vercel-ip-city')
+    || getRequestHeaderValue(req, 'cloudfront-viewer-city')
+    || getRequestHeaderValue(req, 'cf-ipcity')
+    || getRequestHeaderValue(req, 'x-city')
+  ).slice(0, 120)
+
+  return {
+    countryCode,
+    region,
+    city,
+  }
+}
+
+const logCustomerSearchKeyword = async (
+  req: Request,
+  keywordRaw: unknown,
+  source = 'shop-now',
+): Promise<void> => {
+  const keyword = String(keywordRaw || '').trim()
+  if (!keyword) return
+
+  await ensureCustomerSearchKeywordsTable()
+  if (hasCustomerSearchKeywordsTableCache !== true) return
+
+  const keywordForDb = keyword.slice(0, 255)
+  const normalizedKeyword = keyword.toLowerCase().slice(0, 255)
+  const sourceForDb = String(source || 'shop-now').trim().slice(0, 50) || 'shop-now'
+  const ipAddress = getRequestIpAddress(req)
+  const location = getRequestLocation(req)
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 255)
+
+  try {
+    await db.query(
+      `INSERT INTO customer_search_keywords (
+        keyword,
+        normalized_keyword,
+        source,
+        ip_address,
+        country_code,
+        region,
+        city,
+        user_agent
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        keywordForDb,
+        normalizedKeyword,
+        sourceForDb,
+        ipAddress || null,
+        location.countryCode || null,
+        location.region || null,
+        location.city || null,
+        userAgent || null,
+      ],
+    )
+  } catch (error) {
+    console.error('Failed to log customer search keyword:', error)
   }
 }
 
@@ -7261,6 +7408,7 @@ app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
     'accounting_step_checks',
     'bank_accounts',
     'customers',
+    'customer_search_keywords',
     'digital_download_tokens',
     'email_accounts',
     'newsletter_subscribers',
@@ -8473,6 +8621,7 @@ app.get('/api/public/sellers/search', async (req: Request, res: Response) => {
     await ensureProfilesStatusColumns()
 
     const query = String(req.query.q || '').trim()
+    await logCustomerSearchKeyword(req, query, 'seller-search')
     if (query.length < 2) {
       return res.status(200).json([])
     }
@@ -8531,6 +8680,7 @@ app.get('/api/public/sellers/:id', async (req: Request, res: Response) => {
 
   try {
     await ensureProfilesStatusColumns()
+    await ensureDeliveryReviewRequestsTable()
 
     const [sellerRows] = await db.query<RowDataPacket[]>(
       `SELECT
