@@ -11,7 +11,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { RowDataPacket, ResultSetHeader } from 'mysql2'
-import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
+import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, createSellerOrderReceivedEmailHtml, EMAIL_HEADER_LOGO_HTML, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
 import { emitToAdmin, emitToSeller, setupWebSocket } from './websocket'
 import { estimateShipmentCost, generateShipmentLabel, trackShipment, type ShipmentAddressInput } from './shipment/shipment'
 import Handlebars from 'handlebars'
@@ -126,7 +126,7 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
   const row = rows[0] || {}
 
   // Read authoritative values from app_settings (set by admin in UI)
-  const settingKeys = ['email_company_name', 'company_address', 'email_company_address', 'email_company_logo_url', 'organization_number', 'company_organization_number']
+  const settingKeys = ['platform_name', 'company_address', 'email_company_address', 'organization_number', 'company_organization_number']
   const [settingRows] = await db.query<RowDataPacket[]>(
     `SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN (?)`,
     [settingKeys],
@@ -136,9 +136,8 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
     settingsMap.set(String(sr.setting_key), String(sr.setting_value || ''))
   }
 
-  // Resolve logo: prefer app_settings, fallback to profile, then config
+  // Resolve logo from admin profile, then fallback to config
   const rawLogoUrl = (
-    settingsMap.get('email_company_logo_url') ||
     String(row.company_logo_url || '').trim() ||
     config.EMAIL.companyLogoUrl ||
     ''
@@ -156,8 +155,9 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
   return {
     company_logo_url: resolvedLogoUrl,
     company_name: (
-      settingsMap.get('email_company_name') ||
+      settingsMap.get('platform_name') ||
       String(row.company_name || '').trim() ||
+      config.SMTP.fromName ||
       config.EMAIL.companyName ||
       ''
     ).trim(),
@@ -1507,30 +1507,9 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_address', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.EMAIL.address || '')],
-    )
-
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_company_name', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.EMAIL.companyName || '')],
-    )
-
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
        VALUES ('company_address', ?)
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
       [String(config.EMAIL.companyAddress || '')],
-    )
-
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_company_logo_url', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.EMAIL.companyLogoUrl || '')],
     )
 
     await db.query(
@@ -1569,10 +1548,8 @@ const ensureCommissionSettingsTable = async () => {
     )
 
     await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('google_client_id', ?)
-       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(config.GOOGLE_CLIENT_ID || '')],
+      `DELETE FROM app_settings
+       WHERE setting_key IN ('email_address', 'google_client_id', 'email_company_name', 'email_company_logo_url')`,
     )
 
     hasCommissionSettingsTableCache = true
@@ -1648,14 +1625,12 @@ type RuntimeSettings = {
   account_commission_revenue: string
   account_stripe_fees: string
   account_bank_costs: string
-  email_address: string
   company_address: string
   organization_number: string
   postnord_customer_number: string
   postnord_debug_logs: boolean
   postnord_use_portal_pricing: boolean
   postnord_enable_transit_time: boolean
-  google_client_id: string
   smtp_host: string
   smtp_port: number
   smtp_secure: string
@@ -1678,15 +1653,9 @@ const applyRuntimeSettings = (settings: RuntimeSettings) => {
   process.env.POSTNORD_DEBUG_LOGS = String(settings.postnord_debug_logs)
   process.env.POSTNORD_USE_PORTAL_PRICING = String(settings.postnord_use_portal_pricing)
   process.env.POSTNORD_ENABLE_TRANSIT_TIME = String(settings.postnord_enable_transit_time)
-  process.env.GOOGLE_CLIENT_ID = settings.google_client_id
 
   VAT_SHIPPING_RATE = settings.vat_shipping_rate
   config.SMTP.fromName = String(settings.platform_name || '').trim() || config.PLATFORM_NAME
-  const runtimeEmailAddress = String(settings.email_address || '').trim()
-  if (runtimeEmailAddress) {
-    config.EMAIL.address = runtimeEmailAddress
-    config.SMTP.user = runtimeEmailAddress
-  }
   config.EMAIL.companyAddress = String(settings.company_address || '').trim()
 
   config.POSTNORD.customerNumber = settings.postnord_customer_number
@@ -1727,7 +1696,6 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     'account_commission_revenue',
     'account_stripe_fees',
     'account_bank_costs',
-    'email_address',
     'company_address',
     'organization_number',
     'email_company_address',
@@ -1736,7 +1704,6 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     'postnord_debug_logs',
     'postnord_use_portal_pricing',
     'postnord_enable_transit_time',
-    'google_client_id',
     'smtp_host',
     'smtp_port',
     'smtp_secure',
@@ -1781,14 +1748,12 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
     account_commission_revenue: String(map.get('account_commission_revenue') || '3001'),
     account_stripe_fees: String(map.get('account_stripe_fees') || '6040'),
     account_bank_costs: String(map.get('account_bank_costs') || '6570'),
-    email_address: String(map.get('email_address') || ''),
     company_address: String(map.get('company_address') || map.get('email_company_address') || config.EMAIL.companyAddress || ''),
     organization_number: String(map.get('organization_number') || map.get('company_organization_number') || config.COMPANY_ORGANIZATION_NUMBER || ''),
     postnord_customer_number: String(map.get('postnord_customer_number') || config.POSTNORD.customerNumber || ''),
     postnord_debug_logs: toBoolSetting(map.get('postnord_debug_logs'), Boolean(config.POSTNORD.debugLogs)),
     postnord_use_portal_pricing: toBoolSetting(map.get('postnord_use_portal_pricing'), Boolean(config.POSTNORD.usePortalPricing)),
     postnord_enable_transit_time: toBoolSetting(map.get('postnord_enable_transit_time'), Boolean(config.POSTNORD.enableTransitTime)),
-    google_client_id: String(map.get('google_client_id') || config.GOOGLE_CLIENT_ID || ''),
     smtp_host: String(map.get('smtp_host') || ''),
     smtp_port: Number(map.get('smtp_port')) || 587,
     smtp_secure: String(map.get('smtp_secure') || 'starttls'),
@@ -2615,6 +2580,7 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
 
   const html = renderTemplate(getCommissionUpdateTemplate(), {
     company_logo_url: String(companyInfo.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(companyInfo.company_name || '').trim(),
     company_email: String(companyInfo.company_email || '').trim(),
     company_address: String(companyInfo.company_address || '').trim(),
@@ -4314,14 +4280,12 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
       ['account_commission_revenue', accountCommissionRevenue],
       ['account_stripe_fees', accountStripeFees],
       ['account_bank_costs', accountBankCosts],
-      ['email_address', String(payload.email_address || '').trim()],
       ['company_address', String(payload.company_address || '').trim()],
       ['organization_number', String(payload.organization_number || '').trim()],
       ['postnord_customer_number', String(payload.postnord_customer_number || '').trim()],
       ['postnord_debug_logs', String(Boolean(payload.postnord_debug_logs))],
       ['postnord_use_portal_pricing', String(Boolean(payload.postnord_use_portal_pricing))],
       ['postnord_enable_transit_time', String(Boolean(payload.postnord_enable_transit_time))],
-      ['google_client_id', String(payload.google_client_id || '').trim()],
       ['smtp_host', String(payload.smtp_host || '').trim()],
       ['smtp_port', String(Number(payload.smtp_port) || 587)],
       ['smtp_secure', String(payload.smtp_secure || 'starttls')],
@@ -4335,6 +4299,11 @@ app.put('/api/admin/settings/runtime', async (req: Request, res: Response) => {
         [key, value],
       )
     }
+
+    await db.query(
+      `DELETE FROM app_settings
+       WHERE setting_key IN ('email_address', 'google_client_id')`,
+    )
 
     const settings = await getRuntimeSettings()
     applyRuntimeSettings(settings)
@@ -4814,13 +4783,38 @@ app.post('/api/admin/settings/runtime/company-logo', adminSettingsLogoUpload.sin
   const companyLogoUrl = `/uploads/company_logos/${file.filename}`
 
   try {
-    await ensureCommissionSettingsTable()
-    await db.query(
-      `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('email_company_logo_url', ?)
-       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
-      [companyLogoUrl],
+    await ensureProfilesStatusColumns()
+    const [adminRows] = await db.query<RowDataPacket[]>(
+      `SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1`,
     )
+    if (!adminRows.length) {
+      return res.status(404).json({ message: 'Admin user not found.' })
+    }
+
+    const adminUserId = Number(adminRows[0].id)
+    const [profileRows] = await db.query<RowDataPacket[]>(
+      `SELECT id
+       FROM profiles
+       WHERE user_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [adminUserId],
+    )
+
+    if (profileRows.length) {
+      await db.query(
+        `UPDATE profiles
+         SET company_logo_url = ?
+         WHERE id = ?`,
+        [companyLogoUrl, Number(profileRows[0].id)],
+      )
+    } else {
+      await db.query(
+        `INSERT INTO profiles (user_id, profile_type, company_logo_url, status, is_verified, is_blocked)
+         VALUES (?, 'company', ?, 'verified', 1, 0)`,
+        [adminUserId, companyLogoUrl],
+      )
+    }
 
     const settings = await getRuntimeSettings()
     applyRuntimeSettings(settings)
@@ -10131,6 +10125,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         order_id: orderIdUnique,
         sale_id: saleId,
         seller_id: Number(sellerId),
+        seller_total_amount: sellerGrandTotal,
+        total_items: items.length,
       })
     }
 
@@ -10243,7 +10239,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       const receiverEmail = String(customerRows[0].email || '')
       if (receiverEmail) {
         const subject = `Invoice for Orders ${orderIdsSummary}`
-        await sendEmail(receiverEmail, subject, html)
+        await sendEmail(receiverEmail, subject, html, { purpose: 'customers' })
       } else {
         console.warn('Skipped invoice email: missing receiver email')
       }
@@ -10272,6 +10268,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
             digitalReceiverEmail,
             `Your digital products — Order #${groupOrderId}`,
             digitalEmailHtml,
+            { purpose: 'customers' },
           )
 
           if (digitalOnlySaleIds.length > 0) {
@@ -10285,6 +10282,81 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       }
     } catch (digitalEmailError) {
       console.error('Digital product email failed:', digitalEmailError)
+    }
+
+    try {
+      const sellerIdsInOrder = Array.from(
+        new Set(createdOrders.map((order) => Number(order.seller_id)).filter((sellerId) => Number.isFinite(sellerId) && sellerId > 0)),
+      )
+
+      if (sellerIdsInOrder.length > 0) {
+        const [sellerRows] = await db.query<RowDataPacket[]>(
+          `SELECT
+             u.id AS seller_id,
+             u.email AS seller_email,
+             u.notify_order_received,
+             COALESCE(
+               NULLIF(TRIM(p.display_name), ''),
+               NULLIF(TRIM(p.company_name), ''),
+               SUBSTRING_INDEX(u.email, '@', 1),
+               CONCAT('Seller #', u.id)
+             ) AS seller_name
+           FROM users u
+           LEFT JOIN profiles p ON p.user_id = u.id
+             AND p.id = (
+               SELECT p2.id
+               FROM profiles p2
+               WHERE p2.user_id = u.id
+               ORDER BY p2.created_at DESC, p2.id DESC
+               LIMIT 1
+             )
+           WHERE u.id IN (?)`,
+          [sellerIdsInOrder],
+        )
+
+        const sellerOrderMap = new Map(
+          createdOrders.map((order) => [Number(order.seller_id), order]),
+        )
+        const companyInfo = await getPlatformCompanyEmailInfo()
+        const orderDate = new Date().toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+        })
+
+        await Promise.allSettled(
+          sellerRows.map(async (row) => {
+            const sellerId = Number(row.seller_id || 0)
+            const sellerEmail = String(row.seller_email || '').trim()
+            const notifyOrderReceived = Boolean(row.notify_order_received)
+            const sellerOrder = sellerOrderMap.get(sellerId)
+
+            if (!sellerId || !sellerEmail || !notifyOrderReceived || !sellerOrder) {
+              return
+            }
+
+            const html = createSellerOrderReceivedEmailHtml({
+              company: companyInfo,
+              seller_name: String(row.seller_name || `Seller #${sellerId}`).trim(),
+              customer_name: String(customerRows[0].name || 'Customer').trim(),
+              order_id: String(sellerOrder.order_id || ''),
+              group_order_id: String(groupOrderId || ''),
+              order_date: orderDate,
+              total_amount: Number(sellerOrder.seller_total_amount || 0),
+              total_items: Number(sellerOrder.total_items || 0),
+            })
+
+            await sendEmail(
+              sellerEmail,
+              `New order received — Order ${String(sellerOrder.order_id || '').trim()}`,
+              html,
+              { purpose: 'sellers' },
+            )
+          }),
+        )
+      }
+    } catch (sellerEmailError) {
+      console.error('Seller order email failed:', sellerEmailError)
     }
 
     const shipmentSummary = Array.from(sellerShippingPolicyMap.entries())
@@ -10538,13 +10610,14 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
       [sellerId]
     )
 
-    // Get total orders count and revenue (paid payouts)
+    // Get total orders count and revenue for active seller orders.
     const [orderStats] = await db.query<RowDataPacket[]>(
       `SELECT
         COUNT(*) as order_count,
         COALESCE(SUM(grand_total), 0) as total_revenue
        FROM sales
-      WHERE seller_id = ? AND payout_status = 'paid'`,
+      WHERE seller_id = ?
+        AND order_status <> 'cancelled'`,
       [sellerId]
     )
 
@@ -10552,7 +10625,8 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
     const [customerCount] = await db.query<RowDataPacket[]>(
       `SELECT COUNT(DISTINCT customer_id) as count
        FROM sales
-      WHERE seller_id = ? AND payout_status = 'paid'`,
+      WHERE seller_id = ?
+        AND order_status <> 'cancelled'`,
       [sellerId]
     )
 
@@ -10563,7 +10637,8 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
         COALESCE(SUM(grand_total), 0) as revenue,
         COUNT(*) as order_count
        FROM sales
-      WHERE seller_id = ? AND payout_status = 'paid'
+      WHERE seller_id = ?
+        AND order_status <> 'cancelled'
        AND order_date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
        GROUP BY DATE_FORMAT(order_date, '%Y-%m')
        ORDER BY month ASC`,
@@ -10574,7 +10649,8 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
     const [currentMonthRevenue] = await db.query<RowDataPacket[]>(
       `SELECT COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
-      WHERE seller_id = ? AND payout_status = 'paid'
+      WHERE seller_id = ?
+        AND order_status <> 'cancelled'
        AND YEAR(order_date) = YEAR(NOW())
        AND MONTH(order_date) = MONTH(NOW())`,
       [sellerId]
@@ -10584,7 +10660,8 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
     const [previousMonthRevenue] = await db.query<RowDataPacket[]>(
       `SELECT COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
-      WHERE seller_id = ? AND payout_status = 'paid'
+      WHERE seller_id = ?
+        AND order_status <> 'cancelled'
        AND YEAR(order_date) = YEAR(DATE_SUB(NOW(), INTERVAL 1 MONTH))
        AND MONTH(order_date) = MONTH(DATE_SUB(NOW(), INTERVAL 1 MONTH))`,
       [sellerId]
@@ -10642,7 +10719,8 @@ app.get('/api/dashboard/customer-demographics', async (req: Request, res: Respon
         COUNT(DISTINCT c.id) as customer_count
        FROM sales s
        INNER JOIN customers c ON s.customer_id = c.id
-      WHERE s.seller_id = ? AND s.payout_status = 'paid'
+      WHERE s.seller_id = ?
+        AND s.order_status <> 'cancelled'
        GROUP BY c.shipping_country
        ORDER BY customer_count DESC
        LIMIT 10`,
@@ -10657,7 +10735,8 @@ app.get('/api/dashboard/customer-demographics', async (req: Request, res: Respon
         COUNT(DISTINCT c.id) as customer_count
        FROM sales s
        INNER JOIN customers c ON s.customer_id = c.id
-      WHERE s.seller_id = ? AND s.payout_status = 'paid'
+      WHERE s.seller_id = ?
+        AND s.order_status <> 'cancelled'
        GROUP BY c.shipping_city, c.shipping_country
        ORDER BY customer_count DESC
        LIMIT 20`,
@@ -10704,12 +10783,11 @@ app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
           return date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })
         }
 
-    const [orderDateColumnExists, payoutStatusColumnExists] = await Promise.all([
+    const [orderDateColumnExists] = await Promise.all([
       hasSalesOrderDateColumn(),
-      hasSalesPayoutStatusColumn(),
     ])
     const dateColumn = orderDateColumnExists ? 'order_date' : 'created_at'
-    const paidFilter = payoutStatusColumnExists ? " AND payout_status = 'paid'" : ''
+    const activeOrderFilter = " AND order_status <> 'cancelled'"
 
     // Get monthly sales and revenue data (last 12 months)
     const [monthlyData] = await db.query<RowDataPacket[]>(
@@ -10719,7 +10797,7 @@ app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
         COUNT(*) as sales_count,
         COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
-      WHERE seller_id = ?${paidFilter}
+        WHERE seller_id = ?${activeOrderFilter}
        AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
        GROUP BY YEAR(${dateColumn}), MONTH(${dateColumn})
        ORDER BY YEAR(${dateColumn}) ASC, MONTH(${dateColumn}) ASC`,
@@ -10734,7 +10812,7 @@ app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
         COUNT(*) as sales_count,
         COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
-      WHERE seller_id = ?${paidFilter}
+        WHERE seller_id = ?${activeOrderFilter}
        AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
        GROUP BY YEAR(${dateColumn}), QUARTER(${dateColumn})
        ORDER BY YEAR(${dateColumn}) ASC, QUARTER(${dateColumn}) ASC`,
@@ -10748,7 +10826,7 @@ app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
         COUNT(*) as sales_count,
         COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
-      WHERE seller_id = ?${paidFilter}
+      WHERE seller_id = ?${activeOrderFilter}
        AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 5 YEAR)
        GROUP BY YEAR(${dateColumn})
        ORDER BY YEAR(${dateColumn})`,
@@ -11329,7 +11407,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
     }
 
     const subject = `Invoice for Order ${order.order_id}`
-    await sendEmail(receiverEmail, subject, html)
+    await sendEmail(receiverEmail, subject, html, { purpose: 'customers' })
 
     res.status(200).json({
       message: 'Invoice email sent successfully',
@@ -11488,7 +11566,7 @@ app.put('/api/orders/:id', async (req: Request, res: Response) => {
               tracking_url: finalTrackingUrl,
               shipping_address: shippingParts || 'N/A',
             })
-            await sendEmail(customerEmail, `Your order has been shipped! Tracking: ${trackingNumber}`, html)
+            await sendEmail(customerEmail, `Your order has been shipped! Tracking: ${trackingNumber}`, html, { purpose: 'customers' })
             emailSent = true
           }
         }

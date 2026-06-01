@@ -54,9 +54,7 @@ VALUES
   ('account_bank_costs', '6570'),
   -- Email Configuration (update in admin panel)
   ('email_address', ''),
-  ('email_company_name', ''),
   ('email_company_address', ''),
-  ('email_company_logo_url', ''),
   -- Company Information
   ('company_organization_number', ''),
   -- PostNord Shipping Configuration

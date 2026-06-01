@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 const nodemailer = require('nodemailer')
-import { SMTP, EMAIL, COMPANY_ORGANIZATION_NUMBER, CLIENT_URL, BACKEND_PUBLIC_BASE_URL } from '../config'
+import { SMTP, EMAIL, CLIENT_URL, BACKEND_PUBLIC_BASE_URL } from '../config'
 
 const resolveTemplatePath = (filename: string): string => {
   const candidates = [
@@ -46,7 +46,6 @@ const normalizeEmailUrl = (value: string): string => {
 }
 
 // Do NOT capture host/port/secure at module load — read live from SMTP object at call time
-const organizationNumber = COMPANY_ORGANIZATION_NUMBER || 'N/A'
 
 type EmailAccountInfo = { email_address: string; plain_password: string }
 type EmailAccountResolver = (purpose: string) => Promise<EmailAccountInfo | null>
@@ -120,6 +119,15 @@ const getSellerPayoutReceiptTemplate = (): string => {
   return sellerPayoutReceiptTemplateCache
 }
 
+const sellerOrderReceivedTemplatePath = resolveTemplatePath('SellerOrderReceived.hbs')
+let sellerOrderReceivedTemplateCache: string | null = null
+
+const getSellerOrderReceivedTemplate = (): string => {
+  if (sellerOrderReceivedTemplateCache) return sellerOrderReceivedTemplateCache
+  sellerOrderReceivedTemplateCache = fs.readFileSync(sellerOrderReceivedTemplatePath, 'utf8')
+  return sellerOrderReceivedTemplateCache
+}
+
 const emailFooterTemplatePath = resolveTemplatePath('EmailFooter.hbs')
 let emailFooterTemplateCache: string | null = null
 
@@ -170,6 +178,9 @@ const renderTemplate = (template: string, values: Record<string, string>): strin
 }
 
 const FOOTER_SENDER_EMAIL_TOKEN = '__SENDER_EMAIL__'
+const EMAIL_HEADER_LOGO_CID = 'platform-header-logo'
+const EMAIL_HEADER_LOGO_PATH = resolveTemplatePath('logo.svg')
+export const EMAIL_HEADER_LOGO_HTML = `<img src="cid:${EMAIL_HEADER_LOGO_CID}" width="44" height="44" alt="Platform logo" style="display:block;width:44px;height:44px;border:0;outline:none;text-decoration:none;border-radius:10px;" />`
 
 export const createEmailFooterHtml = (input: {
   company_name: string
@@ -211,6 +222,7 @@ export const createSellerVerificationEmailHtml = (input: { company: EmailCompany
     organization_number: String(input.company.organization_number || '').trim(),
     verification_url: normalizeEmailUrl(input.verification_url),
     email_footer: footer,
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
   })
 }
 
@@ -229,6 +241,7 @@ export const createSellerPasswordResetEmailHtml = (input: { company: EmailCompan
     organization_number: String(input.company.organization_number || '').trim(),
     reset_url: normalizeEmailUrl(input.reset_url),
     email_footer: footer,
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
   })
 }
 
@@ -283,6 +296,7 @@ export const createDigitalProductEmailHtml = (input: CreateDigitalProductEmailHt
 
   return renderTemplate(template, {
     company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(input.company.company_name || '').trim(),
     company_email: String(input.company.company_email || '').trim(),
     company_address: String(input.company.company_address || '').trim(),
@@ -413,6 +427,7 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
   const template = getInvoiceTemplate()
 
   return renderTemplate(template, {
+        email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_logo_url: String(input.company.company_logo_url || '').trim(),
     company_name: String(input.company.company_name || '').trim(),
     company_email: String(input.company.company_email || '').trim(),
@@ -473,10 +488,22 @@ type CreateSellerPayoutReceiptEmailHtmlInput = {
   orders: SellerPayoutOrderRow[]
 }
 
+type CreateSellerOrderReceivedEmailHtmlInput = {
+  company: InvoiceCompanyInfo
+  seller_name: string
+  customer_name: string
+  order_id: string
+  group_order_id: string
+  order_date: string
+  total_amount: number
+  total_items: number
+}
+
 export const createShipmentNotificationEmailHtml = (input: CreateShipmentNotificationEmailHtmlInput): string => {
   const template = getShipmentTemplate()
   return renderTemplate(template, {
     company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(input.company.company_name || '').trim(),
     company_email: String(input.company.company_email || '').trim(),
     company_address: String(input.company.company_address || '').trim(),
@@ -514,6 +541,7 @@ export const createSellerPayoutReceiptEmailHtml = (input: CreateSellerPayoutRece
   const template = getSellerPayoutReceiptTemplate()
   return renderTemplate(template, {
     company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(input.company.company_name || '').trim(),
     company_email: String(input.company.company_email || '').trim(),
     company_address: String(input.company.company_address || '').trim(),
@@ -532,6 +560,33 @@ export const createSellerPayoutReceiptEmailHtml = (input: CreateSellerPayoutRece
       company_address: String(input.company.company_address || ''),
       organization_number: String(input.company.organization_number || ''),
       introText: 'Questions about this payout? Contact:',
+    }),
+  })
+}
+
+export const createSellerOrderReceivedEmailHtml = (input: CreateSellerOrderReceivedEmailHtmlInput): string => {
+  const template = getSellerOrderReceivedTemplate()
+
+  return renderTemplate(template, {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: String(input.company.organization_number || '').trim(),
+    seller_name: String(input.seller_name || 'Seller').trim(),
+    customer_name: String(input.customer_name || 'Customer').trim(),
+    order_id: String(input.order_id || '').trim(),
+    group_order_id: String(input.group_order_id || '').trim(),
+    order_date: String(input.order_date || '').trim(),
+    total_amount: Number(input.total_amount || 0).toFixed(2),
+    total_items: String(Number(input.total_items || 0)),
+    email_footer: createEmailFooterHtml({
+      company_name: String(input.company.company_name || ''),
+      company_email: String(input.company.company_email || ''),
+      company_address: String(input.company.company_address || ''),
+      organization_number: String(input.company.organization_number || ''),
+      introText: 'If you have any questions about this order, please contact:',
     }),
   })
 }
@@ -560,6 +615,17 @@ export const sendEmail = async (
   const useTestSender = Boolean(options?.useTestSender)
   const fromName = String(SMTP.fromName || 'Platform').trim()
   let purposeSendError: unknown = null
+
+  const inlineHeaderLogoAttachment = {
+    filename: 'logo.svg',
+    path: EMAIL_HEADER_LOGO_PATH,
+    contentType: 'image/svg+xml',
+    cid: EMAIL_HEADER_LOGO_CID,
+  }
+  const mergedAttachments = [
+    ...(options?.attachments || []),
+    inlineHeaderLogoAttachment,
+  ]
 
   // When a purpose is provided, try to load from the email_accounts table
   if (options?.purpose && !useTestSender) {
@@ -598,7 +664,7 @@ export const sendEmail = async (
             subject,
             text: textBody,
             html: htmlBody,
-            attachments: options?.attachments,
+            attachments: mergedAttachments,
           })
 
           return {
@@ -706,7 +772,7 @@ export const sendEmail = async (
     subject,
     text: textBody,
     html: htmlBody,
-    attachments: options?.attachments,
+    attachments: mergedAttachments,
   })
 
   return {
@@ -775,6 +841,8 @@ export const createSellerProfileStatusEmailHtml = (input: SellerProfileStatusEma
   })
 
   return renderTemplate(getSellerProfileStatusTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(input.company.company_name || '').trim(),
     seller_name: String(input.seller_name || 'Seller').trim(),
     seller_email: String(input.seller_email || '').trim(),
@@ -832,6 +900,8 @@ export const createProductStatusEmailHtml = (input: ProductStatusEmailInput): st
   })
 
   return renderTemplate(getProductStatusTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_name: String(input.company.company_name || '').trim(),
     seller_name: String(input.seller_name || 'Seller').trim(),
     intro_text: intro,
@@ -891,6 +961,13 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
   const sellerName = String(input.seller_name || 'Seller').trim()
   const customerName = String(input.customer_name || 'Customer').trim()
   const productName = String(input.product_name || '').trim()
+  const companyName = String(input.company.company_name || '').trim()
+  const companyAddress = String(input.company.company_address || '').trim()
+  const companyOrgNumber = String(input.company.organization_number || '').trim()
+  const companyMeta = [
+    companyAddress,
+    companyOrgNumber ? `Org ${companyOrgNumber}` : '',
+  ].filter(Boolean).join(' • ')
 
   return `
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-family:Arial,Helvetica,sans-serif;background:#f3f4f6;padding:24px 0;">
@@ -899,7 +976,17 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
           <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e5e7eb;">
             <tr>
               <td style="padding:24px 28px;background:#111827;color:#ffffff;">
-                <p style="margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#cbd5e1;">${String(input.company.company_name || '').trim()}</p>
+                <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:12px;">
+                  <tr>
+                    <td style="width:36px;height:36px;padding-right:10px;vertical-align:middle;">
+                      ${EMAIL_HEADER_LOGO_HTML}
+                    </td>
+                    <td style="vertical-align:middle;">
+                      <p style="margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#cbd5e1;">${companyName}</p>
+                      <p style="margin:4px 0 0 0;font-size:11px;line-height:1.4;color:#93c5fd;">${companyMeta}</p>
+                    </td>
+                  </tr>
+                </table>
                 <h1 style="margin:8px 0 0 0;font-size:24px;line-height:1.25;">${copy.title}</h1>
               </td>
             </tr>
