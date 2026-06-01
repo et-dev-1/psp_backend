@@ -200,8 +200,14 @@ const isTruthyEnv = (key: string, defaultValue = false): boolean => {
 	return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase())
 }
 
-const isPostNordDebugLogsEnabled = (): boolean => isTruthyEnv('POSTNORD_DEBUG_LOGS', process.env.NODE_ENV !== 'production')
-const isPostNordFetchDebugEnabled = (): boolean => isTruthyEnv('POSTNORD_PRINT_FETCH', false)
+const isPostNordDebugLogsEnabled = (): boolean => {
+	if (process.env.NODE_ENV === 'production') return false
+	return isTruthyEnv('POSTNORD_DEBUG_LOGS', true)
+}
+const isPostNordFetchDebugEnabled = (): boolean => {
+	if (process.env.NODE_ENV === 'production') return false
+	return isTruthyEnv('POSTNORD_PRINT_FETCH', false)
+}
 
 const shouldLogPostNordTraffic = (path: string): boolean => {
 	const normalizedPath = String(path || '').toLowerCase()
@@ -567,24 +573,7 @@ const buildLabelPayload = (input: GenerateShipmentLabelInput): Record<string, un
 
 const buildEdiShipmentPayload = (input: GenerateShipmentLabelInput): Record<string, unknown> => {
 	const senderAddress = input.senderAddress || getDefaultSenderAddress()
-	
-	console.log('[Shipment EDI] Building EDI payload with addresses:', {
-		recipientAddress: {
-			street: input.address?.street,
-			postalCode: input.address?.postalCode,
-			city: input.address?.city,
-			countryCode: input.address?.countryCode,
-			companyName: input.address?.companyName,
-		},
-		senderAddress: {
-			street: senderAddress?.street,
-			postalCode: senderAddress?.postalCode,
-			city: senderAddress?.city,
-			countryCode: senderAddress?.countryCode,
-			companyName: senderAddress?.companyName,
-		},
-	})
-	
+
 	requireAddress(input.address)
 	requireAddress(senderAddress, 'senderAddress')
 

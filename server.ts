@@ -20,6 +20,28 @@ import { generateSecret, generateURI, verify } from 'otplib'
 import QRCode from 'qrcode'
 import SwishApi from './swish/SwishApi'
 
+const sanitizeLogArg = (value: unknown): unknown => {
+  if (value instanceof Error) return value.message
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === null || value === undefined) {
+    return value
+  }
+  return '[redacted]'
+}
+
+const installProductionSafeLogging = () => {
+  if (config.NODE_ENV !== 'production') return
+
+  const originalLog = console.log.bind(console)
+  const originalWarn = console.warn.bind(console)
+  const originalError = console.error.bind(console)
+
+  console.log = (...args: unknown[]) => originalLog(...args.map(sanitizeLogArg))
+  console.warn = (...args: unknown[]) => originalWarn(...args.map(sanitizeLogArg))
+  console.error = (...args: unknown[]) => originalError(...args.map(sanitizeLogArg))
+}
+
+installProductionSafeLogging()
+
 const stripe = new Stripe(config.STRIPE_SECRET_KEY)
 let swishApi: SwishApi | null = null
 
@@ -27,7 +49,7 @@ if (config.SWISH_ENABLED) {
   try {
     swishApi = new SwishApi({ testMode: config.SWISH_TEST_MODE })
     const swishEnvironment = swishApi.getEnvironmentInfo()
-    console.log(`[Swish API] Environment: ${swishEnvironment.testMode ? 'Merchant Swish Simulator' : 'Production'} (${swishEnvironment.baseHost})`)
+    console.log('[Swish API] Environment initialized')
   } catch (error) {
     console.warn('[Swish API] Disabled at startup. Certificates not found or invalid.', error)
   }
@@ -209,13 +231,102 @@ const app = express()
 
 app.set('trust proxy', config.NODE_ENV === 'production' ? 1 : false)
 
-const uploadsRootDir = String(config.UPLOADS_DIR || '').trim() || path.join(__dirname, 'uploads')
+const configuredUploadsDir = String(config.UPLOADS_DIR || '').trim()
+const uploadsRootDir = configuredUploadsDir
+  ? path.resolve(configuredUploadsDir)
+  : path.join(__dirname, 'uploads')
 const ensureDir = (dirPath: string) => {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true })
   }
 }
 const uploadsDir = (...segments: string[]) => path.join(uploadsRootDir, ...segments)
+
+const PRODUCT_UPLOAD_SUBDIR = 'products'
+const SUPPORT_UPLOAD_SUBDIR = 'support'
+const COMPANY_LOGO_UPLOAD_SUBDIR = 'company_logos'
+const PROFILE_PICTURE_UPLOAD_SUBDIR = 'profile_pictures'
+const SHIPMENT_LABEL_UPLOAD_SUBDIR = 'shipment_labels'
+
+// Ensure all upload destinations are rooted under UPLOADS_DIR (or fallback) before handling requests.
+ensureDir(uploadsRootDir)
+ensureDir(uploadsDir(PRODUCT_UPLOAD_SUBDIR))
+ensureDir(uploadsDir(SUPPORT_UPLOAD_SUBDIR))
+ensureDir(uploadsDir(COMPANY_LOGO_UPLOAD_SUBDIR))
+ensureDir(uploadsDir(PROFILE_PICTURE_UPLOAD_SUBDIR))
+ensureDir(uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR))
+
+let hasInitializedBaseSchema = false
+
+const resolveSchemaFilePath = (): string => {
+  const candidates = [
+    path.join(__dirname, 'schema.sql'),
+    path.join(process.cwd(), 'schema.sql'),
+    path.join(__dirname, '..', 'schema.sql'),
+  ]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error('Unable to locate schema.sql for database initialization')
+}
+
+const parseSqlStatements = (sql: string): string[] => {
+  return sql
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((chunk) =>
+      chunk
+        .split('\n')
+        .filter((line) => !line.trimStart().startsWith('--'))
+        .join('\n')
+        .trim(),
+    )
+    .filter(Boolean)
+}
+
+const ensureDefaultAdminUser = async (): Promise<void> => {
+  const [rows] = await db.query<RowDataPacket[]>(
+    "SELECT id FROM users WHERE role = 'admin' LIMIT 1",
+  )
+
+  if (rows.length > 0) return
+
+  const defaultAdminEmail = 'experts.town.ab@gmail.com'
+  const defaultAdminPassword = 'Admin1234!'
+  const hashedPassword = await bcrypt.hash(defaultAdminPassword, 12)
+
+  await db.query(
+    "INSERT INTO users (email, password, role, email_is_verified) VALUES (?, ?, 'admin', TRUE)",
+    [defaultAdminEmail, hashedPassword],
+  )
+
+  console.warn('[DB Init] Default admin user created because none existed.')
+}
+
+const ensureBaseSchemaInitialized = async (): Promise<void> => {
+  if (hasInitializedBaseSchema) return
+
+  const [rows] = await db.query<RowDataPacket[]>("SHOW TABLES LIKE 'users'")
+  if (rows.length > 0) {
+    hasInitializedBaseSchema = true
+    return
+  }
+
+  const schemaPath = resolveSchemaFilePath()
+  const schemaSql = fs.readFileSync(schemaPath, 'utf8')
+  const statements = parseSqlStatements(schemaSql)
+
+  console.warn('[DB Init] Base schema missing. Applying schema.sql')
+  for (const statement of statements) {
+    await db.query(statement)
+  }
+
+  hasInitializedBaseSchema = true
+  console.log('[DB Init] Base schema initialized successfully.')
+}
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true })
@@ -309,10 +420,10 @@ app.options('/{*splat}', cors())
 app.use(express.json())
 
 // Configure multer for file uploads
-const uploadDir = uploadsDir('products')
+const uploadDir = uploadsDir(PRODUCT_UPLOAD_SUBDIR)
 ensureDir(uploadDir)
 
-const supportUploadDir = uploadsDir('support')
+const supportUploadDir = uploadsDir(SUPPORT_UPLOAD_SUBDIR)
 ensureDir(supportUploadDir)
 
 const storage = multer.diskStorage({
@@ -386,7 +497,7 @@ const supportUpload = upload.array('attachments', 5)
 const adminSettingsLogoUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => {
-      const dir = uploadsDir('company_logos')
+      const dir = uploadsDir(COMPANY_LOGO_UPLOAD_SUBDIR)
       ensureDir(dir)
       cb(null, dir)
     },
@@ -5383,12 +5494,7 @@ app.post('/api/swish/payment-request', async (req: Request, res: Response) => {
       })
     }
 
-    console.log('[API] Swish payment request:', {
-      amount,
-      payeeAlias: normalizedPayeeAlias,
-      message: normalizedMessage,
-      reference: normalizedPayeePaymentReference,
-    })
+    console.log('[API] Swish payment request received')
 
     const callbackIdentifier = crypto.randomBytes(16).toString('hex').toUpperCase()
 
@@ -5452,7 +5558,7 @@ app.post('/api/swish/payment-status', async (req: Request, res: Response) => {
       })
     }
 
-    console.log('[API] Checking Swish payment status:', { instructionUUID })
+    console.log('[API] Checking Swish payment status')
 
     // Get payment status from Swish API
     const paymentStatus = await swishApi.getPaymentStatus(instructionUUID)
@@ -5671,12 +5777,7 @@ app.post('/api/swish/callback', async (req: Request, res: Response) => {
   try {
     const { instructionUUID, status, amount, timestamp } = req.body || {}
 
-    console.log('[Webhook] Swish callback received:', {
-      instructionUUID,
-      status,
-      amount,
-      timestamp,
-    })
+    console.log('[Webhook] Swish callback received')
 
     // In a real application, you would:
     // 1. Verify the callback signature
@@ -5767,7 +5868,9 @@ const countDigits = (value?: string | null) => String(value || '').replace(/\D/g
 const profileUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
-      const subdir = file.fieldname === 'profilePicture' ? 'profile_pictures' : 'company_logos'
+      const subdir = file.fieldname === 'profilePicture'
+        ? PROFILE_PICTURE_UPLOAD_SUBDIR
+        : COMPANY_LOGO_UPLOAD_SUBDIR
       const dir = uploadsDir(subdir)
       ensureDir(dir)
       cb(null, dir)
@@ -6526,9 +6629,10 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
   try {
     await Promise.all([ensureSalesPayoutColumns(), ensureSalesPaymentIntentIdColumn()])
     const runtimeSettings = await getRuntimeSettings()
-    const [paymentDateColumnExists, paymentIntentIdColumnExists] = await Promise.all([
+    const [paymentDateColumnExists, paymentIntentIdColumnExists, payoutReferenceColumnExists] = await Promise.all([
       hasSalesPayoutPaymentDateColumn(),
       hasSalesPaymentIntentIdColumn(),
+      hasSalesPayoutReferenceColumn(),
     ])
     const payoutPaymentDateSelect = paymentDateColumnExists
       ? 's.payout_payment_date'
@@ -6536,12 +6640,16 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
     const paymentIntentIdSelect = paymentIntentIdColumnExists
       ? 's.payment_intent_id'
       : 'NULL AS payment_intent_id'
+    const payoutReferenceSelect = payoutReferenceColumnExists
+      ? 's.payout_reference'
+      : 'NULL AS payout_reference'
 
     const [allItems] = await db.query<RowDataPacket[]>(
       `SELECT
         s.id as sale_id,
         s.order_id,
         ${paymentIntentIdSelect},
+        ${payoutReferenceSelect},
         s.customer_id,
         s.seller_id,
         s.order_date,
@@ -6631,6 +6739,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
           id: row.sale_id,
           order_id: row.order_id,
           payment_intent_id: row.payment_intent_id || null,
+          payout_reference: row.payout_reference || null,
           customer_id: row.customer_id,
           seller_id: row.seller_id,
           seller_email: row.seller_email,
@@ -7434,7 +7543,7 @@ app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
     await db.query(`DELETE FROM users WHERE role != 'admin'`)
     await db.query('SET FOREIGN_KEY_CHECKS = 1')
 
-    console.log(`[DB Reset] Database cleared by admin user ${auth.id} (app_settings preserved)`)
+    console.log('[DB Reset] Database cleared (app_settings preserved)')
     return res.json({ success: true, message: 'Database reset complete. Admin account and app settings preserved.' })
   } catch (error) {
     await db.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => {})
@@ -7486,7 +7595,7 @@ app.post('/api/admin/sellers/bulk-email', async (req: Request, res: Response) =>
         await sendEmail(email, subject, body)
         sent++
       } catch (err) {
-        console.error(`[bulk-email] Failed to send to ${email}:`, err)
+        console.error('[bulk-email] Failed to send message:', err)
         failed++
       }
     }
@@ -7780,14 +7889,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     console.error('Profile status check failed:', profileCheckErr)
   }
 
-  console.log('Product registration:', req.body)
   const uploadedFiles = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined
-  console.log('Files uploaded:', {
-    images: uploadedFiles?.images?.length || 0,
-    variant_images: uploadedFiles?.variant_images?.length || 0,
-    variant_files: uploadedFiles?.variant_files?.length || 0,
-    digital_file: uploadedFiles?.digital_file?.length || 0,
-  })
 
   const {
     name,
@@ -7837,8 +7939,6 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       productData.sku = await generateUniqueProductSku(auth.id, name)
     }
 
-    console.log('Parsing variants with:', { variants, metadata, price, discount_price, stock_quantity, type })
-
     let normalizedVariants: NormalizedVariant[] = []
     try {
       normalizedVariants = normalizeVariantsFromRequest(variants ?? metadata, {
@@ -7854,8 +7954,6 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
         details: parseErr instanceof Error ? parseErr.message : String(parseErr)
       })
     }
-
-    console.log('Normalized variants:', normalizedVariants)
 
     if (normalizedVariants.length === 0) {
       return res.status(400).json({ error: 'At least one variant is required' })
@@ -7881,7 +7979,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       'SELECT id FROM users WHERE id = ?', [auth.id]
     )
     if (sellerExists.length === 0) {
-      console.error(`Seller with ID ${auth.id} does not exist`)
+      console.error('Seller account does not exist')
       return res.status(400).json({ error: `Seller account not found. Please ensure your user exists in the system.` })
     }
 
@@ -7948,7 +8046,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     }
 
     const [result] = await db.query<ResultSetHeader>('INSERT INTO products SET ?', productData)
-    console.log('Product inserted with ID:', result.insertId)
+    console.log('Product inserted successfully')
 
     emitToAdmin('notification:new', {
       entity: 'product',
@@ -7963,17 +8061,6 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       const sku = variant.sku || await generateVariantSku(auth.id, name, variant.variant_value)
       const variantImageUrl = variantImagesMap[i] || variant.image_url || null
       const variantFileUrl = variantFilesMap[i] || variant.file_url || null
-
-      console.log(`Inserting variant ${i}:`, {
-        variant_name: variant.variant_name,
-        variant_value: variant.variant_value,
-        price: variant.price,
-        discount_price: variant.discount_price,
-        stock_quantity: variant.stock_quantity,
-        type: variant.type,
-        image_url: variantImageUrl,
-        file_url: variantFileUrl,
-      })
 
       try {
         await db.query(
@@ -7998,7 +8085,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
             variantFileUrl,
           ],
         )
-        console.log(`Variant ${i} inserted successfully`)
+        console.log('Variant inserted successfully')
       } catch (variantErr) {
         console.error(`Error inserting variant ${i}:`, variantErr)
         throw variantErr
@@ -8054,8 +8141,6 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
   if (!auth) return
 
   const productId = req.params.id
-  console.log('Product update:', req.body)
-
   const {
     name,
     subtitle,
@@ -9682,8 +9767,7 @@ app.post('/api/customers', async (req: Request, res: Response) => {
 
 // ===== Create Order from Customer (with Payment Processing) =====
 app.post('/api/customer/orders', async (req: Request, res: Response) => {
-  // Print all received parameters for debugging
-  console.log('Order received:', JSON.stringify(req.body, null, 2))
+  console.log('Order request received')
 
   const {
     customer_id,
@@ -10918,6 +11002,7 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
       `SELECT
         s.id,
         s.order_id,
+        s.payout_reference,
         s.order_date,
         s.grand_total,
         COALESCE(st.total_tax, s.tax_amount, 0) as tax_amount,
@@ -11012,6 +11097,7 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
       orders: currentMonthOrders.map((order: any) => ({
         id: order.id,
         order_id: order.order_id,
+        payment_reference: order.payout_reference || '',
         order_date: order.order_date,
         customer_name: order.customer_name,
         customer_email: order.customer_email,
@@ -11922,7 +12008,7 @@ app.post('/api/shipment/label', async (req: Request, res: Response) => {
       })
     }
 
-    const labelsDir = uploadsDir('shipment_labels')
+    const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR)
     ensureDir(labelsDir)
 
     const ext = generated.fileName.includes('.')
@@ -12159,7 +12245,7 @@ app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) =
     })
 
     await ensureShipmentLabelsTable()
-    const labelsDir = uploadsDir('shipment_labels')
+    const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR)
     ensureDir(labelsDir)
 
     if (generated.contentBuffer) {
@@ -12783,7 +12869,7 @@ app.post('/api/contact', async (req: Request, res: Response) => {
       emailBody,
       { purpose: 'contact_form' },
     )
-    console.log(`[Contact] Email forwarded to ${supportEmail} from ${email}${orderLine}`)
+    console.log('[Contact] Email forwarded successfully')
     return res.json({ success: true, message: 'Your message has been sent. We will be in touch soon.' })
   } catch (err: any) {
     console.error('[Contact] Failed to send email:', err)
@@ -12821,6 +12907,14 @@ const startServer = (port: number) => {
 }
 
 const bootstrapAndStartServer = async () => {
+  try {
+    await ensureBaseSchemaInitialized()
+    await ensureDefaultAdminUser()
+  } catch (error) {
+    console.error('Failed to initialize base database schema. Server startup aborted.', error)
+    process.exit(1)
+  }
+
   try {
     const settings = await getRuntimeSettings()
     applyRuntimeSettings(settings)

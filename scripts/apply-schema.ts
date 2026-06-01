@@ -123,10 +123,7 @@ async function seedAdminUser(conn: mysql.Connection) {
     [DEFAULT_ADMIN_EMAIL, hashedPassword],
   )
 
-  console.log('[apply-schema] Default admin user created.')
-  console.log(`  Email:    ${DEFAULT_ADMIN_EMAIL}`)
-  console.log(`  Password: ${DEFAULT_ADMIN_PASSWORD}`)
-  console.log('  ⚠️  Change this password immediately after first login!')
+  console.log('[apply-schema] Default admin user created. Set a secure password immediately after first login.')
 }
 
 main().catch((err) => {

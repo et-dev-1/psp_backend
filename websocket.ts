@@ -93,7 +93,7 @@ export const setupWebSocket = (httpServer: HttpServer): Server => {
     const authSocket = socket as AuthableSocket
     const userId = authSocket.userId!
 
-    console.log(`✅ User ${userId} connected with socket ${socket.id}`)
+    console.log('WebSocket client connected')
 
     // Track active connections
     if (!activeConnections.has(userId)) {
@@ -111,7 +111,7 @@ export const setupWebSocket = (httpServer: HttpServer): Server => {
       
       if (connections?.size === 0) {
         activeConnections.delete(userId)
-        console.log(`🚪 User ${userId} fully disconnected`)
+        console.log('WebSocket client disconnected')
       }
     })
 
@@ -128,7 +128,7 @@ export const setupWebSocket = (httpServer: HttpServer): Server => {
       }
       
       socket.emit('subscribed', { channel: 'orders', role: data.role })
-      console.log(`📨 User ${userId} (${data.role}) subscribed to orders`)
+      console.log('WebSocket orders subscription confirmed')
     })
 
     socket.on('subscribe:payments', (data: { role: 'admin' | 'seller' }) => {
@@ -150,7 +150,7 @@ export const setupWebSocket = (httpServer: HttpServer): Server => {
     })
 
     socket.on('error', (error) => {
-      console.error(`Socket error for user ${userId}:`, error)
+      console.error('Socket error:', error)
     })
   })
 
@@ -171,7 +171,7 @@ export const emitWebhook = (event: WebhookEventType, payload: WebhookEventPayloa
   }
 
   const eventRoom = getEventRoom(event, targets)
-  console.log(`📤 Emitting webhook: ${event} to ${eventRoom}`)
+  console.log('Emitting webhook event')
   
   io.to(eventRoom).emit(event, {
     timestamp: new Date().toISOString(),
@@ -185,7 +185,7 @@ export const emitToUser = (userId: number, event: WebhookEventType, payload: Web
     return
   }
 
-  console.log(`📤 Emitting to user ${userId}: ${event}`)
+  console.log('Emitting user event')
   io.to(`user:${userId}`).emit(event, {
     timestamp: new Date().toISOString(),
     ...payload,
@@ -198,7 +198,7 @@ export const emitToAdmin = (event: WebhookEventType, payload: WebhookEventPayloa
     return
   }
 
-  console.log(`📤 Emitting to admins: ${event}`)
+  console.log('Emitting admin event')
   io.to('admin-notifications').emit(event, {
     timestamp: new Date().toISOString(),
     ...payload,
@@ -211,7 +211,7 @@ export const emitToSeller = (sellerId: number, event: WebhookEventType, payload:
     return
   }
 
-  console.log(`📤 Emitting to seller ${sellerId}: ${event}`)
+  console.log('Emitting seller event')
   io.to(`seller:${sellerId}`).emit(event, {
     timestamp: new Date().toISOString(),
     ...payload,
@@ -256,7 +256,7 @@ export const broadcastToAll = (event: WebhookEventType, payload: WebhookEventPay
     return
   }
 
-  console.log(`📡 Broadcasting: ${event}`)
+  console.log('Broadcasting event')
   io.emit(event, {
     timestamp: new Date().toISOString(),
     ...payload,
