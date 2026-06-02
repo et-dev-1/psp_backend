@@ -2709,7 +2709,23 @@ const calculateCommissionBreakdown = (
   }
 }
 
-const commissionUpdateTemplatePath = path.join(__dirname, 'email', 'CommissionUpdateNotice.hbs')
+const resolveServerEmailTemplatePath = (filename: string): string => {
+  const candidates = [
+    path.join(__dirname, 'email', filename),
+    path.join(__dirname, '..', 'email', filename),
+    path.join(process.cwd(), 'email', filename),
+  ]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error(`Email template not found: ${filename}. Checked: ${candidates.join(', ')}`)
+}
+
+const commissionUpdateTemplatePath = resolveServerEmailTemplatePath('CommissionUpdateNotice.hbs')
 let commissionUpdateTemplateCache: string | null = null
 
 const getCommissionUpdateTemplate = (): string => {
@@ -2718,7 +2734,7 @@ const getCommissionUpdateTemplate = (): string => {
   return commissionUpdateTemplateCache
 }
 
-const emailFooterTemplatePath = path.join(__dirname, 'email', 'EmailFooter.hbs')
+const emailFooterTemplatePath = resolveServerEmailTemplatePath('EmailFooter.hbs')
 let emailFooterTemplateCache: string | null = null
 
 const getEmailFooterTemplate = (): string => {
@@ -2827,7 +2843,7 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
   return { sent, failed }
 }
 
-const invoiceTemplatePath = path.join(__dirname, 'email', 'InvoiceCustomer.hbs')
+const invoiceTemplatePath = resolveServerEmailTemplatePath('InvoiceCustomer.hbs')
 let invoiceTemplateCache: string | null = null
 
 const getInvoiceTemplate = (): string => {
@@ -4279,6 +4295,25 @@ app.post('/api/seller/account/reactivate', async (req: Request, res: Response) =
   } catch (error) {
     console.error('Account reactivation error:', error)
     return res.status(500).json({ message: 'Failed to reactivate account.' })
+  }
+})
+
+app.get('/api/seller/settings/commission-preview', async (req: Request, res: Response) => {
+  const auth = await requireSellerOrAdmin(req, res)
+  if (!auth) return
+
+  try {
+    const settings = await getCommissionSettings()
+    const sellerFlags = await getSellerAdminFlags(Number(auth.id))
+
+    return res.json({
+      commission_percent: settings.percent,
+      commission_fixed: settings.fixed,
+      self_commission_exempt: sellerFlags.selfCommissionExempt,
+    })
+  } catch (error) {
+    console.error('Seller commission preview read error:', error)
+    return res.status(500).json({ message: 'Failed to load commission preview' })
   }
 })
 
