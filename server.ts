@@ -426,6 +426,35 @@ ensureDir(uploadDir)
 const supportUploadDir = uploadsDir(SUPPORT_UPLOAD_SUBDIR)
 ensureDir(supportUploadDir)
 
+const DIGITAL_FILE_MAX_SIZE_BYTES = 50 * 1024 * 1024
+const DIGITAL_FILE_ALLOWED_EXTENSIONS = new Set([
+  '.pdf',
+  '.zip',
+  '.rar',
+  '.7z',
+  '.tar',
+  '.jpeg',
+  '.jpg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.tiff',
+])
+const DIGITAL_FILE_ALLOWED_MIME_TYPES = new Set([
+  'application/pdf',
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/vnd.rar',
+  'application/x-rar-compressed',
+  'application/x-7z-compressed',
+  'application/x-tar',
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/bmp',
+  'image/tiff',
+])
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     if (file.fieldname === 'attachments') {
@@ -443,7 +472,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: DIGITAL_FILE_MAX_SIZE_BYTES },
   fileFilter: (req, file, cb) => {
     if (file.fieldname === 'images' || file.fieldname === 'variant_images') {
       const allowedImageTypes = /jpeg|jpg|png|gif|webp/
@@ -456,16 +485,20 @@ const upload = multer({
     }
 
     if (file.fieldname === 'digital_file' || file.fieldname === 'variant_files') {
-      const allowedDigitalTypes = /pdf|jpeg|jpg|png|gif|webp/
-      const extname = allowedDigitalTypes.test(path.extname(file.originalname).toLowerCase())
-      const mimetype =
-        file.mimetype === 'application/pdf' || /image\/(jpeg|jpg|png|gif|webp)/.test(file.mimetype)
+      const extension = path.extname(file.originalname).toLowerCase()
+      const isAllowedExtension = DIGITAL_FILE_ALLOWED_EXTENSIONS.has(extension)
+      const normalizedMimeType = file.mimetype.toLowerCase()
+      const isArchiveByExtension = extension === '.zip' || extension === '.rar' || extension === '.7z' || extension === '.tar'
+      const isAllowedMimeType =
+        DIGITAL_FILE_ALLOWED_MIME_TYPES.has(normalizedMimeType) ||
+        (isArchiveByExtension &&
+          (normalizedMimeType === 'application/octet-stream' || normalizedMimeType === 'application/x-download'))
 
-      if (extname && mimetype) {
+      if (isAllowedExtension && isAllowedMimeType) {
         return cb(null, true)
       }
 
-      return cb(new Error('Digital file must be a PDF or image file'))
+      return cb(new Error('Digital file must be one of: PDF, ZIP, RAR, 7Z, TAR, JPEG, JPG, PNG, GIF, BMP, TIFF'))
     }
 
     if (file.fieldname === 'attachments') {
@@ -659,6 +692,8 @@ type SellerProfileStatusSource = {
   is_blocked?: number | boolean | null
   rejection_reason?: string | null
   blocked_reason?: string | null
+  is_self_commission_exempt?: number | boolean | null
+  is_trusted_seller?: number | boolean | null
 }
 
 const normalizeSellerProfileStatus = (value: unknown): SellerProfileStatus | null => {
@@ -720,6 +755,8 @@ const buildSellerProfileCompatFields = (profile: SellerProfileStatusSource | nul
     is_blocked: status === 'blocked' ? 1 : 0,
     rejection_reason: status === 'rejected' ? statusReason || null : null,
     blocked_reason: status === 'blocked' ? statusReason || null : null,
+    is_self_commission_exempt: Number(profile?.is_self_commission_exempt || 0) === 1 ? 1 : 0,
+    is_trusted_seller: Number(profile?.is_trusted_seller || 0) === 1 ? 1 : 0,
   }
 }
 
@@ -1038,6 +1075,16 @@ const ensureProfilesStatusColumns = async (): Promise<void> => {
     if (!columnNames.has('status_reason')) {
       await db.query('ALTER TABLE profiles ADD COLUMN status_reason TEXT NULL')
       columnNames.add('status_reason')
+    }
+
+    if (!columnNames.has('is_self_commission_exempt')) {
+      await db.query('ALTER TABLE profiles ADD COLUMN is_self_commission_exempt BOOLEAN NOT NULL DEFAULT FALSE')
+      columnNames.add('is_self_commission_exempt')
+    }
+
+    if (!columnNames.has('is_trusted_seller')) {
+      await db.query('ALTER TABLE profiles ADD COLUMN is_trusted_seller BOOLEAN NOT NULL DEFAULT FALSE')
+      columnNames.add('is_trusted_seller')
     }
 
     const hasIsBlocked = columnNames.has('is_blocked')
@@ -2367,6 +2414,49 @@ const calculateCommissionAmount = (baseAmount: number, commissionRate: number, c
   return roundToTwo(Number(baseAmount || 0) * Number(commissionRate || 0) + Number(commissionFixed || 0))
 }
 
+const getSellerAdminFlagsMap = async (sellerIds: number[]): Promise<Map<number, { selfCommissionExempt: boolean; trustedSeller: boolean }>> => {
+  const normalizedSellerIds = Array.from(
+    new Set(
+      sellerIds
+        .map((sellerId) => Number(sellerId))
+        .filter((sellerId) => Number.isFinite(sellerId) && sellerId > 0),
+    ),
+  )
+
+  const map = new Map<number, { selfCommissionExempt: boolean; trustedSeller: boolean }>()
+  if (normalizedSellerIds.length === 0) return map
+
+  await ensureProfilesStatusColumns()
+  const [rows] = await db.query<RowDataPacket[]>(
+    `SELECT p.user_id,
+            COALESCE(p.is_self_commission_exempt, 0) AS is_self_commission_exempt,
+            COALESCE(p.is_trusted_seller, 0) AS is_trusted_seller
+     FROM profiles p
+     INNER JOIN (
+       SELECT user_id, MAX(id) AS latest_id
+       FROM profiles
+       WHERE user_id IN (?)
+       GROUP BY user_id
+     ) latest ON latest.latest_id = p.id`,
+    [normalizedSellerIds],
+  )
+
+  for (const row of rows) {
+    const sellerId = Number(row.user_id)
+    map.set(sellerId, {
+      selfCommissionExempt: Number(row.is_self_commission_exempt || 0) === 1,
+      trustedSeller: Number(row.is_trusted_seller || 0) === 1,
+    })
+  }
+
+  return map
+}
+
+const getSellerAdminFlags = async (sellerId: number): Promise<{ selfCommissionExempt: boolean; trustedSeller: boolean }> => {
+  const map = await getSellerAdminFlagsMap([sellerId])
+  return map.get(Number(sellerId)) || { selfCommissionExempt: false, trustedSeller: false }
+}
+
 const getPaymentProviderFromReference = (paymentReferenceId?: string | null): 'stripe' | 'swish' | 'unknown' => {
   const reference = String(paymentReferenceId || '').trim()
   if (!reference) return 'unknown'
@@ -2486,6 +2576,7 @@ const calculateCommissionBreakdown = (
   shipmentFees: Map<number, ShipmentFee> | ShipmentFee[] | Record<number, ShipmentFee>,
   platform_commission_percent: number,
   platform_commission_fixed: number,
+  commissionExemptSellerIds: Set<number> = new Set<number>(),
 ): CommissionBreakdown => {
   // Convert shipmentFees to Map if needed
   let shipmentFeesMap: Map<number, ShipmentFee>
@@ -2559,17 +2650,40 @@ const calculateCommissionBreakdown = (
   const totalGrandAmount = roundToTwo(totalAmountBeforeCommission + totalTaxAmount + totalShippingAmount)
   const commissionRate = platform_commission_percent / 100
 
-  // Calculate total commission
-  const totalCommission = roundToTwo(totalGrandAmount * commissionRate + platform_commission_fixed)
+  const chargedSellerAmounts = sellerAmounts
+    .map((seller) => ({
+      seller_id: seller.seller_id,
+      amountWithShipping: roundToTwo(seller.productTotal + seller.taxAmount + seller.shippingNoVat + seller.shippingVat),
+    }))
+    .filter((seller) => !commissionExemptSellerIds.has(seller.seller_id))
+
+  const chargedGrandTotal = chargedSellerAmounts.reduce((sum, seller) => sum + Number(seller.amountWithShipping || 0), 0)
+
+  // Calculate total commission only from sellers that are not commission-exempt.
+  const totalCommission = chargedGrandTotal > 0
+    ? roundToTwo(chargedGrandTotal * commissionRate + platform_commission_fixed)
+    : 0
 
   // Calculate commission for each seller proportionally
   const sellerBreakdown = sellerAmounts.map((seller) => {
     const sellerAmountWithShipping = roundToTwo(seller.productTotal + seller.taxAmount + seller.shippingNoVat + seller.shippingVat)
 
+    if (commissionExemptSellerIds.has(seller.seller_id)) {
+      return {
+        seller_id: seller.seller_id,
+        amountBeforeCommission: seller.productTotal,
+        taxAmount: seller.taxAmount,
+        shippingAmount: seller.shippingNoVat + seller.shippingVat,
+        amountBeforeCommissionWithShipping: sellerAmountWithShipping,
+        commissionAmount: 0,
+        amountAfterCommission: sellerAmountWithShipping,
+      }
+    }
+
     // Seller's proportional share of total commission
     // Commission = TotalCommission * (SellerAmount / TotalAmount)
-    const sellerCommission = totalGrandAmount > 0
-      ? roundToTwo(totalCommission * (sellerAmountWithShipping / totalGrandAmount))
+    const sellerCommission = chargedGrandTotal > 0
+      ? roundToTwo(totalCommission * (sellerAmountWithShipping / chargedGrandTotal))
       : 0
 
     return {
@@ -6594,6 +6708,8 @@ app.get('/api/admin/sellers', async (req: Request, res: Response) => {
         p.rejection_reason,
         p.is_blocked,
         p.blocked_reason,
+        p.is_self_commission_exempt,
+        p.is_trusted_seller,
         p.last_login,
         p.created_at AS profile_created_at,
         u.pending_deletion
@@ -7095,7 +7211,15 @@ app.post('/api/admin/orders/message-seller', async (req: Request, res: Response)
     return res.status(500).json({ message })
   }
 })
-const updateSellerProfileStatus = async (profileId: number, status: SellerProfileStatus, reason?: string | null) => {
+const updateSellerProfileStatus = async (
+  profileId: number,
+  status: SellerProfileStatus,
+  reason?: string | null,
+  options?: {
+    selfCommissionExempt?: boolean
+    trustedSeller?: boolean
+  },
+) => {
   await ensureProfilesStatusColumns()
 
   const normalizedReason = String(reason || '').trim() || null
@@ -7113,6 +7237,9 @@ const updateSellerProfileStatus = async (profileId: number, status: SellerProfil
   }
 
   const nextReason = status === 'verified' ? null : normalizedReason
+  const nextSelfCommissionExempt = options?.selfCommissionExempt
+  const nextTrustedSeller = options?.trustedSeller
+
   await db.query<ResultSetHeader>(
     `UPDATE profiles
      SET status = ?,
@@ -7120,7 +7247,9 @@ const updateSellerProfileStatus = async (profileId: number, status: SellerProfil
          is_verified = ?,
          is_blocked = ?,
          rejection_reason = ?,
-         blocked_reason = ?
+         blocked_reason = ?,
+         is_self_commission_exempt = COALESCE(?, is_self_commission_exempt),
+         is_trusted_seller = COALESCE(?, is_trusted_seller)
      WHERE id = ?`,
     [
       status,
@@ -7129,6 +7258,8 @@ const updateSellerProfileStatus = async (profileId: number, status: SellerProfil
       status === 'blocked' ? 1 : 0,
       status === 'rejected' ? nextReason : null,
       status === 'blocked' ? nextReason : null,
+      nextSelfCommissionExempt == null ? null : (nextSelfCommissionExempt ? 1 : 0),
+      nextTrustedSeller == null ? null : (nextTrustedSeller ? 1 : 0),
       profileId,
     ],
   )
@@ -7224,6 +7355,31 @@ const validateAdminSellerStatusPayload = (profileIdRaw: unknown, statusRaw: unkn
   return { profileId, status, reason }
 }
 
+const parseOptionalBoolean = (value: unknown): boolean | undefined => {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (value === 1) return true
+    if (value === 0) return false
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'true' || normalized === '1') return true
+    if (normalized === 'false' || normalized === '0') return false
+  }
+  return undefined
+}
+
+const parseAdminSellerFlags = (payload: unknown): {
+  selfCommissionExempt?: boolean
+  trustedSeller?: boolean
+} => {
+  const body = (payload && typeof payload === 'object') ? payload as Record<string, unknown> : {}
+  return {
+    selfCommissionExempt: parseOptionalBoolean(body.self_commission_exempt),
+    trustedSeller: parseOptionalBoolean(body.trusted_seller),
+  }
+}
+
 // ===== Admin Update Profile Status =====
 app.post('/api/admin/profiles/:id/status', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
@@ -7235,7 +7391,11 @@ app.post('/api/admin/profiles/:id/status', async (req: Request, res: Response) =
   }
 
   try {
-    const result = await updateSellerProfileStatus(parsed.profileId, parsed.status, parsed.reason)
+    const flags = parseAdminSellerFlags(req.body)
+    const result = await updateSellerProfileStatus(parsed.profileId, parsed.status, parsed.reason, {
+      selfCommissionExempt: flags.selfCommissionExempt,
+      trustedSeller: flags.trustedSeller,
+    })
     if (!result) {
       return res.status(404).json({ message: 'Profile not found' })
     }
@@ -7247,6 +7407,72 @@ app.post('/api/admin/profiles/:id/status', async (req: Request, res: Response) =
       profile_id: parsed.profileId,
       status: parsed.status,
       status_reason: result.reason,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({ message: 'Database error' })
+  }
+})
+
+// ===== Admin Update Seller Flags =====
+app.post('/api/admin/profiles/:id/flags', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const profileId = Number(req.params.id)
+  if (!Number.isFinite(profileId) || profileId <= 0) {
+    return res.status(400).json({ message: 'Invalid profile id' })
+  }
+
+  const flags = parseAdminSellerFlags(req.body)
+  if (flags.selfCommissionExempt == null && flags.trustedSeller == null) {
+    return res.status(400).json({ message: 'No valid flag values provided' })
+  }
+
+  try {
+    await ensureProfilesStatusColumns()
+
+    const [result] = await db.query<ResultSetHeader>(
+      `UPDATE profiles
+       SET is_self_commission_exempt = COALESCE(?, is_self_commission_exempt),
+           is_trusted_seller = COALESCE(?, is_trusted_seller)
+       WHERE id = ?`,
+      [
+        flags.selfCommissionExempt == null ? null : (flags.selfCommissionExempt ? 1 : 0),
+        flags.trustedSeller == null ? null : (flags.trustedSeller ? 1 : 0),
+        profileId,
+      ],
+    )
+
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Profile not found' })
+    }
+
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT id, user_id,
+              COALESCE(is_self_commission_exempt, 0) AS is_self_commission_exempt,
+              COALESCE(is_trusted_seller, 0) AS is_trusted_seller
+       FROM profiles
+       WHERE id = ?
+       LIMIT 1`,
+      [profileId],
+    )
+
+    if (rows.length > 0) {
+      const row = rows[0]
+      emitToSeller(Number(row.user_id), 'profile:updated', {
+        profile_id: profileId,
+        seller_id: Number(row.user_id),
+        is_self_commission_exempt: Number(row.is_self_commission_exempt || 0) === 1,
+        is_trusted_seller: Number(row.is_trusted_seller || 0) === 1,
+      })
+    }
+
+    return res.status(200).json({
+      message: 'Seller flags updated',
+      profile_id: profileId,
+      is_self_commission_exempt: flags.selfCommissionExempt,
+      is_trusted_seller: flags.trustedSeller,
     })
   } catch (error) {
     console.error(error)
@@ -7290,6 +7516,7 @@ app.post('/api/admin/sellers/:sellerId/verify', async (req: Request, res: Respon
 
   try {
     await ensureProfilesStatusColumns()
+    const flags = parseAdminSellerFlags(req.body)
 
     const [users] = await db.query<RowDataPacket[]>(
       "SELECT id, role, email FROM users WHERE id = ? LIMIT 1",
@@ -7314,7 +7541,10 @@ app.post('/api/admin/sellers/:sellerId/verify', async (req: Request, res: Respon
     )
 
     if (profiles.length > 0) {
-      const result = await updateSellerProfileStatus(Number(profiles[0].id), 'verified')
+      const result = await updateSellerProfileStatus(Number(profiles[0].id), 'verified', null, {
+        selfCommissionExempt: flags.selfCommissionExempt,
+        trustedSeller: flags.trustedSeller,
+      })
       if (!result) {
         return res.status(404).json({ message: 'Profile not found' })
       }
@@ -7324,8 +7554,16 @@ app.post('/api/admin/sellers/:sellerId/verify', async (req: Request, res: Respon
     }
 
     const [insertResult] = await db.query<ResultSetHeader>(
-      "INSERT INTO profiles (user_id, profile_type, status, status_reason, is_verified, is_blocked, rejection_reason, blocked_reason) VALUES (?, 'private', 'verified', NULL, 1, 0, NULL, NULL)",
-      [sellerId],
+      `INSERT INTO profiles (
+        user_id, profile_type, status, status_reason,
+        is_verified, is_blocked, rejection_reason, blocked_reason,
+        is_self_commission_exempt, is_trusted_seller
+      ) VALUES (?, 'private', 'verified', NULL, 1, 0, NULL, NULL, ?, ?)`,
+      [
+        sellerId,
+        flags.selfCommissionExempt ? 1 : 0,
+        flags.trustedSeller ? 1 : 0,
+      ],
     )
 
     await notifySellerProfileStatusChange(insertResult.insertId, {
@@ -7919,6 +8157,8 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
   }
 
   try {
+    const sellerAdminFlags = await getSellerAdminFlags(auth.id)
+    const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending'
     const skuColumnExists = await hasProductSkuColumn()
 
     const productData: any = {
@@ -7931,7 +8171,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       age_category: age_category || null,
       item_condition: item_condition || 'new',
       tax_class: tax_class || 'standard',
-      approval_status: approval_status || 'pending',
+      approval_status: sellerApprovalStatus,
       status: status || 'active',
     }
 
@@ -8170,6 +8410,8 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
   }
 
   try {
+    const sellerAdminFlags = await getSellerAdminFlags(auth.id)
+    const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending'
     // Check if product exists and belongs to the user
     const [products] = await db.query<RowDataPacket[]>(
       'SELECT id, seller_id FROM products WHERE id = ?',
@@ -8189,12 +8431,11 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
       ? `UPDATE products SET
         name = ?, subtitle = ?, description = ?, category = ?, brand = ?,
         age_category = ?, item_condition = ?, tax_class = ?,
-        approval_status = 'pending', rejection_message = NULL, status = ?, type = ?
+        approval_status = ?, rejection_message = NULL, status = ?, type = ?
       WHERE id = ?`
       : `UPDATE products SET
         name = ?, subtitle = ?, description = ?, category = ?, brand = ?,
-        age_category = ?, item_condition = ?, tax_class = ?,
-        approval_status = 'pending', status = ?, type = ?
+        age_category = ?, item_condition = ?, tax_class = ?, approval_status = ?, status = ?, type = ?
       WHERE id = ?`
 
     await db.query(updateProductQuery,
@@ -8207,6 +8448,7 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
         age_category || null,
         item_condition || 'new',
         tax_class || 'standard',
+        sellerApprovalStatus,
         status || 'active',
         type === 'digital' ? 'digital' : 'physical',
         productId,
@@ -10000,11 +10242,23 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       [],
     )
 
+    const sellerIdsForCommission = Object.keys(ordersBySeller)
+      .map((sellerId) => Number(sellerId))
+      .filter((sellerId) => Number.isFinite(sellerId) && sellerId > 0)
+
+    const sellerAdminFlagsMap = await getSellerAdminFlagsMap(sellerIdsForCommission)
+    const commissionExemptSellerIds = new Set<number>(
+      Array.from(sellerAdminFlagsMap.entries())
+        .filter(([, flags]) => flags.selfCommissionExempt)
+        .map(([sellerId]) => sellerId),
+    )
+
     const commissionBreakdown = calculateCommissionBreakdown(
       orderProductsForCommission,
       sellerShippingPolicyMap,
       commissionSettings.percent,
       commissionSettings.fixed,
+      commissionExemptSellerIds,
     )
 
     const sellerCommissionMap = new Map(
@@ -10646,11 +10900,14 @@ app.post('/api/orders', async (req: Request, res: Response) => {
 
   try {
     const commissionSettings = await getCommissionSettings()
-    const commission_amount = calculateCommissionAmount(
-      grand_total,
-      commissionSettings.rate,
-      commissionSettings.fixed,
-    )
+    const sellerAdminFlags = await getSellerAdminFlags(auth.id)
+    const commission_amount = sellerAdminFlags.selfCommissionExempt
+      ? 0
+      : calculateCommissionAmount(
+        grand_total,
+        commissionSettings.rate,
+        commissionSettings.fixed,
+      )
 
     const [result] = await db.query<ResultSetHeader>(
       `INSERT INTO sales (
@@ -12880,7 +13137,9 @@ app.post('/api/contact', async (req: Request, res: Response) => {
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   if (err instanceof multer.MulterError) {
     const message = err.code === 'LIMIT_FILE_SIZE'
-      ? 'File is too large. Maximum allowed size is 5MB.'
+      ? (err.field === 'digital_file' || err.field === 'variant_files'
+        ? 'Digital file is too large. Maximum allowed size is 50MB.'
+        : 'Uploaded file is too large.')
       : err.message
     return res.status(400).json({ message })
   }
