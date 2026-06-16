@@ -10,8 +10,6 @@
     "start:prod": "npm run build && node dist/scripts/apply-schema.js && npm start",
     "ship": "git add . && git commit -m \"update\" && git push",
     "build": "tsc",
-    "build:hostinger": "npm run build",
-    "start:hostinger": "node server.js",
     "serve": "npm run build && node server.js"
   },
   "engines": {

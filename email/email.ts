@@ -648,6 +648,7 @@ export const sendEmail = async (
           const textBody = looksLikeHtml ? stripHtml(htmlBody) : body
 
           const transporter = nodemailer.createTransport({
+            
             host: smtpHost,
             port: smtpPort,
             secure: smtpSecure,
@@ -657,6 +658,8 @@ export const sendEmail = async (
               pass: account.plain_password,
             },
           })
+
+          console.log(`[sendEmail] Using purpose account for '${options.purpose}': ${senderEmail}, SMTP host: ${smtpHost}, port: ${smtpPort}, secure: ${smtpSecure}`)
 
           const info = await transporter.sendMail({
             from: `"${fromName}" <${senderEmail}>`,
