@@ -294,8 +294,8 @@ const ensureDefaultAdminUser = async (): Promise<void> => {
 
   if (rows.length > 0) return
 
-  const defaultAdminEmail = 'experts.town.ab@gmail.com'
-  const defaultAdminPassword = 'Admin1234!'
+  const defaultAdminEmail = config.DEFAULT_ADMIN_EMAIL
+  const defaultAdminPassword = config.DEFAULT_ADMIN_PASSWORD
   const hashedPassword = await bcrypt.hash(defaultAdminPassword, 12)
 
   await db.query(
@@ -4438,6 +4438,130 @@ app.post('/api/admin/settings/commission/send-email', async (req: Request, res: 
   } catch (error) {
     console.error('Admin commission notification send error:', error)
     return res.status(500).json({ message: 'Failed to send commission update email' })
+  }
+})
+
+const swishUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
+}).array('files', 10)
+
+function updateEnvFile(updates: Record<string, string>) {
+  const envPath = path.resolve(process.cwd(), '.env')
+  if (!fs.existsSync(envPath)) return
+
+  let content = fs.readFileSync(envPath, 'utf-8')
+  let lines = content.split(/\r?\n/)
+
+  for (const [key, value] of Object.entries(updates)) {
+    let keyFound = false
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim().startsWith(`${key}=`) || lines[i].trim().startsWith(`${key} =`)) {
+        lines[i] = `${key}=${value}`
+        keyFound = true
+        break
+      }
+    }
+    if (!keyFound) {
+      lines.push(`${key}=${value}`)
+    }
+  }
+
+  fs.writeFileSync(envPath, lines.join('\n'), 'utf-8')
+}
+
+app.get('/api/admin/swish-config', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  try {
+    const alias = process.env.SWISH_PAYEE_ALIAS || ''
+    const certDir = process.env.SWISH_CERTIFICATE_PATH || '/home/sdf/swish'
+    const p12Filename = process.env.SWISH_P12_FILENAME || 'cert.p12'
+    const pemFilename = process.env.SWISH_CA_FILENAME || 'cert.pem'
+    
+    const hasP12 = fs.existsSync(path.resolve(certDir, p12Filename))
+    const hasPem = fs.existsSync(path.resolve(certDir, pemFilename))
+
+    return res.json({
+      success: true,
+      alias,
+      hasP12,
+      hasPem
+    })
+  } catch (error) {
+    console.error('Failed to read Swish config:', error)
+    return res.status(500).json({ success: false, message: 'Failed to read Swish config.' })
+  }
+})
+
+app.post('/api/admin/swish-config', swishUpload, async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const { password, alias } = req.body
+  const files = req.files as Express.Multer.File[] | undefined
+
+  if (!password || !alias) {
+    return res.status(400).json({ success: false, message: 'Password and alias are required.' })
+  }
+
+  if (!files || files.length === 0) {
+    return res.status(400).json({ success: false, message: 'No certificate files uploaded.' })
+  }
+
+  for (const file of files) {
+    const ext = path.extname(file.originalname)
+    const base = path.basename(file.originalname, ext)
+    
+    if (base !== 'cert') {
+      return res.status(400).json({ success: false, message: `Invalid filename: ${file.originalname}. Certificates must be named 'cert' (e.g. cert.p12, cert.pem).` })
+    }
+
+    if (!file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({ success: false, message: `File is empty: ${file.originalname}` })
+    }
+  }
+
+  let certDir = process.env.SWISH_CERTIFICATE_PATH || '/home/sdf/swish'
+  certDir = path.resolve(certDir)
+
+  try {
+    if (!fs.existsSync(certDir)) {
+      fs.mkdirSync(certDir, { recursive: true })
+    }
+
+    for (const file of files) {
+      const targetPath = path.resolve(certDir, file.originalname)
+      fs.writeFileSync(targetPath, file.buffer)
+    }
+
+    const updates: Record<string, string> = {
+      SWISH_CERTIFICATE_PASSWORD: password,
+      SWISH_PAYEE_ALIAS: alias,
+      SWISH_ENABLED: 'true'
+    }
+    
+    updateEnvFile(updates)
+    
+    for (const [key, val] of Object.entries(updates)) {
+      process.env[key] = val
+    }
+
+    try {
+      swishApi = new SwishApi({ testMode: process.env.SWISH_TEST_MODE === 'true' || config.SWISH_TEST_MODE })
+      const info = swishApi.getEnvironmentInfo()
+      console.log('[Swish API] Reloaded and updated successfully:', info)
+      return res.json({ success: true, message: 'Swish configuration updated and service reloaded successfully.', info })
+    } catch (apiError: any) {
+      swishApi = null
+      console.error('[Swish API] Failed to initialize service with new credentials:', apiError)
+      return res.status(400).json({ success: false, message: `Certificates uploaded but Swish service failed to initialize: ${apiError.message}` })
+    }
+
+  } catch (err: any) {
+    console.error('Failed to configure Swish:', err)
+    return res.status(500).json({ success: false, message: `Server error during configuration: ${err.message}` })
   }
 })
 
