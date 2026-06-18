@@ -10,7 +10,8 @@
     "start:prod": "npm run build && node dist/scripts/apply-schema.js && npm start",
     "ship": "git add . && git commit -m \"update\" && git push",
     "build": "tsc",
-    "serve": "npm run build && node server.js"
+    "serve": "npm run build && node server.js",
+    "restart": "fuser -k 3000/tcp && fuser -k 3001/tcp && npm run dev"
   },
   "engines": {
     "node": ">=18"

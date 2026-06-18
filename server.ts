@@ -1139,6 +1139,62 @@ const ensureProfilesBlockColumns = async (): Promise<void> => {
 	await ensureProfilesStatusColumns()
 }
 
+let hasProfilesShippingColumnsCache: boolean | null = null
+const ensureProfilesShippingColumns = async (): Promise<boolean> => {
+  if (hasProfilesShippingColumnsCache !== null) return hasProfilesShippingColumnsCache
+  try {
+    const [columnRows] = await db.query<RowDataPacket[]>('SHOW COLUMNS FROM profiles')
+    const columnNames = new Set(columnRows.map((row) => String(row.Field || '')))
+
+    if (!columnNames.has('shipping_mode')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN shipping_mode VARCHAR(50) NOT NULL DEFAULT 'package'")
+    }
+    if (!columnNames.has('package_flat_fee')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN package_flat_fee DECIMAL(10,2) NOT NULL DEFAULT 0.00")
+    }
+    if (!columnNames.has('package_delivery_time')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN package_delivery_time VARCHAR(100) NOT NULL DEFAULT '3-5 Days'")
+    }
+    if (!columnNames.has('package_free_threshold')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN package_free_threshold DECIMAL(10,2) NULL DEFAULT NULL")
+    }
+    if (!columnNames.has('package_free_threshold_enabled')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN package_free_threshold_enabled BOOLEAN NOT NULL DEFAULT FALSE")
+    }
+    if (!columnNames.has('package_shipping_country')) {
+      await db.query("ALTER TABLE profiles ADD COLUMN package_shipping_country VARCHAR(100) NULL DEFAULT NULL")
+    }
+    hasProfilesShippingColumnsCache = true
+    return true
+  } catch (error) {
+    console.error('Unable to ensure profiles shipping columns:', error)
+    hasProfilesShippingColumnsCache = null
+    return false
+  }
+}
+
+let hasProductsShippingColumnsCache: boolean | null = null
+const ensureProductsShippingColumns = async (): Promise<boolean> => {
+  if (hasProductsShippingColumnsCache !== null) return hasProductsShippingColumnsCache
+  try {
+    const [columnRows] = await db.query<RowDataPacket[]>('SHOW COLUMNS FROM products')
+    const columnNames = new Set(columnRows.map((row) => String(row.Field || '')))
+
+    if (!columnNames.has('shipping_fee')) {
+      await db.query("ALTER TABLE products ADD COLUMN shipping_fee DECIMAL(10,2) NOT NULL DEFAULT 0.00")
+    }
+    if (!columnNames.has('delivery_time')) {
+      await db.query("ALTER TABLE products ADD COLUMN delivery_time INT NOT NULL DEFAULT 3")
+    }
+    hasProductsShippingColumnsCache = true
+    return true
+  } catch (error) {
+    console.error('Unable to ensure products shipping columns:', error)
+    hasProductsShippingColumnsCache = null
+    return false
+  }
+}
+
 const hasProfilesCompanyAddressColumn = async (): Promise<boolean> => {
   if (hasProfilesCompanyAddressColumnCache !== null) {
     return hasProfilesCompanyAddressColumnCache
@@ -8332,6 +8388,8 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       tax_class: tax_class || 'standard',
       approval_status: sellerApprovalStatus,
       status: status || 'active',
+      shipping_fee: req.body.shipping_fee !== undefined ? Number(req.body.shipping_fee || 0) : 0,
+      delivery_time: req.body.delivery_time !== undefined ? Number(req.body.delivery_time || 3) : 3,
     }
 
     if (skuColumnExists) {
@@ -8434,7 +8492,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       }
     }
 
-    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn()])
+    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn(), ensureProductsShippingColumns()])
     if (seo_meta) productData.seo_meta = String(seo_meta).trim() || null
     if (gender) productData.gender = String(gender).trim() || null
     if (tags) {
@@ -8615,7 +8673,7 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
     )
 
     // Update new optional fields if present
-    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn()])
+    await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn(), ensureProductsShippingColumns()])
     const extraUpdates: string[] = []
     const extraValues: unknown[] = []
     if (seo_meta !== undefined) {
@@ -8632,6 +8690,14 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
         extraUpdates.push('tags = ?')
         extraValues.push(Array.isArray(parsedTags) ? JSON.stringify(parsedTags.map(String).filter(Boolean)) : null)
       } catch { /* skip */ }
+    }
+    if (req.body.shipping_fee !== undefined) {
+      extraUpdates.push('shipping_fee = ?')
+      extraValues.push(Number(req.body.shipping_fee || 0))
+    }
+    if (req.body.delivery_time !== undefined) {
+      extraUpdates.push('delivery_time = ?')
+      extraValues.push(Number(req.body.delivery_time || 3))
     }
     if (extraUpdates.length > 0) {
       await db.query(`UPDATE products SET ${extraUpdates.join(', ')} WHERE id = ?`, [...extraValues, productId])
@@ -8950,6 +9016,8 @@ app.get('/api/products', async (req: Request, res: Response) => {
 app.get('/api/public/products', async (req: Request, res: Response) => {
   try {
     await ensureProfilesStatusColumns()
+    await ensureProfilesShippingColumns()
+    await ensureProductsShippingColumns()
     const pageRaw = Number(req.query.page)
     const limitRaw = Number(req.query.limit)
     const sellerIdRaw = Number(req.query.seller_id)
@@ -8989,9 +9057,17 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
         p.status,
         p.created_at,
         p.updated_at,
+        p.shipping_fee,
+        p.delivery_time,
         ANY_VALUE(u.email) as seller_email,
         ANY_VALUE(sp.profile_type) as seller_profile_type,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
+        ANY_VALUE(sp.shipping_mode) as seller_shipping_mode,
+        ANY_VALUE(sp.package_flat_fee) as seller_package_flat_fee,
+        ANY_VALUE(sp.package_delivery_time) as seller_package_delivery_time,
+        ANY_VALUE(sp.package_free_threshold) as seller_package_free_threshold,
+        ANY_VALUE(sp.package_free_threshold_enabled) as seller_package_free_threshold_enabled,
+        ANY_VALUE(sp.package_shipping_country) as seller_package_shipping_country,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -9333,6 +9409,8 @@ app.get('/api/public/products/:id', async (req: Request, res: Response) => {
 
   try {
     await ensureProfilesStatusColumns()
+    await ensureProfilesShippingColumns()
+    await ensureProductsShippingColumns()
 
     const [products] = await db.query<RowDataPacket[]>(
       `SELECT
@@ -9350,9 +9428,17 @@ app.get('/api/public/products/:id', async (req: Request, res: Response) => {
         p.status,
         p.created_at,
         p.updated_at,
+        p.shipping_fee,
+        p.delivery_time,
         ANY_VALUE(u.email) as seller_email,
         ANY_VALUE(sp.profile_type) as seller_profile_type,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
+        ANY_VALUE(sp.shipping_mode) as seller_shipping_mode,
+        ANY_VALUE(sp.package_flat_fee) as seller_package_flat_fee,
+        ANY_VALUE(sp.package_delivery_time) as seller_package_delivery_time,
+        ANY_VALUE(sp.package_free_threshold) as seller_package_free_threshold,
+        ANY_VALUE(sp.package_free_threshold_enabled) as seller_package_free_threshold_enabled,
+        ANY_VALUE(sp.package_shipping_country) as seller_package_shipping_country,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -9838,6 +9924,7 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
   const productId = req.params.id
 
   try {
+    await ensureProductsShippingColumns()
     const [products] = await db.query<RowDataPacket[]>(
       `SELECT
         p.id,
@@ -9856,6 +9943,8 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
         p.status,
         p.created_at,
         p.updated_at,
+        p.shipping_fee,
+        p.delivery_time,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -9933,23 +10022,25 @@ app.get('/api/seller/shipment-policies', async (req: Request, res: Response) => 
   if (!auth) return
 
   try {
-    const hasVatRateColumn = await hasShipmentPolicyVatRateColumn()
+    await ensureProfilesShippingColumns()
 
-    const [policies] = await db.query<RowDataPacket[]>(
-      `SELECT id, seller_id, country, fee${hasVatRateColumn ? ', vat_rate' : ''}, created_at, updated_at
-       FROM shipment_policies
-       WHERE seller_id = ?
-       ORDER BY country ASC`,
+    const [profileRows] = await db.query<RowDataPacket[]>(
+      `SELECT shipping_mode, package_flat_fee, package_delivery_time, package_free_threshold, package_free_threshold_enabled, package_shipping_country
+       FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
       [auth.id]
     )
 
-    res.json(
-      (policies || []).map((policy: any) => ({
-        ...policy,
-        fee: Number(policy.fee || 0),
-        vat_rate: Number(hasVatRateColumn ? policy.vat_rate : VAT_SHIPPING_RATE * 100),
-      }))
-    )
+    const profile = profileRows[0] || {}
+
+    res.json({
+      policies: [], // Returned empty for backwards compatibility/no break
+      shipping_mode: profile.shipping_mode || 'package',
+      package_flat_fee: Number(profile.package_flat_fee || 0),
+      package_delivery_time: profile.package_delivery_time || '3',
+      package_free_threshold: profile.package_free_threshold !== null ? Number(profile.package_free_threshold) : null,
+      package_free_threshold_enabled: Boolean(profile.package_free_threshold_enabled),
+      package_shipping_country: profile.package_shipping_country || '',
+    })
   } catch (err) {
     console.error(err)
     res.status(500).json({ message: 'Failed to fetch shipment policies' })
@@ -9961,45 +10052,57 @@ app.post('/api/seller/shipment-policies', async (req: Request, res: Response) =>
   const auth = await requireAuth(req, res)
   if (!auth) return
 
-  const { policies } = req.body
-
-  if (!Array.isArray(policies) || policies.length === 0) {
-    return res.status(400).json({ message: 'Policies array is required' })
-  }
+  const {
+    shipping_mode,
+    package_flat_fee,
+    package_delivery_time,
+    package_free_threshold,
+    package_free_threshold_enabled,
+    package_shipping_country
+  } = req.body
 
   try {
-    const hasVatRateColumn = await hasShipmentPolicyVatRateColumn()
+    await ensureProfilesShippingColumns()
 
-    // Delete existing policies for this seller
-    await db.query(
-      'DELETE FROM shipment_policies WHERE seller_id = ?',
+    // Update/Save the settings in profiles table
+    const [profileCheck] = await db.query<RowDataPacket[]>(
+      'SELECT id FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
       [auth.id]
     )
 
-    // Insert new policies
-    for (const policy of policies) {
-      if (!policy.country || policy.fee === null || policy.fee === undefined) {
-        continue // Skip invalid entries
-      }
-
-      if (hasVatRateColumn) {
-        await db.query(
-          `INSERT INTO shipment_policies (seller_id, country, fee, vat_rate)
-           VALUES (?, ?, ?, ?)`,
-          [auth.id, policy.country, parseFloat(policy.fee), Number(policy.vat_rate ?? VAT_SHIPPING_RATE * 100)]
-        )
-      } else {
-        await db.query(
-          `INSERT INTO shipment_policies (seller_id, country, fee)
-           VALUES (?, ?, ?)`,
-          [auth.id, policy.country, parseFloat(policy.fee)]
-        )
-      }
+    if (profileCheck.length > 0) {
+      await db.query(
+        `UPDATE profiles
+         SET shipping_mode = ?, package_flat_fee = ?, package_delivery_time = ?, package_free_threshold = ?, package_free_threshold_enabled = ?, package_shipping_country = ?
+         WHERE id = ?`,
+        [
+          shipping_mode || 'package',
+          Number(package_flat_fee || 0),
+          package_delivery_time || '3',
+          package_free_threshold !== undefined && package_free_threshold !== null ? Number(package_free_threshold) : null,
+          package_free_threshold_enabled ? 1 : 0,
+          package_shipping_country || null,
+          profileCheck[0].id
+        ]
+      )
+    } else {
+      await db.query(
+        `INSERT INTO profiles (user_id, first_name, last_name, street, city, country, zip, phone, shipping_mode, package_flat_fee, package_delivery_time, package_free_threshold, package_free_threshold_enabled, package_shipping_country)
+         VALUES (?, 'Seller', 'User', 'Street', 'City', 'Sweden', '12345', '123456789', ?, ?, ?, ?, ?, ?)`,
+        [
+          auth.id,
+          shipping_mode || 'package',
+          Number(package_flat_fee || 0),
+          package_delivery_time || '3',
+          package_free_threshold !== undefined && package_free_threshold !== null ? Number(package_free_threshold) : null,
+          package_free_threshold_enabled ? 1 : 0,
+          package_shipping_country || null
+        ]
+      )
     }
 
     res.status(201).json({
-      message: 'Shipment policies saved successfully',
-      count: policies.length
+      message: 'Shipment policies saved successfully'
     })
   } catch (err) {
     console.error(err)
@@ -10348,6 +10451,9 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     let shippingFeeNoVat = 0
     let shippingFeeVat = 0
 
+    await ensureProfilesShippingColumns()
+    await ensureProductsShippingColumns()
+
     for (const sellerIdRaw of Object.keys(ordersBySeller)) {
       const sellerId = Number(sellerIdRaw)
 
@@ -10358,19 +10464,49 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       const sellerIsPrivate = (ordersBySeller[sellerId] as any[]).some((item) => item.is_private_seller)
 
       if (shippingCountry && sellersWithPhysicalItems.has(sellerId)) {
-        const [policyRows] = await db.query<RowDataPacket[]>(
-          `SELECT fee${hasVatRateColumn ? ', vat_rate' : ''}
-           FROM shipment_policies
-           WHERE seller_id = ? AND country = ?
-           LIMIT 1`,
-          [sellerId, shippingCountry],
+        // Fetch seller profile settings
+        const [profileRows] = await db.query<RowDataPacket[]>(
+          `SELECT shipping_mode, package_flat_fee, package_delivery_time, package_free_threshold, package_free_threshold_enabled, profile_type, package_shipping_country
+           FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+          [sellerId]
         )
+        const profile = profileRows[0] || {}
+        const shippingMode = profile.shipping_mode || 'package'
 
-        if (policyRows.length > 0) {
-          feeNoVat = Number(policyRows[0].fee || 0)
-          if (hasVatRateColumn && !sellerIsPrivate) {
-            const rawVatRate = Number(policyRows[0].vat_rate)
-            vatRateDecimal = Number.isFinite(rawVatRate) ? rawVatRate / 100 : VAT_SHIPPING_RATE
+        if (shippingMode === 'item') {
+          // Individual item shipment
+          let totalItemFee = 0
+          for (const item of ordersBySeller[sellerId]) {
+            if (item.type !== 'digital') {
+              const [prodRows] = await db.query<RowDataPacket[]>(
+                'SELECT shipping_fee FROM products WHERE id = ? LIMIT 1',
+                [Number(item.product_id)]
+              )
+              const itemShippingFee = prodRows.length > 0 ? Number(prodRows[0].shipping_fee || 0) : 0
+              totalItemFee += itemShippingFee * Number(item.quantity || 1)
+            }
+          }
+          feeNoVat = totalItemFee
+        } else {
+          // Package shipment - check country
+          const configuredCountry = String(profile.package_shipping_country || '').trim().toLowerCase()
+          const reqCountry = String(shippingCountry || '').trim().toLowerCase()
+
+          if (!configuredCountry || configuredCountry !== reqCountry) {
+            return res.status(400).json({
+              message: `Seller does not support shipping to ${shippingCountry || 'the requested country'}.`
+            })
+          }
+
+          feeNoVat = Number(profile.package_flat_fee || 0)
+        }
+
+        // Apply free shipping threshold if enabled (for both package and individual item shipments)
+        if (profile.package_free_threshold_enabled) {
+          const threshold = Number(profile.package_free_threshold || 0)
+          const sellerSubtotal = (ordersBySeller[sellerId] as any[]).reduce((sum, item) => sum + Number(item.total_price || 0), 0)
+          if (sellerSubtotal >= threshold) {
+            feeNoVat = 0
           }
         }
       }
@@ -10960,6 +11096,7 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
   try {
     const sellerIdsRaw = Array.isArray(req.body?.seller_ids) ? req.body.seller_ids : []
     const country = String(req.body?.country || '').trim()
+    const itemsRaw = Array.isArray(req.body?.items) ? req.body.items : []
 
     const sellerIds: number[] = Array.from(
       new Set(
@@ -10979,6 +11116,9 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
     }
 
     const hasVatRateColumn = await hasShipmentPolicyVatRateColumn()
+    await ensureProfilesShippingColumns()
+    await ensureProductsShippingColumns()
+
     const shipmentSummary: Array<{
       seller_id: number
       shipment_name: string
@@ -10991,22 +11131,61 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
     let shipmentVat = 0
 
     for (const sellerId of sellerIds) {
-      const [policyRows] = await db.query<RowDataPacket[]>(
-        `SELECT fee${hasVatRateColumn ? ', vat_rate' : ''}
-         FROM shipment_policies
-         WHERE seller_id = ? AND country = ?
-         LIMIT 1`,
-        [sellerId, country],
+      // 1. Fetch seller's profile settings
+      const [profileRows] = await db.query<RowDataPacket[]>(
+        `SELECT shipping_mode, package_flat_fee, package_delivery_time, package_free_threshold, package_free_threshold_enabled, profile_type, package_shipping_country
+         FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+        [sellerId]
       )
+      const profile = profileRows[0] || {}
+      const shippingMode = profile.shipping_mode || 'package'
+      const sellerIsPrivate = String(profile.profile_type || '').toLowerCase() === 'private'
 
-      if (!policyRows.length) continue
-
-      const feeNoVat = Number(policyRows[0].fee || 0)
+      let feeNoVat = 0
       let vatRateDecimal = VAT_SHIPPING_RATE
 
-      if (hasVatRateColumn) {
-        const rawVatRate = Number(policyRows[0].vat_rate)
-        vatRateDecimal = Number.isFinite(rawVatRate) ? rawVatRate / 100 : VAT_SHIPPING_RATE
+      if (shippingMode === 'item') {
+        // Mode is individual item-by-item shipment
+        // Sum up shipping fees of each item in the cart from this seller
+        let totalItemFee = 0
+        const sellerItems = itemsRaw.filter((item: any) => Number(item.seller_id) === sellerId && item.type !== 'digital')
+        for (const cartItem of sellerItems) {
+          const [prodRows] = await db.query<RowDataPacket[]>(
+            'SELECT shipping_fee FROM products WHERE id = ? LIMIT 1',
+            [Number(cartItem.id)]
+          )
+          const itemShippingFee = prodRows.length > 0 ? Number(prodRows[0].shipping_fee || 0) : 0
+          totalItemFee += itemShippingFee * Number(cartItem.quantity || 1)
+        }
+        feeNoVat = totalItemFee
+      } else {
+        // Mode is package shipment - check country
+        const configuredCountry = String(profile.package_shipping_country || '').trim().toLowerCase()
+        const reqCountry = String(country || '').trim().toLowerCase()
+
+        if (!configuredCountry || configuredCountry !== reqCountry) {
+          return res.status(400).json({
+            message: `Seller does not support shipping to ${country || 'the requested country'}.`
+          })
+        }
+
+        feeNoVat = Number(profile.package_flat_fee || 0)
+      }
+
+      // Apply free shipping threshold if enabled (for both package and individual item shipments)
+      if (profile.package_free_threshold_enabled) {
+        const threshold = Number(profile.package_free_threshold || 0)
+        // Calculate subtotal for this seller's items
+        const sellerItems = itemsRaw.filter((item: any) => Number(item.seller_id) === sellerId)
+        const sellerSubtotal = sellerItems.reduce((sum: number, item: any) => sum + (Number(item.unit_price || 0) * Number(item.quantity || 1)), 0)
+        if (sellerSubtotal >= threshold) {
+          feeNoVat = 0
+        }
+      }
+
+      // If the seller is a private seller, VAT on shipping is always 0%
+      if (sellerIsPrivate) {
+        vatRateDecimal = 0
       }
 
       const vatAmount = calculateTaxOnShipment(feeNoVat, vatRateDecimal)
@@ -11015,7 +11194,7 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
 
       shipmentSummary.push({
         seller_id: sellerId,
-        shipment_name: 'Shipment',
+        shipment_name: shippingMode === 'item' ? 'Individual Item Shipment' : 'Package Shipment',
         fee_no_vat: feeNoVat,
         vat_amount: vatAmount,
         fee_incl_vat: feeNoVat + vatAmount,
@@ -13328,6 +13507,8 @@ const bootstrapAndStartServer = async () => {
   try {
     await ensureBaseSchemaInitialized()
     await ensureDefaultAdminUser()
+    await ensureProfilesShippingColumns()
+    await ensureProductsShippingColumns()
   } catch (error) {
     console.error('Failed to initialize base database schema. Server startup aborted.', error)
     process.exit(1)
