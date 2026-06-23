@@ -8493,13 +8493,21 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     }
 
     await Promise.all([hasProductSeoMetaColumn(), hasProductGenderColumn(), hasProductTagsColumn(), ensureProductsShippingColumns()])
-    if (seo_meta) productData.seo_meta = String(seo_meta).trim() || null
-    if (gender) productData.gender = String(gender).trim() || null
+    productData.seo_meta = seo_meta ? String(seo_meta).trim() || null : null
+    productData.gender = gender ? String(gender).trim() || null : null
     if (tags) {
       try {
         const parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags
-        if (Array.isArray(parsedTags)) productData.tags = JSON.stringify(parsedTags.map(String).filter(Boolean))
-      } catch { /* skip */ }
+        if (Array.isArray(parsedTags)) {
+          productData.tags = JSON.stringify(parsedTags.map(String).filter(Boolean))
+        } else {
+          productData.tags = null
+        }
+      } catch {
+        productData.tags = null
+      }
+    } else {
+      productData.tags = null
     }
 
     const [result] = await db.query<ResultSetHeader>('INSERT INTO products SET ?', productData)
@@ -8685,11 +8693,13 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
       extraValues.push(gender ? String(gender).trim() || null : null)
     }
     if (tags !== undefined) {
+      extraUpdates.push('tags = ?')
       try {
         const parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags
-        extraUpdates.push('tags = ?')
         extraValues.push(Array.isArray(parsedTags) ? JSON.stringify(parsedTags.map(String).filter(Boolean)) : null)
-      } catch { /* skip */ }
+      } catch {
+        extraValues.push(null)
+      }
     }
     if (req.body.shipping_fee !== undefined) {
       extraUpdates.push('shipping_fee = ?')
@@ -8896,6 +8906,11 @@ app.get('/api/products', async (req: Request, res: Response) => {
   if (!auth) return
 
   try {
+    await Promise.all([
+      hasProductSeoMetaColumn(),
+      hasProductGenderColumn(),
+      hasProductTagsColumn()
+    ])
     const skuColumnExists = await hasProductSkuColumn()
     const skuSelect = skuColumnExists ? 'p.sku' : 'NULL as sku'
     const rejectionMessageColumnExists = await hasProductRejectionMessageColumn()
@@ -8929,6 +8944,9 @@ app.get('/api/products', async (req: Request, res: Response) => {
         p.status,
         p.created_at,
         p.updated_at,
+        p.seo_meta,
+        p.gender,
+        p.tags,
         GROUP_CONCAT(pi.image_url) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -9924,7 +9942,12 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
   const productId = req.params.id
 
   try {
-    await ensureProductsShippingColumns()
+    await Promise.all([
+      hasProductSeoMetaColumn(),
+      hasProductGenderColumn(),
+      hasProductTagsColumn(),
+      ensureProductsShippingColumns()
+    ])
     const [products] = await db.query<RowDataPacket[]>(
       `SELECT
         p.id,
@@ -9945,6 +9968,9 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
         p.updated_at,
         p.shipping_fee,
         p.delivery_time,
+        p.seo_meta,
+        p.gender,
+        p.tags,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
