@@ -247,6 +247,7 @@ const SUPPORT_UPLOAD_SUBDIR = 'support'
 const COMPANY_LOGO_UPLOAD_SUBDIR = 'company_logos'
 const PROFILE_PICTURE_UPLOAD_SUBDIR = 'profile_pictures'
 const SHIPMENT_LABEL_UPLOAD_SUBDIR = 'shipment_labels'
+const CUSTOMIZATION_UPLOAD_SUBDIR = 'customizations'
 
 // Ensure all upload destinations are rooted under UPLOADS_DIR (or fallback) before handling requests.
 ensureDir(uploadsRootDir)
@@ -255,6 +256,7 @@ ensureDir(uploadsDir(SUPPORT_UPLOAD_SUBDIR))
 ensureDir(uploadsDir(COMPANY_LOGO_UPLOAD_SUBDIR))
 ensureDir(uploadsDir(PROFILE_PICTURE_UPLOAD_SUBDIR))
 ensureDir(uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR))
+ensureDir(uploadsDir(CUSTOMIZATION_UPLOAD_SUBDIR))
 
 let hasInitializedBaseSchema = false
 
@@ -552,6 +554,38 @@ const adminSettingsLogoUpload = multer({
 // Serve static files for uploaded images
 ensureDir(uploadsRootDir)
 app.use('/uploads', express.static(uploadsRootDir))
+
+const customizationUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      const dir = uploadsDir(CUSTOMIZATION_UPLOAD_SUBDIR)
+      ensureDir(dir)
+      cb(null, dir)
+    },
+    filename: (_req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9)
+      cb(null, 'customization-' + uniqueSuffix + path.extname(file.originalname))
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (_req, file, cb) => {
+    const allowed = /jpeg|jpg|png|webp|gif/i
+    const isAllowed = allowed.test(path.extname(file.originalname)) && allowed.test(file.mimetype)
+    if (isAllowed) {
+      cb(null, true)
+    } else {
+      cb(new Error('Only images are allowed (jpeg, jpg, png, webp, gif)'))
+    }
+  }
+})
+
+app.post('/api/upload/customization', customizationUpload.single('file'), (req: Request, res: Response) => {
+  if (!req.file) {
+    return res.status(400).json({ message: 'No file uploaded' })
+  }
+  const fileUrl = `/uploads/customizations/${req.file.filename}`
+  res.status(200).json({ url: fileUrl })
+})
 
 const getAuthToken = (req: Request): string | null => {
   const authHeader = req.headers['authorization']
@@ -1191,6 +1225,39 @@ const ensureProductsShippingColumns = async (): Promise<boolean> => {
   } catch (error) {
     console.error('Unable to ensure products shipping columns:', error)
     hasProductsShippingColumnsCache = null
+    return false
+  }
+}
+
+let hasCustomizationColumnsCache: boolean | null = null
+const ensureCustomizationColumns = async (): Promise<boolean> => {
+  if (hasCustomizationColumnsCache !== null) return hasCustomizationColumnsCache
+  try {
+    const [prodColumns] = await db.query<RowDataPacket[]>('SHOW COLUMNS FROM products')
+    const prodColNames = new Set(prodColumns.map((row) => String(row.Field || '')))
+
+    if (!prodColNames.has('is_customizable')) {
+      await db.query("ALTER TABLE products ADD COLUMN is_customizable BOOLEAN NOT NULL DEFAULT FALSE")
+    }
+    if (!prodColNames.has('customization_type')) {
+      await db.query("ALTER TABLE products ADD COLUMN customization_type VARCHAR(50) DEFAULT NULL")
+    }
+    if (!prodColNames.has('customization_instructions')) {
+      await db.query("ALTER TABLE products ADD COLUMN customization_instructions TEXT DEFAULT NULL")
+    }
+
+    const [itemColumns] = await db.query<RowDataPacket[]>('SHOW COLUMNS FROM sale_items')
+    const itemColNames = new Set(itemColumns.map((row) => String(row.Field || '')))
+
+    if (!itemColNames.has('customization_value')) {
+      await db.query("ALTER TABLE sale_items ADD COLUMN customization_value TEXT DEFAULT NULL")
+    }
+
+    hasCustomizationColumnsCache = true
+    return true
+  } catch (error) {
+    console.error('Unable to ensure customization columns:', error)
+    hasCustomizationColumnsCache = null
     return false
   }
 }
@@ -7018,6 +7085,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
         si.product_type,
         si.product_id,
         si.product_name,
+        si.customization_value,
         COALESCE(p.type, 'physical') as item_type,
         p.category as item_category,
         p.main_image_url as item_main_image_url,
@@ -7118,6 +7186,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
           product_type: row.product_type,
           product_id: row.product_id,
           product_name: row.product_name,
+          customization_value: row.customization_value || null,
           sku: null,
           type: row.item_type || 'physical',
           category: row.item_category || null,
@@ -8390,6 +8459,9 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       status: status || 'active',
       shipping_fee: req.body.shipping_fee !== undefined ? Number(req.body.shipping_fee || 0) : 0,
       delivery_time: req.body.delivery_time !== undefined ? Number(req.body.delivery_time || 3) : 3,
+      is_customizable: req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true' ? 1 : 0,
+      customization_type: req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true' ? (req.body.customization_type || 'text') : null,
+      customization_instructions: req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true' ? (req.body.customization_instructions || null) : null,
     }
 
     if (skuColumnExists) {
@@ -8709,6 +8781,15 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
       extraUpdates.push('delivery_time = ?')
       extraValues.push(Number(req.body.delivery_time || 3))
     }
+    if (req.body.is_customizable !== undefined) {
+      const isCustom = req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true' ? 1 : 0
+      extraUpdates.push('is_customizable = ?')
+      extraValues.push(isCustom)
+      extraUpdates.push('customization_type = ?')
+      extraValues.push(isCustom ? (req.body.customization_type || 'text') : null)
+      extraUpdates.push('customization_instructions = ?')
+      extraValues.push(isCustom ? (req.body.customization_instructions || null) : null)
+    }
     if (extraUpdates.length > 0) {
       await db.query(`UPDATE products SET ${extraUpdates.join(', ')} WHERE id = ?`, [...extraValues, productId])
     }
@@ -8947,6 +9028,9 @@ app.get('/api/products', async (req: Request, res: Response) => {
         p.seo_meta,
         p.gender,
         p.tags,
+        p.is_customizable,
+        p.customization_type,
+        p.customization_instructions,
         GROUP_CONCAT(pi.image_url) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -9077,6 +9161,9 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
         p.updated_at,
         p.shipping_fee,
         p.delivery_time,
+        p.is_customizable,
+        p.customization_type,
+        p.customization_instructions,
         ANY_VALUE(u.email) as seller_email,
         ANY_VALUE(sp.profile_type) as seller_profile_type,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
@@ -9448,6 +9535,9 @@ app.get('/api/public/products/:id', async (req: Request, res: Response) => {
         p.updated_at,
         p.shipping_fee,
         p.delivery_time,
+        p.is_customizable,
+        p.customization_type,
+        p.customization_instructions,
         ANY_VALUE(u.email) as seller_email,
         ANY_VALUE(sp.profile_type) as seller_profile_type,
         MAX(COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), SUBSTRING_INDEX(u.email, '@', 1))) as seller_display_name,
@@ -9971,6 +10061,9 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
         p.seo_meta,
         p.gender,
         p.tags,
+        p.is_customizable,
+        p.customization_type,
+        p.customization_instructions,
         GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) as image_urls
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
@@ -10329,6 +10422,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       const quantity = Number(orderProduct?.quantity)
       const variantIdRaw = orderProduct?.variant_id
       const variantId = variantIdRaw == null ? null : Number(variantIdRaw)
+      const customization_value = orderProduct?.customization_value ? String(orderProduct.customization_value).trim() : null
 
       if (!Number.isFinite(productId) || productId <= 0 || !Number.isFinite(quantity) || quantity <= 0) {
         return res.status(400).json({ message: 'Invalid product or quantity in order' })
@@ -10434,6 +10528,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         tax_amount: taxAmount,
         commission_amount: 0,
         is_private_seller: isPrivateSeller,
+        customization_value,
       })
     }
 
@@ -10709,8 +10804,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
         await db.query<ResultSetHeader>(
           `INSERT INTO sale_items (
-            sale_id, product_type, product_id, product_name, quantity, unit_price, tax_amount
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            sale_id, product_type, product_id, product_name, quantity, unit_price, tax_amount, customization_value
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             saleId,
             'item',
@@ -10719,6 +10814,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
             item.quantity,
             item.unit_price,
             item.tax_amount,
+            item.customization_value || null,
           ]
         )
 
@@ -11802,6 +11898,7 @@ app.get('/api/orders', async (req: Request, res: Response) => {
         si.product_type,
         si.product_id,
         si.product_name,
+        si.customization_value,
         COALESCE(p.type, 'physical') as item_type,
         p.category as item_category,
         p.main_image_url as item_main_image_url,
@@ -11888,6 +11985,7 @@ app.get('/api/orders', async (req: Request, res: Response) => {
           product_type: row.product_type,
           product_id: row.product_id,
           product_name: row.product_name,
+          customization_value: row.customization_value || null,
           sku: null,
           type: row.item_type || 'physical',
           category: row.item_category || null,
@@ -11955,6 +12053,7 @@ app.get('/api/orders/:id', async (req: Request, res: Response) => {
         si.product_type,
         si.product_id,
         si.product_name,
+        si.customization_value,
         si.quantity,
         si.unit_price,
         (si.unit_price * si.quantity) as total_price,
@@ -12987,6 +13086,7 @@ app.get('/api/orders/:id/products', async (req: Request, res: Response) => {
         si.product_type,
         si.product_id,
         si.product_name,
+        si.customization_value,
         si.quantity,
         si.unit_price,
         (si.unit_price * si.quantity) as total_price,
@@ -13535,6 +13635,7 @@ const bootstrapAndStartServer = async () => {
     await ensureDefaultAdminUser()
     await ensureProfilesShippingColumns()
     await ensureProductsShippingColumns()
+    await ensureCustomizationColumns()
   } catch (error) {
     console.error('Failed to initialize base database schema. Server startup aborted.', error)
     process.exit(1)

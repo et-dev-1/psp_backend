@@ -11,7 +11,7 @@
     "ship": "git add . && git commit -m \"update\" && git push",
     "build": "tsc",
     "serve": "npm run build && node server.js",
-    "restart": "fuser -k 3000/tcp && fuser -k 3001/tcp && npm run dev"
+    "restart": "(fuser -k 3000/tcp || true) && (fuser -k 3001/tcp || true) && npm run dev"
   },
   "engines": {
     "node": ">=18"
