@@ -210,6 +210,35 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
   }
 }
 
+const getAdminEmails = async (): Promise<string[]> => {
+  try {
+    const [rows] = await db.query<RowDataPacket[]>(
+      "SELECT email FROM users WHERE role = 'admin'"
+    )
+    if (rows.length > 0) {
+      return rows.map((r) => String(r.email).trim()).filter(Boolean)
+    }
+  } catch (err) {
+    console.error('Failed to query admin emails from DB:', err)
+  }
+  return [config.DEFAULT_ADMIN_EMAIL]
+}
+
+const notifyAdminsNewSeller = async (sellerId: number, sellerEmail: string) => {
+  try {
+    const adminEmails = await getAdminEmails()
+    const subject = `New Seller Registered: ${sellerEmail}`
+    const html = `<p>A new seller has registered/joined Barakah Mart.</p>
+<p>Seller Email: <strong>${sellerEmail}</strong></p>
+<p>Seller ID: <strong>${sellerId}</strong></p>`
+    for (const adminEmail of adminEmails) {
+      await sendEmail(adminEmail, subject, html, { purpose: 'sellers' })
+    }
+  } catch (err) {
+    console.error('Failed to send new seller registration email to admins:', err)
+  }
+}
+
 interface AuthPayload {
   id: number
   sv?: number
@@ -3589,6 +3618,8 @@ app.post('/api/register', async (req: Request, res: Response) => {
       [email, hashedPassword, 'seller', false, verificationToken],
     )
 
+    await notifyAdminsNewSeller(result.insertId, email)
+
     res.status(201).json({
       id: result.insertId,
       email,
@@ -3792,6 +3823,8 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
         'INSERT INTO users (email, password, role, email_is_verified, google_sub) VALUES (?, ?, ?, ?, ?)',
         [email, hashedPassword, 'seller', true, googleSub],
       )
+
+      await notifyAdminsNewSeller(result.insertId, email)
 
       const [freshRows] = await db.query<RowDataPacket[]>(
         'SELECT * FROM users WHERE id = ? LIMIT 1',
@@ -8505,12 +8538,13 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
 
     // Check if seller exists
     const [sellerExists] = await db.query<RowDataPacket[]>(
-      'SELECT id FROM users WHERE id = ?', [auth.id]
+      'SELECT id, email FROM users WHERE id = ?', [auth.id]
     )
     if (sellerExists.length === 0) {
       console.error('Seller account does not exist')
       return res.status(400).json({ error: `Seller account not found. Please ensure your user exists in the system.` })
     }
+    const sellerEmail = String(sellerExists[0].email || '').trim()
 
     // Process variant images if uploaded
     const variantImagesMap: { [key: string]: string } = {}
@@ -8584,6 +8618,21 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
 
     const [result] = await db.query<ResultSetHeader>('INSERT INTO products SET ?', productData)
     console.log('Product inserted successfully')
+
+    // Notify admin itself ("seller communication") when a new product is added
+    try {
+      const adminEmails = await getAdminEmails()
+      const subject = `New Product Added: ${name}`
+      const html = `<p>A new product has been added by seller <strong>${sellerEmail}</strong> (ID: ${auth.id}).</p>
+<p>Product Name: <strong>${name}</strong></p>
+<p>Product ID: <strong>${result.insertId}</strong></p>
+<p>Approval Status: <strong>${sellerApprovalStatus}</strong></p>`
+      for (const adminEmail of adminEmails) {
+        await sendEmail(adminEmail, subject, html, { purpose: 'sellers' })
+      }
+    } catch (notifyAdminErr) {
+      console.error('Failed to send product addition email to admins:', notifyAdminErr)
+    }
 
     emitToAdmin('notification:new', {
       entity: 'product',
@@ -8711,7 +8760,7 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
     const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending'
     // Check if product exists and belongs to the user
     const [products] = await db.query<RowDataPacket[]>(
-      'SELECT id, seller_id FROM products WHERE id = ?',
+      'SELECT id, seller_id, approval_status, description FROM products WHERE id = ?',
       [productId]
     )
 
@@ -8721,6 +8770,19 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
 
     if (products[0].seller_id !== auth.id) {
       return res.status(403).json({ message: 'You do not have permission to update this product' })
+    }
+
+    const currentProduct = products[0]
+    const currentApprovalStatus = String(currentProduct.approval_status || '').trim()
+    let finalApprovalStatus = sellerApprovalStatus
+
+    if (currentApprovalStatus === 'approved') {
+      const oldDescription = currentProduct.description === null ? '' : String(currentProduct.description).trim()
+      const newDescription = description === undefined ? oldDescription : String(description || '').trim()
+      if (newDescription !== oldDescription) {
+        // If the description is changed on an already approved product, it remains approved.
+        finalApprovalStatus = 'approved'
+      }
     }
 
     const hasRejectionMessageColumn = await hasProductRejectionMessageColumn()
@@ -8745,7 +8807,7 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
         age_category || null,
         item_condition || 'new',
         tax_class || 'standard',
-        sellerApprovalStatus,
+        finalApprovalStatus,
         status || 'active',
         type === 'digital' ? 'digital' : 'physical',
         productId,
@@ -11083,10 +11145,9 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
           sellerRows.map(async (row) => {
             const sellerId = Number(row.seller_id || 0)
             const sellerEmail = String(row.seller_email || '').trim()
-            const notifyOrderReceived = Boolean(row.notify_order_received)
             const sellerOrder = sellerOrderMap.get(sellerId)
 
-            if (!sellerId || !sellerEmail || !notifyOrderReceived || !sellerOrder) {
+            if (!sellerId || !sellerEmail || !sellerOrder) {
               return
             }
 
@@ -11101,12 +11162,28 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
               total_items: Number(sellerOrder.total_items || 0),
             })
 
+            // Send to corresponding seller using seller email address
             await sendEmail(
               sellerEmail,
               `New order received — Order ${String(sellerOrder.order_id || '').trim()}`,
               html,
               { purpose: 'sellers' },
             )
+
+            // Send to admin itself ("seller communication")
+            try {
+              const adminEmails = await getAdminEmails()
+              for (const adminEmail of adminEmails) {
+                await sendEmail(
+                  adminEmail,
+                  `New seller order received — Order ${String(sellerOrder.order_id || '').trim()}`,
+                  html,
+                  { purpose: 'sellers' },
+                )
+              }
+            } catch (adminEmailError) {
+              console.error('Failed to notify admin of new order:', adminEmailError)
+            }
           }),
         )
       }
