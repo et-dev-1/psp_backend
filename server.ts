@@ -11,7 +11,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { RowDataPacket, ResultSetHeader } from 'mysql2'
-import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, createSellerOrderReceivedEmailHtml, EMAIL_HEADER_LOGO_HTML, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
+import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, createSellerOrderReceivedEmailHtml, createSignupVerificationCodeEmailHtml, EMAIL_HEADER_LOGO_HTML, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
 import { emitToAdmin, emitToSeller, setupWebSocket } from './websocket'
 import { estimateShipmentCost, generateShipmentLabel, trackShipment, type ShipmentAddressInput } from './shipment/shipment'
 import Handlebars from 'handlebars'
@@ -101,6 +101,55 @@ const decryptSmtpPassword = (encryptedPayload: string): string => {
   decipher.setAuthTag(authTag)
   const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()])
   return decrypted.toString('utf8')
+}
+
+const getBankDetailsEncryptionKey = (): Buffer => {
+  const secret = String(process.env.BANK_DETAILS_ENCRYPTION_KEY || config.JWT_SECRET || '').trim()
+  if (!secret) {
+    throw new Error('Missing BANK_DETAILS_ENCRYPTION_KEY or JWT_SECRET for bank details encryption')
+  }
+  return crypto.createHash('sha256').update(secret).digest()
+}
+
+const encryptBankDetail = (plainTextValue: string): string => {
+  const normalized = String(plainTextValue || '').trim()
+  if (!normalized) return ''
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', getBankDetailsEncryptionKey(), iv)
+  const encrypted = Buffer.concat([cipher.update(normalized, 'utf8'), cipher.final()])
+  const authTag = cipher.getAuthTag()
+  return `${iv.toString('base64')}:${authTag.toString('base64')}:${encrypted.toString('base64')}`
+}
+
+const decryptBankDetail = (value: string): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+
+  const [ivB64, tagB64, cipherTextB64] = raw.split(':')
+  if (!ivB64 || !tagB64 || !cipherTextB64) {
+    // Backward compatibility with legacy plaintext rows.
+    return raw
+  }
+
+  try {
+    const iv = Buffer.from(ivB64, 'base64')
+    const authTag = Buffer.from(tagB64, 'base64')
+    const cipherText = Buffer.from(cipherTextB64, 'base64')
+    const decipher = crypto.createDecipheriv('aes-256-gcm', getBankDetailsEncryptionKey(), iv)
+    decipher.setAuthTag(authTag)
+    const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()])
+    return decrypted.toString('utf8')
+  } catch {
+    // Keep API usable even if a legacy/invalid payload is present.
+    return raw
+  }
+}
+
+const maskSensitiveValue = (value: string): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  if (raw.length <= 4) return `•••• ${raw}`
+  return `•••• ${raw.slice(-4)}`
 }
 
 const applySmtpPasswordFromStorage = async (): Promise<void> => {
@@ -3513,6 +3562,7 @@ const PUBLIC_SITEMAP_ROUTES = [
 
 
 const trimEmail = (value: unknown): string => String(value || '').trim().toLowerCase()
+const SIGNUP_EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/
 
 const createAuthCaptchaChallenge = () => {
   const left = Math.floor(Math.random() * 8) + 2
@@ -3857,6 +3907,228 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Google auth error:', error)
     return res.status(400).json({ message: 'Google authentication failed.' })
+  }
+})
+
+// Email verification table helper and endpoints for code-based signup
+
+const ensureEmailVerificationCodesTable = async (): Promise<void> => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS email_verification_codes (
+        email VARCHAR(255) PRIMARY KEY,
+        code_hash VARCHAR(128) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        attempts_left INT NOT NULL DEFAULT 3,
+        resend_count INT NOT NULL DEFAULT 0,
+        verified_at DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `)
+  } catch (err) {
+    console.error('Failed to ensure email_verification_codes table:', err)
+    throw err
+  }
+}
+
+const getLocalSqlDateTime = (date: Date): string => {
+  const yyyy = date.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  const hh = String(date.getHours()).padStart(2, '0')
+  const mi = String(date.getMinutes()).padStart(2, '0')
+  const ss = String(date.getSeconds()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`
+}
+
+const normalizeVerificationCode = (value: unknown): string => {
+  return String(value || '').replace(/\D/g, '').slice(0, 6)
+}
+
+// POST /api/register/request-code
+app.post('/api/register/request-code', async (req: Request, res: Response) => {
+  const rawEmail = String(req.body?.email || '').trim()
+  const emailAddr = trimEmail(rawEmail)
+  if (!emailAddr) return res.status(400).json({ message: 'Email is required' })
+  if (!SIGNUP_EMAIL_RE.test(emailAddr)) {
+    return res.status(400).json({ message: 'Please enter a valid email address.' })
+  }
+
+  const expiryMinutes = Number(process.env.VERIFICATION_CODE_EXPIRY_MINUTES || 10)
+  const cooldownSeconds = Number(process.env.VERIFICATION_CODE_RESEND_COOLDOWN_SECONDS || 45)
+  const maxResend = Number(process.env.VERIFICATION_CODE_MAX_RESEND || 10)
+
+  try {
+    await ensureEmailVerificationCodesTable()
+
+    // Block if email already exists in users table
+    const [existingUsers] = await db.query<RowDataPacket[]>(`SELECT id, email_is_verified FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`, [emailAddr])
+    if (existingUsers.length > 0) {
+      return res.status(400).json({ message: 'An account with that email already exists' })
+    }
+
+    const now = new Date()
+    const [rows] = await db.query<RowDataPacket[]>(`SELECT email, created_at, resend_count FROM email_verification_codes WHERE LOWER(email) = LOWER(?) LIMIT 1`, [emailAddr])
+    const existing = rows[0]
+
+    if (existing) {
+      const createdAt = existing.created_at ? new Date(existing.created_at) : now
+      const elapsed = Math.floor((now.getTime() - createdAt.getTime()) / 1000)
+      if (elapsed < cooldownSeconds) {
+        return res.status(429).json({ message: `Please wait before requesting a new code`, cooldown_remaining: cooldownSeconds - elapsed })
+      }
+      if (Number(existing.resend_count || 0) >= maxResend) {
+        return res.status(429).json({ message: 'Resend limit reached for this email' })
+      }
+    }
+
+    // Generate 6-digit code
+    const code = String(Math.floor(100000 + Math.random() * 900000))
+    const codeHash = hashToken(code)
+    const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000)
+    const expiresAtSql = getLocalSqlDateTime(expiresAt)
+
+    if (!existing) {
+      // insert new
+      await db.query<ResultSetHeader>(
+        `INSERT INTO email_verification_codes (email, code_hash, expires_at, attempts_left, resend_count, created_at) VALUES (?, ?, ?, ?, ?, NOW())`,
+        [emailAddr, codeHash, expiresAtSql, 3, 1],
+      )
+    } else {
+      // update existing: replace code_hash, reset attempts_left and expiry, increment resend_count
+      await db.query<ResultSetHeader>(
+        `UPDATE email_verification_codes SET code_hash = ?, expires_at = ?, attempts_left = ?, resend_count = COALESCE(resend_count,0) + 1, verified_at = NULL, created_at = NOW() WHERE LOWER(email) = LOWER(?)`,
+        [codeHash, expiresAtSql, 3, emailAddr],
+      )
+    }
+
+    // Send email with code
+    const expiryText = expiryMinutes <= 1 ? `${expiryMinutes} minute` : `${expiryMinutes} minutes`
+    const subject = 'Your verification code for Barakah Mart'
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const body = createSignupVerificationCodeEmailHtml({
+      company: companyInfo,
+      verification_code: code,
+      expiry_text: expiryText,
+    })
+
+    try {
+      await sendEmail(emailAddr, subject, body, { purpose: 'sellers' })
+    } catch (e) {
+      console.error('Failed to send verification email:', e)
+      const smtpCode = Number((e as { responseCode?: unknown })?.responseCode || 0)
+      const smtpMessage = String((e as { message?: unknown })?.message || '').toLowerCase()
+      const invalidRecipient = smtpCode === 550 || smtpCode === 551 || smtpCode === 553 || smtpMessage.includes('recipient address rejected')
+      if (invalidRecipient) {
+        return res.status(400).json({ message: 'Email address is not valid. Please check and try again.' })
+      }
+      return res.status(500).json({ message: 'Failed to send verification email' })
+    }
+
+    return res.json({
+      message: 'Verification code sent',
+      expires_minutes: expiryMinutes,
+      attempts_left: 3,
+      resend_count: existing ? Number(existing.resend_count || 0) + 1 : 1,
+    })
+  } catch (error) {
+    console.error('request-code error:', error)
+    return res.status(500).json({ message: 'Failed to request verification code' })
+  }
+})
+
+// POST /api/register/verify-code
+app.post('/api/register/verify-code', async (req: Request, res: Response) => {
+  const rawEmail = String(req.body?.email || '').trim()
+  const emailAddr = trimEmail(rawEmail)
+  const code = normalizeVerificationCode(req.body?.code)
+
+  if (!emailAddr || !/^[0-9]{6}$/.test(code)) return res.status(400).json({ message: 'Email and 6-digit code are required' })
+  if (!SIGNUP_EMAIL_RE.test(emailAddr)) return res.status(400).json({ message: 'Please enter a valid email address.' })
+
+  try {
+    await ensureEmailVerificationCodesTable()
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT *, CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END AS is_not_expired
+       FROM email_verification_codes
+       WHERE LOWER(email) = LOWER(?)
+       LIMIT 1`,
+      [emailAddr],
+    )
+    if (!rows.length) return res.status(400).json({ message: 'No verification code requested for this email' })
+
+    const rec = rows[0]
+    if (Number(rec.is_not_expired || 0) !== 1) {
+      // expire record
+      await db.query(`DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+      return res.status(400).json({ message: 'Code expired' })
+    }
+
+    if (Number(rec.attempts_left || 0) <= 0) {
+      await db.query(`DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+      return res.status(400).json({ message: 'Too many failed attempts. Please request a new code.' })
+    }
+
+    const codeHash = hashToken(code).toLowerCase()
+    const storedHash = String(rec.code_hash || '').toLowerCase()
+    if (codeHash !== storedHash) {
+      // decrement attempts
+      await db.query(`UPDATE email_verification_codes SET attempts_left = GREATEST(0, COALESCE(attempts_left,3) - 1) WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+      const [fresh] = await db.query<RowDataPacket[]>(`SELECT attempts_left FROM email_verification_codes WHERE LOWER(email) = LOWER(?) LIMIT 1`, [emailAddr])
+      const left = fresh[0]?.attempts_left ?? 0
+      if (left <= 0) {
+        await db.query(`DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+        return res.status(400).json({ message: 'Too many failed attempts. Please request a new code.' })
+      }
+      return res.status(400).json({ message: 'Invalid code', attempts_left: left })
+    }
+
+    // valid code — mark verified
+    await db.query(`UPDATE email_verification_codes SET verified_at = NOW(), code_hash = '' WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+    return res.json({ message: 'Code verified' })
+  } catch (error) {
+    console.error('verify-code error:', error)
+    return res.status(500).json({ message: 'Failed to verify code' })
+  }
+})
+
+// POST /api/register/complete
+app.post('/api/register/complete', async (req: Request, res: Response) => {
+  const rawEmail = String(req.body?.email || '').trim()
+  const emailAddr = trimEmail(rawEmail)
+  const password = String(req.body?.password || '')
+
+  if (!emailAddr || !password) return res.status(400).json({ message: 'Email and password are required' })
+  if (!SIGNUP_EMAIL_RE.test(emailAddr)) return res.status(400).json({ message: 'Please enter a valid email address.' })
+  if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' })
+
+  try {
+    await ensureEmailVerificationCodesTable()
+
+    const [codeRows] = await db.query<RowDataPacket[]>(`SELECT verified_at FROM email_verification_codes WHERE LOWER(email) = LOWER(?) LIMIT 1`, [emailAddr])
+    if (!codeRows.length || !codeRows[0].verified_at) return res.status(400).json({ message: 'Email not verified' })
+
+    // Ensure not already registered
+    const [users] = await db.query<RowDataPacket[]>(`SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`, [emailAddr])
+    if (users.length) return res.status(400).json({ message: 'An account with that email already exists' })
+
+    const hashedPassword = await bcrypt.hash(password, 10)
+    const [result] = await db.query<ResultSetHeader>(`INSERT INTO users (email, password, role, email_is_verified) VALUES (?, ?, 'seller', TRUE)`, [emailAddr, hashedPassword])
+
+    // cleanup verification record
+    await db.query(`DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER(?)`, [emailAddr])
+
+    // Notify admins asynchronously
+    try {
+      await notifyAdminsNewSeller(Number((result as ResultSetHeader).insertId || 0), emailAddr)
+    } catch (nerr) {
+      console.warn('Failed to notify admins:', nerr)
+    }
+
+    return res.json({ message: 'Seller account created successfully' })
+  } catch (error) {
+    console.error('register complete error:', error)
+    return res.status(500).json({ message: 'Failed to complete registration' })
   }
 })
 
@@ -5547,6 +5819,7 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
       `SELECT
         account_country,
         account_holder_type,
+        account_holder_name,
         routing_code,
         account_number_iban,
         company_bank_type,
@@ -5586,12 +5859,25 @@ app.get('/api/notifications/summary', async (req: Request, res: Response) => {
     } else {
       if (!bank.account_country) missingFields.push('bank country')
       if (!bank.account_holder_type) missingFields.push('bank account type')
+      if (!bank.account_holder_name) missingFields.push('account holder name')
       if (!bank.account_number_iban) missingFields.push('IBAN / account number')
-      if (!bank.routing_code) missingFields.push('routing / clearance code')
-      if (bank.account_holder_type === 'company') {
-        if (!bank.company_bank_type) missingFields.push('company bank type')
-      } else if (!bank.bank_name) {
-        missingFields.push('bank name')
+
+      const bankIsSweden = isSwedenCountry(String(bank.account_country || ''))
+      const bankHolderType = String(bank.account_holder_type || '').trim().toLowerCase()
+
+      if (bankHolderType === 'company') {
+        if (bankIsSweden) {
+          if (!bank.company_bank_type) missingFields.push('company bank type')
+        } else if (!bank.routing_code) {
+          missingFields.push('routing / clearance code')
+        }
+      } else {
+        if (!bankIsSweden && !bank.routing_code) {
+          missingFields.push('routing / clearance code')
+        }
+        if (bankIsSweden && !bank.bank_name) {
+          missingFields.push('bank name')
+        }
       }
     }
 
@@ -6267,6 +6553,7 @@ const ensureBankAccountsTable = async () => {
         user_id INT UNSIGNED NOT NULL,
         account_country VARCHAR(100) NOT NULL,
         account_holder_type ENUM('private', 'company') NOT NULL,
+        account_holder_name VARCHAR(150) NULL,
         routing_code VARCHAR(100) NULL,
         account_number_iban VARCHAR(100) NOT NULL,
         company_bank_type ENUM('bankgiro', 'plusgiro') NULL,
@@ -6278,6 +6565,11 @@ const ensureBankAccountsTable = async () => {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       )
     `)
+
+    const [holderNameColumn] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM bank_accounts LIKE 'account_holder_name'")
+    if (!holderNameColumn.length) {
+      await db.query('ALTER TABLE bank_accounts ADD COLUMN account_holder_name VARCHAR(150) NULL AFTER account_holder_type')
+    }
     hasBankAccountsTableCache = true
   } catch (error) {
     hasBankAccountsTableCache = null
@@ -6611,6 +6903,7 @@ app.get('/api/profiles', async (req: Request, res: Response) => {
 
   try {
     await ensureProfilesStatusColumns()
+    await ensureBankAccountsTable()
     const [rows] = await db.query<RowDataPacket[]>(
       `SELECT * FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
       [auth.id],
@@ -6618,9 +6911,24 @@ app.get('/api/profiles', async (req: Request, res: Response) => {
     if (!rows.length) {
       return res.json(null)
     }
+    const [bankRows] = await db.query<RowDataPacket[]>(
+      `SELECT account_number_iban, account_country, account_holder_type
+       FROM bank_accounts
+       WHERE user_id = ?
+       LIMIT 1`,
+      [auth.id],
+    )
+    const bank = bankRows[0] || null
+    const hasBankDetails = Boolean(
+      bank
+      && String(bank.account_country || '').trim()
+      && String(bank.account_holder_type || '').trim()
+      && String(bank.account_number_iban || '').trim(),
+    )
     res.json({
       ...rows[0],
       ...buildSellerProfileCompatFields(rows[0]),
+      has_bank_details: hasBankDetails,
     })
   } catch (err) {
     console.error(err)
@@ -6639,6 +6947,7 @@ app.get('/api/bank-account', async (req: Request, res: Response) => {
       `SELECT
         account_country,
         account_holder_type,
+        account_holder_name,
         routing_code,
         account_number_iban,
         company_bank_type,
@@ -6652,8 +6961,19 @@ app.get('/api/bank-account', async (req: Request, res: Response) => {
     if (!rows.length) {
       return res.json(null)
     }
-
-    res.json(rows[0])
+    const row = rows[0]
+    const decryptedRoutingCode = decryptBankDetail(String(row.routing_code || ''))
+    const decryptedAccountNumber = decryptBankDetail(String(row.account_number_iban || ''))
+    res.json({
+      account_country: row.account_country,
+      account_holder_type: row.account_holder_type,
+      account_holder_name: row.account_holder_name || '',
+      company_bank_type: row.company_bank_type,
+      bank_name: row.bank_name,
+      routing_code_masked: maskSensitiveValue(decryptedRoutingCode),
+      account_number_iban_masked: maskSensitiveValue(decryptedAccountNumber),
+      has_bank_details: Boolean(decryptedAccountNumber),
+    })
   } catch (error) {
     console.error('Failed loading bank account:', error)
     res.status(500).json({ message: 'Database error' })
@@ -6669,6 +6989,7 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
 
     const accountCountry = String(req.body?.account_country || '').trim()
     const accountHolderType = String(req.body?.account_holder_type || '').trim().toLowerCase()
+    const accountHolderName = String(req.body?.account_holder_name || '').trim()
     const routingCode = String(req.body?.routing_code || '').trim()
     const accountNumberOrIban = String(req.body?.account_number_iban || '').trim()
     const companyBankTypeRaw = String(req.body?.company_bank_type || '').trim().toLowerCase()
@@ -6676,6 +6997,16 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
     const companyBankType = companyBankTypeRaw === 'bankgiro' || companyBankTypeRaw === 'plusgiro'
       ? companyBankTypeRaw
       : null
+
+    const [existingRows] = await db.query<RowDataPacket[]>(
+      `SELECT routing_code, account_number_iban FROM bank_accounts WHERE user_id = ? LIMIT 1`,
+      [auth.id],
+    )
+    const existing = existingRows[0] || null
+    const existingRouting = existing ? decryptBankDetail(String(existing.routing_code || '')) : ''
+    const existingAccount = existing ? decryptBankDetail(String(existing.account_number_iban || '')) : ''
+    const effectiveRoutingCode = routingCode || existingRouting
+    const effectiveAccountNumberOrIban = accountNumberOrIban || existingAccount
 
     if (!accountCountry) {
       return res.status(400).json({ message: 'Account country is required.' })
@@ -6692,29 +7023,32 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
     if (accountNumberOrIban.length > 30) {
       return res.status(400).json({ message: 'IBAN / Account number cannot exceed 30 characters.' })
     }
+    if (accountHolderName.length > 150) {
+      return res.status(400).json({ message: 'Account holder name cannot exceed 150 characters.' })
+    }
 
     const isSweden = isSwedenCountry(accountCountry)
 
     if (accountHolderType === 'private' && isSweden) {
-      if (!bankName || !routingCode || !accountNumberOrIban) {
+      if (!bankName || !effectiveRoutingCode || !effectiveAccountNumberOrIban) {
         return res.status(400).json({ message: 'Bank name, clearance number, and account number are required.' })
       }
     }
 
     if (accountHolderType === 'private' && !isSweden) {
-      if (!routingCode || !accountNumberOrIban) {
+      if (!effectiveRoutingCode || !effectiveAccountNumberOrIban) {
         return res.status(400).json({ message: 'SWIFT / BIC and IBAN are required.' })
       }
     }
 
     if (accountHolderType === 'company' && isSweden) {
-      if (!companyBankType || !accountNumberOrIban) {
+      if (!companyBankType || !effectiveAccountNumberOrIban) {
         return res.status(400).json({ message: 'Bankgiro/Plusgiro and account number are required.' })
       }
     }
 
     if (accountHolderType === 'company' && !isSweden) {
-      if (!routingCode || !accountNumberOrIban) {
+      if (!effectiveRoutingCode || !effectiveAccountNumberOrIban) {
         return res.status(400).json({ message: 'SWIFT / BIC and IBAN are required.' })
       }
     }
@@ -6723,18 +7057,20 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
       user_id: auth.id,
       account_country: accountCountry,
       account_holder_type: accountHolderType,
-      routing_code: routingCode || null,
-      account_number_iban: accountNumberOrIban,
+      account_holder_name: accountHolderName || null,
+      routing_code: effectiveRoutingCode ? encryptBankDetail(effectiveRoutingCode) : null,
+      account_number_iban: encryptBankDetail(effectiveAccountNumberOrIban),
       company_bank_type: companyBankType,
       bank_name: bankName || null,
     }
 
     await db.query(
-      `INSERT INTO bank_accounts (user_id, account_country, account_holder_type, routing_code, account_number_iban, company_bank_type, bank_name)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO bank_accounts (user_id, account_country, account_holder_type, account_holder_name, routing_code, account_number_iban, company_bank_type, bank_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          account_country = VALUES(account_country),
          account_holder_type = VALUES(account_holder_type),
+         account_holder_name = VALUES(account_holder_name),
          routing_code = VALUES(routing_code),
          account_number_iban = VALUES(account_number_iban),
          company_bank_type = VALUES(company_bank_type),
@@ -6743,6 +7079,7 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
         payload.user_id,
         payload.account_country,
         payload.account_holder_type,
+        payload.account_holder_name,
         payload.routing_code,
         payload.account_number_iban,
         payload.company_bank_type,
@@ -6750,7 +7087,16 @@ app.put('/api/bank-account', async (req: Request, res: Response) => {
       ],
     )
 
-    res.status(200).json(payload)
+    res.status(200).json({
+      account_country: payload.account_country,
+      account_holder_type: payload.account_holder_type,
+      account_holder_name: payload.account_holder_name,
+      company_bank_type: payload.company_bank_type,
+      bank_name: payload.bank_name,
+      routing_code_masked: maskSensitiveValue(effectiveRoutingCode),
+      account_number_iban_masked: maskSensitiveValue(effectiveAccountNumberOrIban),
+      has_bank_details: true,
+    })
   } catch (error) {
     console.error('Failed updating bank account:', error)
     res.status(500).json({ message: 'Database error' })
@@ -8413,7 +8759,7 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
   const auth = await requireAuth(req, res)
   if (!auth) return
 
-  // Only verified sellers can create products.
+  // Only blocked sellers are prevented from creating products.
   try {
     await ensureProfilesStatusColumns()
     const [profileCheck] = await db.query<RowDataPacket[]>(
@@ -8421,24 +8767,15 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
       [auth.id],
     )
 
-    if (profileCheck.length === 0) {
-      return res.status(403).json({ message: 'Your seller profile is pending review. Complete your profile and wait for admin approval before registering products.' })
-    }
-
-    const sellerStatus = getSellerProfileStatus(profileCheck[0])
-    const sellerStatusReason = getSellerProfileStatusReason(profileCheck[0])
-
-    if (sellerStatus !== 'verified') {
-      const fallbackMessage = sellerStatus === 'blocked'
-        ? 'Your account has been suspended. You cannot register products.'
-        : sellerStatus === 'rejected'
-        ? 'Your profile has been rejected. Please update your profile before registering products.'
-        : 'Your seller profile is pending review. You cannot register products until it is verified.'
-
-      return res.status(403).json({
-        message: sellerStatusReason || fallbackMessage,
-        status: sellerStatus,
-      })
+    if (profileCheck.length > 0) {
+      const sellerStatus = getSellerProfileStatus(profileCheck[0])
+      const sellerStatusReason = getSellerProfileStatusReason(profileCheck[0])
+      if (sellerStatus === 'blocked') {
+        return res.status(403).json({
+          message: sellerStatusReason || 'Your account has been suspended. You cannot register products.',
+          status: sellerStatus,
+        })
+      }
     }
   } catch (profileCheckErr) {
     console.error('Profile status check failed:', profileCheckErr)

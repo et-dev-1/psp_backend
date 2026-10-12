@@ -146,6 +146,15 @@ const getSellerVerificationTemplate = (): string => {
   return sellerVerificationTemplateCache
 }
 
+const signupVerificationCodeTemplatePath = resolveTemplatePath('SignupVerificationCode.hbs')
+let signupVerificationCodeTemplateCache: string | null = null
+
+const getSignupVerificationCodeTemplate = (): string => {
+  if (signupVerificationCodeTemplateCache) return signupVerificationCodeTemplateCache
+  signupVerificationCodeTemplateCache = fs.readFileSync(signupVerificationCodeTemplatePath, 'utf8')
+  return signupVerificationCodeTemplateCache
+}
+
 const sellerPasswordResetTemplatePath = resolveTemplatePath('SellerPasswordReset.hbs')
 let sellerPasswordResetTemplateCache: string | null = null
 
@@ -221,6 +230,30 @@ export const createSellerVerificationEmailHtml = (input: { company: EmailCompany
     company_address: String(input.company.company_address || '').trim(),
     organization_number: String(input.company.organization_number || '').trim(),
     verification_url: normalizeEmailUrl(input.verification_url),
+    email_footer: footer,
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
+  })
+}
+
+export const createSignupVerificationCodeEmailHtml = (input: {
+  company: EmailCompanyInfo
+  verification_code: string
+  expiry_text: string
+}): string => {
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name,
+    company_email: input.company.company_email,
+    company_address: input.company.company_address,
+    organization_number: input.company.organization_number,
+  })
+  return renderTemplate(getSignupVerificationCodeTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: String(input.company.organization_number || '').trim(),
+    verification_code: String(input.verification_code || '').trim(),
+    expiry_text: String(input.expiry_text || '').trim(),
     email_footer: footer,
     email_header_logo: EMAIL_HEADER_LOGO_HTML,
   })
