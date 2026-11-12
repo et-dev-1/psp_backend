@@ -467,6 +467,117 @@ app.get('/sitemap.xml', async (_req: Request, res: Response) => {
   }
 })
 
+app.get('/p/:id', async (req: Request, res: Response) => {
+  const productId = Number(req.params.id)
+  if (!Number.isFinite(productId) || productId <= 0) {
+    return res.status(400).type('text/plain; charset=utf-8').send('Invalid product id')
+  }
+
+  let clientBaseUrl = ''
+  try {
+    clientBaseUrl = getClientBaseUrl()
+  } catch (error) {
+    console.error('Failed to resolve client base URL for product share link:', error)
+    return res.status(500).type('text/plain; charset=utf-8').send('Share link is temporarily unavailable')
+  }
+
+  const redirectUrl = buildAbsoluteUrl(clientBaseUrl, `/shop-now?product=${encodeURIComponent(String(productId))}`)
+
+  try {
+    await ensureProfilesStatusColumns()
+
+    const [productRows] = await db.query<RowDataPacket[]>(
+      `SELECT
+        p.id,
+        p.name,
+        p.subtitle,
+        p.description,
+        p.main_image_url,
+        GROUP_CONCAT(pi.image_url ORDER BY pi.is_main DESC) AS image_urls
+      FROM products p
+      LEFT JOIN product_images pi ON pi.product_id = p.id
+      LEFT JOIN users u ON p.seller_id = u.id
+      LEFT JOIN profiles sp ON sp.id = (
+        SELECT p2.id
+        FROM profiles p2
+        WHERE p2.user_id = u.id
+        ORDER BY p2.created_at DESC, p2.id DESC
+        LIMIT 1
+      )
+      WHERE p.id = ?
+        AND p.status = 'active'
+        AND p.approval_status = 'approved'
+        AND COALESCE(sp.status, 'pending') = 'verified'
+      GROUP BY p.id
+      LIMIT 1`,
+      [productId],
+    )
+
+    if (!productRows.length) {
+      return res.redirect(302, redirectUrl)
+    }
+
+    const [variantRows] = await db.query<RowDataPacket[]>(
+      'SELECT type, stock_quantity FROM product_variants WHERE product_id = ?',
+      [productId],
+    )
+
+    const hasDigitalVariant = variantRows.some((row) => String(row.type || '').toLowerCase() === 'digital')
+    const physicalStock = variantRows.reduce((sum, row) => {
+      if (String(row.type || '').toLowerCase() === 'digital') return sum
+      return sum + Number(row.stock_quantity || 0)
+    }, 0)
+
+    if (!hasDigitalVariant && physicalStock <= 0) {
+      return res.redirect(302, redirectUrl)
+    }
+
+    const product = productRows[0]
+    const serverBaseUrl = getServerBaseUrl(req)
+    const shortUrl = buildAbsoluteUrl(serverBaseUrl, `/p/${encodeURIComponent(String(productId))}`)
+    const imageCandidates = String(product.image_urls || '')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+    const imageUrl = toAbsoluteUrlFromBase(serverBaseUrl, String(product.main_image_url || '').trim() || imageCandidates[0] || '')
+    const descriptionRaw = [String(product.subtitle || '').trim(), String(product.description || '').trim()]
+      .filter(Boolean)
+      .join(' • ')
+    const description = (descriptionRaw || 'Discover this product on Barakah Mart.').slice(0, 260)
+    const title = String(product.name || '').trim() || 'Barakah Mart Product'
+
+    const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtml(title)} | Barakah Mart</title>
+    <meta name="description" content="${escapeHtml(description)}" />
+    <meta name="robots" content="index,follow" />
+    <meta property="og:type" content="product" />
+    <meta property="og:title" content="${escapeHtml(title)}" />
+    <meta property="og:description" content="${escapeHtml(description)}" />
+    <meta property="og:url" content="${escapeHtml(shortUrl)}" />
+    ${imageUrl ? `<meta property="og:image" content="${escapeHtml(imageUrl)}" />` : ''}
+    <meta name="twitter:card" content="${imageUrl ? 'summary_large_image' : 'summary'}" />
+    <meta name="twitter:title" content="${escapeHtml(title)}" />
+    <meta name="twitter:description" content="${escapeHtml(description)}" />
+    ${imageUrl ? `<meta name="twitter:image" content="${escapeHtml(imageUrl)}" />` : ''}
+    <link rel="canonical" href="${escapeHtml(shortUrl)}" />
+    <meta http-equiv="refresh" content="0;url=${escapeHtml(redirectUrl)}" />
+  </head>
+  <body>
+    <p>Redirecting to product page...</p>
+    <p><a href="${escapeHtml(redirectUrl)}">Open product</a></p>
+  </body>
+</html>`
+
+    return res.status(200).type('text/html; charset=utf-8').send(html)
+  } catch (error) {
+    console.error('Failed to render product share page:', error)
+    return res.redirect(302, redirectUrl)
+  }
+})
+
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
@@ -3523,10 +3634,26 @@ const escapeXml = (value: string): string =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
 
+const escapeHtml = (value: string): string =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
 const buildAbsoluteUrl = (baseUrl: string, routePath: string): string => {
   const normalizedBase = String(baseUrl || '').replace(/\/+$/, '')
   const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`
   return `${normalizedBase}${normalizedPath}`
+}
+
+const toAbsoluteUrlFromBase = (baseUrl: string, value?: string | null): string => {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  if (/^https?:\/\//i.test(raw)) return raw
+  const normalizedPath = raw.startsWith('/') ? raw : `/${raw}`
+  return `${baseUrl}${normalizedPath}`
 }
 
 const PUBLIC_SITEMAP_ROUTES = [
