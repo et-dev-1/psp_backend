@@ -8,7 +8,6 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-
 # ---------- Runtime stage ----------
 FROM node:20-alpine AS runtime
 WORKDIR /app
@@ -20,12 +19,11 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
-COPY --from=build /app/email ./dist/email
-COPY --from=build /app/server.js ./server.js
 COPY --from=build /app/email ./email
 COPY --from=build /app/swish ./swish
 COPY --from=build /app/schema.sql ./schema.sql
+COPY --from=build /app/bootstrap.sql ./bootstrap.sql
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "node dist/scripts/apply-schema.js && exec node server.js"]
+CMD ["sh", "-c", "node dist/scripts/apply-schema.js && exec node dist/server.js"]
