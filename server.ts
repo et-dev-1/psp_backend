@@ -422,6 +422,9 @@ app.get('/sitemap.xml', async (_req: Request, res: Response) => {
     const [productRows] = await db.query<RowDataPacket[]>(
       `SELECT
         p.id,
+        p.name,
+        p.category,
+        p.brand,
         p.created_at,
         p.updated_at,
         p.type,
@@ -441,18 +444,61 @@ app.get('/sitemap.xml', async (_req: Request, res: Response) => {
       ORDER BY p.created_at DESC`,
     )
 
+    const categoryUrls = new Set<string>()
+    const brandUrls = new Set<string>()
+
+    for (const row of productRows) {
+      const categoryValue = String(row.category || '').trim()
+      if (categoryValue) {
+        const categorySlug = normalizeSitemapSlug(categoryValue)
+        const categoryPaths = [
+          `/category/${categorySlug}`,
+          `/en/category/${categorySlug}`,
+          `/sv/category/${categorySlug}`,
+        ]
+        for (const routePath of categoryPaths) {
+          categoryUrls.add(buildAbsoluteUrl(baseUrl, routePath))
+        }
+      }
+
+      const brandValue = String(row.brand || '').trim()
+      if (brandValue) {
+        const brandSlug = normalizeSitemapSlug(brandValue)
+        const brandPaths = [
+          `/brand/${brandSlug}`,
+          `/en/brand/${brandSlug}`,
+          `/sv/brand/${brandSlug}`,
+        ]
+        for (const routePath of brandPaths) {
+          brandUrls.add(buildAbsoluteUrl(baseUrl, routePath))
+        }
+      }
+    }
+
     const productEntries = productRows
       .filter((product) => String(product.type || '').toLowerCase() === 'digital' || Number(product.stock_quantity || 0) > 0)
-      .map((product) => ({
-        loc: buildAbsoluteUrl(baseUrl, `/shop-now?product=${encodeURIComponent(String(product.id))}`),
-        lastmod: new Date(product.updated_at || product.created_at || Date.now()).toISOString(),
-      }))
+      .map((product) => {
+        const productId = Number(product.id)
+        const locs = [
+          buildAbsoluteUrl(baseUrl, `/p/${encodeURIComponent(String(productId))}`),
+          buildAbsoluteUrl(baseUrl, `/shop-now?product=${encodeURIComponent(String(productId))}`),
+          buildAbsoluteUrl(baseUrl, `/en/shop-now?product=${encodeURIComponent(String(productId))}`),
+          buildAbsoluteUrl(baseUrl, `/sv/shop-now?product=${encodeURIComponent(String(productId))}`),
+        ]
+
+        return {
+          locs: [...new Set(locs)],
+          lastmod: new Date(product.updated_at || product.created_at || Date.now()).toISOString(),
+        }
+      })
 
     const xml = [
       '<?xml version="1.0" encoding="UTF-8"?>',
       '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
       ...PUBLIC_SITEMAP_ROUTES.map((routePath) => `  <url><loc>${escapeXml(buildAbsoluteUrl(baseUrl, routePath))}</loc></url>`),
-      ...productEntries.map(({ loc, lastmod }) => `  <url><loc>${escapeXml(loc)}</loc><lastmod>${escapeXml(lastmod)}</lastmod></url>`),
+      ...[...categoryUrls].map((loc) => `  <url><loc>${escapeXml(loc)}</loc></url>`),
+      ...[...brandUrls].map((loc) => `  <url><loc>${escapeXml(loc)}</loc></url>`),
+      ...productEntries.flatMap(({ locs, lastmod }) => locs.map((loc) => `  <url><loc>${escapeXml(loc)}</loc><lastmod>${escapeXml(lastmod)}</lastmod></url>`)),
       '</urlset>',
     ].join('\n')
 
@@ -3646,6 +3692,18 @@ const buildAbsoluteUrl = (baseUrl: string, routePath: string): string => {
   const normalizedBase = String(baseUrl || '').replace(/\/+$/, '')
   const normalizedPath = routePath.startsWith('/') ? routePath : `/${routePath}`
   return `${normalizedBase}${normalizedPath}`
+}
+
+const normalizeSitemapSlug = (value: string): string => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80)
+
+  return normalized || 'item'
 }
 
 const toAbsoluteUrlFromBase = (baseUrl: string, value?: string | null): string => {
