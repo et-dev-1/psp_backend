@@ -4130,6 +4130,72 @@ const normalizeVerificationCode = (value: unknown): string => {
   return String(value || '').replace(/\D/g, '').slice(0, 6)
 }
 
+const getProductValidationErrors = ({
+  name,
+  category,
+  type,
+  itemCondition,
+  isCustomizable,
+  customizationType,
+  customizationInstructions,
+  shippingMode,
+  shippingFee,
+  deliveryTime,
+  hasImages,
+  hasMainImage,
+  variants,
+}: {
+  name: unknown
+  category: unknown
+  type: unknown
+  itemCondition?: unknown
+  isCustomizable?: unknown
+  customizationType?: unknown
+  customizationInstructions?: unknown
+  shippingMode?: 'item' | 'package'
+  shippingFee?: unknown
+  deliveryTime?: unknown
+  hasImages?: boolean
+  hasMainImage?: boolean
+  variants?: unknown[]
+}) => {
+  const errors: Record<string, string> = {}
+  const typeValue = String(type ?? '').trim()
+
+  if (!String(name ?? '').trim()) errors.name = 'Product name is required.'
+  if (!String(category ?? '').trim()) errors.category = 'Category is required.'
+  if (!['physical', 'digital'].includes(typeValue)) errors.type = 'Product type is required.'
+
+  if (typeValue !== 'digital') {
+    if (!String(itemCondition ?? '').trim()) errors.itemCondition = 'Product condition is required.'
+    if (!hasImages) errors.images = 'Please upload at least one product image.'
+    if (hasImages && !hasMainImage) errors.mainImage = 'Please select a main image.'
+    if (shippingMode === 'item') {
+      const parsedShippingFee = Number(shippingFee)
+      if (shippingFee === '' || !Number.isFinite(parsedShippingFee) || parsedShippingFee < 0) {
+        errors.shippingFee = 'Item shipping fee is required and must be zero or positive.'
+      }
+      const parsedDelivery = Number(deliveryTime)
+      if (deliveryTime === '' || !Number.isFinite(parsedDelivery) || parsedDelivery < 1) {
+        errors.deliveryTime = 'Estimated delivery time is required and must be at least 1 day.'
+      }
+    }
+  }
+
+  if (!Array.isArray(variants) || variants.length === 0) {
+    errors.variants = 'At least one variant must be added before submitting.'
+  }
+
+  if (isCustomizable) {
+    if (!String(customizationType ?? '').trim()) errors.customizationType = 'Customization type is required.'
+    if (!String(customizationInstructions ?? '').trim()) {
+      errors.customizationInstructions = 'Guidelines/instructions are required for customizable products.'
+    }
+  }
+
+  return errors
+}
+
 // POST /api/register/request-code
 app.post('/api/register/request-code', async (req: Request, res: Response) => {
   const rawEmail = String(req.body?.email || '').trim()
@@ -8991,11 +9057,54 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
   const imageFiles = uploadedFiles?.images || []
   const variantImageFiles = uploadedFiles?.variant_images || []
   const variantFiles = uploadedFiles?.variant_files || []
-  if (!name || !category) {
-    return res.status(400).json({ error: 'Missing required fields' })
-  }
 
   try {
+    const normalizedVariantsInput = normalizeVariantsFromRequest(variants ?? metadata, {
+      price,
+      discount_price,
+      stock_quantity,
+      type,
+    })
+
+    const validationErrors = getProductValidationErrors({
+      name,
+      category,
+      type,
+      itemCondition: item_condition,
+      isCustomizable: req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true',
+      customizationType: req.body.customization_type,
+      customizationInstructions: req.body.customization_instructions,
+      shippingMode: req.body.shipping_mode === 'item' ? 'item' : 'package',
+      shippingFee: req.body.shipping_fee,
+      deliveryTime: req.body.delivery_time,
+      hasImages: imageFiles.length > 0,
+      hasMainImage: Array.isArray(req.body.images_main)
+        ? req.body.images_main.includes('1')
+        : typeof req.body.images_main === 'string'
+          ? req.body.images_main.split(',').includes('1')
+          : false,
+      variants: normalizedVariantsInput,
+    })
+
+    if (Object.keys(validationErrors).length > 0) {
+      console.error('[product registration validation failed]', {
+        seller_id: auth.id,
+        validationErrors,
+        payload: {
+          name,
+          category,
+          type,
+          item_condition,
+          hasImages: imageFiles.length,
+          hasVariants: normalizedVariantsInput.length,
+        },
+      })
+      return res.status(400).json({
+        message: 'Please review the highlighted fields and complete the required product details.',
+        field_errors: validationErrors,
+      })
+    }
+
     const sellerAdminFlags = await getSellerAdminFlags(auth.id)
     const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending'
     const skuColumnExists = await hasProductSkuColumn()
@@ -9034,18 +9143,30 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     } catch (parseErr) {
       console.error('Error parsing variants:', parseErr)
       return res.status(400).json({
-        error: 'Invalid variant data format',
-        details: parseErr instanceof Error ? parseErr.message : String(parseErr)
+        message: 'Please review your variant data and try again.',
+        field_errors: {
+          variants: 'Invalid variant data format. Please update the variant section and resubmit.',
+        },
       })
     }
 
     if (normalizedVariants.length === 0) {
-      return res.status(400).json({ error: 'At least one variant is required' })
+      return res.status(400).json({
+        message: 'Please review the highlighted fields and complete the required product details.',
+        field_errors: {
+          variants: 'At least one variant is required.',
+        },
+      })
     }
 
     const pricingError = validateVariantPricing(normalizedVariants)
     if (pricingError) {
-      return res.status(400).json({ error: pricingError })
+      return res.status(400).json({
+        message: 'Please review the highlighted fields and complete the required product details.',
+        field_errors: {
+          variants: pricingError,
+        },
+      })
     }
 
     const resolvedProductType: 'digital' | 'physical' =
@@ -9234,11 +9355,8 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     if (err instanceof Error) {
       console.error('Error stack:', err.stack)
     }
-    const errorMessage = err instanceof Error ? err.message : String(err)
     res.status(500).json({
-      error: 'Failed to register product',
-      details: errorMessage,
-      stack: config.NODE_ENV === 'development' ? (err instanceof Error ? err.stack : null) : undefined
+      message: 'Unable to register product right now. Please try again in a moment.',
     })
   }
 })
@@ -9273,11 +9391,55 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
   const variantImageFiles = uploadedFiles?.variant_images || []
   const variantFiles = uploadedFiles?.variant_files || []
 
-  if (!name || !category) {
-    return res.status(400).json({ message: 'Required fields are missing' })
-  }
-
   try {
+    const variantPayload = variants ?? metadata
+    const normalizedVariantsInput = normalizeVariantsFromRequest(variantPayload, {
+      price,
+      discount_price,
+      stock_quantity,
+      type,
+    })
+
+    const validationErrors = getProductValidationErrors({
+      name,
+      category,
+      type,
+      itemCondition: item_condition,
+      isCustomizable: req.body.is_customizable === '1' || req.body.is_customizable === 1 || req.body.is_customizable === true || req.body.is_customizable === 'true',
+      customizationType: req.body.customization_type,
+      customizationInstructions: req.body.customization_instructions,
+      shippingMode: req.body.shipping_mode === 'item' ? 'item' : 'package',
+      shippingFee: req.body.shipping_fee,
+      deliveryTime: req.body.delivery_time,
+      hasImages: imageFiles.length > 0,
+      hasMainImage: Array.isArray(req.body.images_main)
+        ? req.body.images_main.includes('1')
+        : typeof req.body.images_main === 'string'
+          ? req.body.images_main.split(',').includes('1')
+          : false,
+      variants: normalizedVariantsInput,
+    })
+
+    if (Object.keys(validationErrors).length > 0) {
+      console.error('[product update validation failed]', {
+        seller_id: auth.id,
+        product_id: productId,
+        validationErrors,
+        payload: {
+          name,
+          category,
+          type,
+          item_condition,
+          hasImages: imageFiles.length,
+          hasVariants: normalizedVariantsInput.length,
+        },
+      })
+      return res.status(400).json({
+        message: 'Please review the highlighted fields and complete the required product details.',
+        field_errors: validationErrors,
+      })
+    }
+
     const sellerAdminFlags = await getSellerAdminFlags(auth.id)
     const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending'
     // Check if product exists and belongs to the user
@@ -9394,12 +9556,22 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
       }))
 
       if (normalizedVariants.length === 0) {
-        return res.status(400).json({ message: 'At least one variant is required' })
+        return res.status(400).json({
+          message: 'Please review the highlighted fields and complete the required product details.',
+          field_errors: {
+            variants: 'At least one variant is required.',
+          },
+        })
       }
 
       const pricingError = validateVariantPricing(normalizedVariants)
       if (pricingError) {
-        return res.status(400).json({ message: pricingError })
+        return res.status(400).json({
+          message: 'Please review the highlighted fields and complete the required product details.',
+          field_errors: {
+            variants: pricingError,
+          },
+        })
       }
 
       // Process variant images if uploaded
@@ -9534,8 +9706,12 @@ app.put('/api/products/:id', productUpload, async (req: Request, res: Response) 
     })
   } catch (err) {
     console.error('Error updating product:', err)
-    const errorMessage = err instanceof Error ? err.message : String(err)
-    res.status(500).json({ message: 'Failed to update product', details: errorMessage })
+    if (err instanceof Error) {
+      console.error('Error stack:', err.stack)
+    }
+    res.status(500).json({
+      message: 'Unable to update product right now. Please try again in a moment.',
+    })
   }
 })
 
