@@ -11,7 +11,7 @@ import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
 import { RowDataPacket, ResultSetHeader } from 'mysql2'
-import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, createSellerOrderReceivedEmailHtml, createSignupVerificationCodeEmailHtml, EMAIL_HEADER_LOGO_HTML, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
+import { createInvoiceEmailHtml, createDigitalProductEmailHtml, createShipmentNotificationEmailHtml, createSellerPayoutReceiptEmailHtml, createSellerVerificationEmailHtml, createSellerPasswordResetEmailHtml, createSellerProfileStatusEmailHtml, createProductStatusEmailHtml, createDeliveryReviewRequestEmailHtml, createSellerOrderReceivedEmailHtml, createSignupVerificationCodeEmailHtml, createServiceBookingEmailHtml, createServiceReminderDigestEmailHtml, createCommissionUpdateNoticeEmailHtml, createAdminNewSellerEmailHtml, createAdminNewProductEmailHtml, createEmailConnectionTestHtml, createCustomMessageEmailHtml, createSupportMessageEmailHtml, createDisputeNotificationEmailHtml, sendEmail, setEmailAccountResolver, setSmtpDefaultCredentialsResolver, setSmtpSettingsResolver } from './email/email'
 import { emitToAdmin, emitToSeller, setupWebSocket } from './websocket'
 import { estimateShipmentCost, generateShipmentLabel, trackShipment, type ShipmentAddressInput } from './shipment/shipment'
 import Handlebars from 'handlebars'
@@ -19,14 +19,53 @@ import { OAuth2Client } from 'google-auth-library'
 import { generateSecret, generateURI, verify } from 'otplib'
 import QRCode from 'qrcode'
 import SwishApi from './swish/SwishApi'
-
-const sanitizeLogArg = (value: unknown): unknown => {
-  if (value instanceof Error) return value.message
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === null || value === undefined) {
-    return value
-  }
-  return '[redacted]'
-}
+import {
+  sanitizeLogArg,
+  toBoolSetting,
+  maskSensitiveValue,
+  toCETDateTime,
+  roundToTwo,
+  toNullableNumber,
+  parseTaxRateFromDbValue,
+  calculateCommissionAmount,
+  calculateTaxOnItem,
+  calculateNetEarning,
+  getPaymentProviderFromReference,
+  calculatePaymentProcessorFee,
+  generateGroupOrderId,
+  generateSellerOrderId,
+  normalizeCountryCode,
+  escapeXml,
+  escapeHtml,
+  sanitizeDisputeInput,
+  sanitizeDisputeFileName,
+  formatIsoDate,
+  resolveSmtpSecure,
+  buildLegalBasisForDispute,
+  normalizeServiceJsonField,
+} from './utils/helpers'
+import {
+  PASSWORD_RESET_TTL_MS,
+  AUTH_CAPTCHA_TTL_MS,
+  SMTP_PASSWORD_SETTING_KEY,
+  PRODUCT_UPLOAD_SUBDIR,
+  SUPPORT_UPLOAD_SUBDIR,
+  DISPUTE_UPLOAD_SUBDIR,
+  DISPUTE_ALLOWED_EXTS,
+  DISPUTE_ALLOWED_MIMES,
+  COMPANY_LOGO_UPLOAD_SUBDIR,
+  CUSTOMIZATION_UPLOAD_SUBDIR,
+  VALID_EMAIL_RE,
+  SUPPORT_TYPE_LABELS,
+} from './constants/variables'
+import {
+  getAdminEmailsQuery as getAdminEmails,
+  ensureDisputeTables,
+  resolveSellerDisputeDisplayName,
+  loadDisputesWithChildren,
+  loadSingleDisputeById,
+  lookupOrdersForDisputeQuery,
+} from './db/queries'
 
 const installProductionSafeLogging = () => {
   if (config.NODE_ENV !== 'production') return
@@ -57,20 +96,7 @@ if (config.SWISH_ENABLED) {
   console.log('[Swish API] Disabled by environment variable SWISH_ENABLED=false')
 }
 
-const DEFAULT_PLATFORM_COMMISSION_PERCENT = config.DEFAULT_PLATFORM_COMMISSION_PERCENT
-const DEFAULT_PLATFORM_COMMISSION_FIXED = config.DEFAULT_PLATFORM_COMMISSION_FIXED
-const DEFAULT_PROMOTION_COMMISSION_PERCENT = config.PROMOTION_COMMISSION_PERCENT
 let VAT_SHIPPING_RATE = config.VAT_SHIPPING_RATE // 0.25 = 25% VAT
-const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000
-const AUTH_CAPTCHA_TTL_MS = 10 * 60 * 1000
-
-const toBoolSetting = (value: unknown, fallback = false): boolean => {
-  const raw = String(value ?? '').trim().toLowerCase()
-  if (!raw) return fallback
-  return ['1', 'true', 'yes', 'on'].includes(raw)
-}
-
-const SMTP_PASSWORD_SETTING_KEY = 'smtp_password_encrypted'
 
 const getSmtpEncryptionKey = (): Buffer => {
   const secret = String(process.env.EMAIL_PASSWORD_ENCRYPTION_KEY || config.JWT_SECRET || '').trim()
@@ -143,13 +169,6 @@ const decryptBankDetail = (value: string): string => {
     // Keep API usable even if a legacy/invalid payload is present.
     return raw
   }
-}
-
-const maskSensitiveValue = (value: string): string => {
-  const raw = String(value || '').trim()
-  if (!raw) return ''
-  if (raw.length <= 4) return `•••• ${raw}`
-  return `•••• ${raw.slice(-4)}`
 }
 
 const applySmtpPasswordFromStorage = async (): Promise<void> => {
@@ -259,27 +278,16 @@ const getPlatformCompanyEmailInfo = async (): Promise<PlatformCompanyEmailInfo> 
   }
 }
 
-const getAdminEmails = async (): Promise<string[]> => {
-  try {
-    const [rows] = await db.query<RowDataPacket[]>(
-      "SELECT email FROM users WHERE role = 'admin'"
-    )
-    if (rows.length > 0) {
-      return rows.map((r) => String(r.email).trim()).filter(Boolean)
-    }
-  } catch (err) {
-    console.error('Failed to query admin emails from DB:', err)
-  }
-  return [config.DEFAULT_ADMIN_EMAIL]
-}
-
 const notifyAdminsNewSeller = async (sellerId: number, sellerEmail: string) => {
   try {
     const adminEmails = await getAdminEmails()
+    const companyInfo = await getPlatformCompanyEmailInfo()
     const subject = `New Seller Registered: ${sellerEmail}`
-    const html = `<p>A new seller has registered/joined Barakah Mart.</p>
-<p>Seller Email: <strong>${sellerEmail}</strong></p>
-<p>Seller ID: <strong>${sellerId}</strong></p>`
+    const html = createAdminNewSellerEmailHtml({
+      company: companyInfo,
+      sellerId,
+      sellerEmail,
+    })
     for (const adminEmail of adminEmails) {
       await sendEmail(adminEmail, subject, html, { purpose: 'sellers' })
     }
@@ -320,12 +328,8 @@ const ensureDir = (dirPath: string) => {
 }
 const uploadsDir = (...segments: string[]) => path.join(uploadsRootDir, ...segments)
 
-const PRODUCT_UPLOAD_SUBDIR = 'products'
-const SUPPORT_UPLOAD_SUBDIR = 'support'
-const COMPANY_LOGO_UPLOAD_SUBDIR = 'company_logos'
 const PROFILE_PICTURE_UPLOAD_SUBDIR = 'profile_pictures'
 const SHIPMENT_LABEL_UPLOAD_SUBDIR = 'shipment_labels'
-const CUSTOMIZATION_UPLOAD_SUBDIR = 'customizations'
 
 // Ensure all upload destinations are rooted under UPLOADS_DIR (or fallback) before handling requests.
 ensureDir(uploadsRootDir)
@@ -440,7 +444,7 @@ app.get('/sitemap.xml', async (_req: Request, res: Response) => {
       )
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
       ORDER BY p.created_at DESC`,
     )
 
@@ -553,7 +557,7 @@ app.get('/p/:id', async (req: Request, res: Response) => {
       WHERE p.id = ?
         AND p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
       GROUP BY p.id
       LIMIT 1`,
       [productId],
@@ -707,15 +711,35 @@ const storage = multer.diskStorage({
   },
 })
 
+const IMAGE_ALLOWED_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.jfif',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.webp',
+  '.svg',
+  '.tif',
+  '.tiff',
+  '.avif',
+  '.heic',
+  '.heif',
+])
+
 const upload = multer({
   storage,
   limits: { fileSize: DIGITAL_FILE_MAX_SIZE_BYTES },
   fileFilter: (req, file, cb) => {
     if (file.fieldname === 'images' || file.fieldname === 'variant_images') {
-      const allowedImageTypes = /jpeg|jpg|png|gif|webp/
-      const extname = allowedImageTypes.test(path.extname(file.originalname).toLowerCase())
-      const mimetype = allowedImageTypes.test(file.mimetype)
-      if (extname && mimetype) {
+      const extension = path.extname(file.originalname || '').toLowerCase()
+      const normalizedMimeType = String(file.mimetype || '').toLowerCase()
+      const isImageMime = normalizedMimeType.startsWith('image/')
+      const isGenericBinaryMime =
+        !normalizedMimeType ||
+        normalizedMimeType === 'application/octet-stream' ||
+        normalizedMimeType === 'application/x-download'
+      if (isImageMime || (IMAGE_ALLOWED_EXTENSIONS.has(extension) && (isImageMime || isGenericBinaryMime))) {
         return cb(null, true)
       }
       return cb(new Error('Only image files are allowed for product images'))
@@ -763,6 +787,37 @@ const productUpload = upload.fields([
 ])
 
 const supportUpload = upload.array('attachments', 5)
+
+const disputeUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      const dir = uploadsDir(DISPUTE_UPLOAD_SUBDIR)
+      ensureDir(dir)
+      cb(null, dir)
+    },
+    filename: (_req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9)
+      const rawExt = path.extname(String(file.originalname || '')).toLowerCase().replace(/[^.a-z0-9]/g, '')
+      const mimeExt = String(file.mimetype || '').startsWith('image/')
+        ? `.${String(file.mimetype).split('/')[1].replace(/[^a-z0-9]/gi, '').toLowerCase() || 'jpg'}`
+        : ''
+      const safeExt = DISPUTE_ALLOWED_EXTS.test(rawExt) ? rawExt : mimeExt
+      cb(null, uniqueSuffix + safeExt)
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(String(file.originalname || '')).toLowerCase()
+    const mime = String(file.mimetype || '').toLowerCase()
+    if (ext === '.svg' || mime === 'image/svg+xml') {
+      return cb(new Error('SVG files are not allowed for security reasons'))
+    }
+    if (DISPUTE_ALLOWED_EXTS.test(ext) || DISPUTE_ALLOWED_MIMES.test(mime)) {
+      return cb(null, true)
+    }
+    return cb(new Error('Dispute evidence must be an image (JPG, PNG, WEBP, GIF, HEIC, AVIF, BMP, TIFF, etc.), PDF, or document file'))
+  },
+}).array('evidence', 5)
 
 const adminSettingsLogoUpload = multer({
   storage: multer.diskStorage({
@@ -874,25 +929,6 @@ const requireAuth = async (req: Request, res: Response): Promise<AuthPayload | n
   }
 
   return auth
-}
-
-const toCETDateTime = (value?: Date | string): string | null => {
-  const date = value ? new Date(value) : new Date()
-  if (Number.isNaN(date.getTime())) return null
-
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/Paris',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).formatToParts(date)
-
-  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]))
-  return `${lookup.year}-${lookup.month}-${lookup.day} ${lookup.hour}:${lookup.minute}:${lookup.second}`
 }
 
 let hasProductSkuColumnCache: boolean | null = null
@@ -1405,7 +1441,7 @@ const ensureProfilesStatusColumns = async (): Promise<void> => {
 }
 
 const ensureProfilesBlockColumns = async (): Promise<void> => {
-	await ensureProfilesStatusColumns()
+  await ensureProfilesStatusColumns()
 }
 
 let hasProfilesShippingColumnsCache: boolean | null = null
@@ -1897,23 +1933,38 @@ const ensureCommissionSettingsTable = async () => {
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('platform_commission_percent', ?)
+       VALUES ('platform_commission_percent', '0')
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(DEFAULT_PLATFORM_COMMISSION_PERCENT)],
     )
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('platform_commission_fixed', ?)
+       VALUES ('platform_commission_fixed', '0')
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(DEFAULT_PLATFORM_COMMISSION_FIXED)],
     )
 
     await db.query(
       `INSERT INTO app_settings (setting_key, setting_value)
-       VALUES ('promotion_commission_percent', ?)
+       VALUES ('promotion_commission_percent', '0')
        ON DUPLICATE KEY UPDATE setting_value = setting_value`,
-      [String(DEFAULT_PROMOTION_COMMISSION_PERCENT)],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_commission_percent', '0')
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_commission_fixed', '0')
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_promotion_commission_percent', '0')
+       ON DUPLICATE KEY UPDATE setting_value = setting_value`,
     )
 
     await db.query(
@@ -2152,13 +2203,6 @@ type RuntimeSettings = {
   smtp_secure: string
 }
 
-const resolveSmtpSecure = (value: string, port: number): boolean => {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (['ssl', 'tls', 'true', '1', 'yes', 'on'].includes(normalized)) return true
-  if (['starttls', 'false', '0', 'no', 'off'].includes(normalized)) return false
-  // Fallback by port convention when setting is absent/unknown.
-  return Number(port) === 465
-}
 
 const applyRuntimeSettings = (settings: RuntimeSettings) => {
   process.env.VAT_SHIPPING_RATE = String(settings.vat_shipping_rate)
@@ -2246,9 +2290,9 @@ const getRuntimeSettings = async (): Promise<RuntimeSettings> => {
 
   return {
     platform_name: String(map.get('platform_name') || config.SMTP.fromName || config.PLATFORM_NAME || 'Platform'),
-    platform_commission_percent: Number.isFinite(platformPercent) ? platformPercent : DEFAULT_PLATFORM_COMMISSION_PERCENT,
-    platform_commission_fixed: Number.isFinite(platformFixed) ? platformFixed : DEFAULT_PLATFORM_COMMISSION_FIXED,
-    promotion_commission_percent: Number.isFinite(promotionPercent) ? promotionPercent : DEFAULT_PROMOTION_COMMISSION_PERCENT,
+    platform_commission_percent: Number.isFinite(platformPercent) ? platformPercent : 0,
+    platform_commission_fixed: Number.isFinite(platformFixed) ? platformFixed : 0,
+    promotion_commission_percent: Number.isFinite(promotionPercent) ? promotionPercent : 0,
     vat_shipping_rate: Number.isFinite(vatShippingRate) ? vatShippingRate : config.VAT_SHIPPING_RATE,
     stripe_payment_fixed_cost: Number.isFinite(stripePaymentFixedCost) ? stripePaymentFixedCost : 0,
     stripe_payment_percent_cost: Number.isFinite(stripePaymentPercentCost) ? stripePaymentPercentCost : 0,
@@ -2730,13 +2774,29 @@ const ensureDigitalDownloadTokensTable = async () => {
   }
 }
 
-const getCommissionSettings = async (): Promise<{ percent: number; fixed: number; promotionPercent: number; rate: number }> => {
+const getCommissionSettings = async (): Promise<{
+  percent: number
+  fixed: number
+  promotionPercent: number
+  rate: number
+  servicePercent: number
+  serviceFixed: number
+  servicePromotionPercent: number
+  serviceRate: number
+}> => {
   await ensureCommissionSettingsTable()
 
   const [rows] = await db.query<RowDataPacket[]>(
     `SELECT setting_key, setting_value
      FROM app_settings
-     WHERE setting_key IN ('platform_commission_percent', 'platform_commission_fixed', 'promotion_commission_percent')`,
+     WHERE setting_key IN (
+       'platform_commission_percent',
+       'platform_commission_fixed',
+       'promotion_commission_percent',
+       'service_commission_percent',
+       'service_commission_fixed',
+       'service_promotion_commission_percent'
+     )`,
   )
 
   const map = new Map<string, string>()
@@ -2747,29 +2807,44 @@ const getCommissionSettings = async (): Promise<{ percent: number; fixed: number
   const percentRaw = Number(map.get('platform_commission_percent'))
   const fixedRaw = Number(map.get('platform_commission_fixed'))
   const promotionPercentRaw = Number(map.get('promotion_commission_percent'))
+  const servicePercentRaw = Number(map.get('service_commission_percent'))
+  const serviceFixedRaw = Number(map.get('service_commission_fixed'))
+  const servicePromotionPercentRaw = Number(map.get('service_promotion_commission_percent'))
 
   const percent = Number.isFinite(percentRaw) && percentRaw >= 0
     ? roundToTwo(percentRaw)
-    : DEFAULT_PLATFORM_COMMISSION_PERCENT
+    : 0
 
   const fixed = Number.isFinite(fixedRaw) && fixedRaw >= 0
     ? roundToTwo(fixedRaw)
-    : DEFAULT_PLATFORM_COMMISSION_FIXED
+    : 0
 
   const promotionPercent = Number.isFinite(promotionPercentRaw) && promotionPercentRaw >= 0
     ? roundToTwo(promotionPercentRaw)
-    : DEFAULT_PROMOTION_COMMISSION_PERCENT
+    : 0
+
+  const servicePercent = Number.isFinite(servicePercentRaw) && servicePercentRaw >= 0
+    ? roundToTwo(servicePercentRaw)
+    : percent
+
+  const serviceFixed = Number.isFinite(serviceFixedRaw) && serviceFixedRaw >= 0
+    ? roundToTwo(serviceFixedRaw)
+    : fixed
+
+  const servicePromotionPercent = Number.isFinite(servicePromotionPercentRaw) && servicePromotionPercentRaw >= 0
+    ? roundToTwo(servicePromotionPercentRaw)
+    : promotionPercent
 
   return {
     percent,
     fixed,
     promotionPercent,
     rate: percent / 100,
+    servicePercent,
+    serviceFixed,
+    servicePromotionPercent,
+    serviceRate: servicePercent / 100,
   }
-}
-
-const calculateCommissionAmount = (baseAmount: number, commissionRate: number, commissionFixed: number): number => {
-  return roundToTwo(Number(baseAmount || 0) * Number(commissionRate || 0) + Number(commissionFixed || 0))
 }
 
 const getSellerAdminFlagsMap = async (sellerIds: number[]): Promise<Map<number, { selfCommissionExempt: boolean; trustedSeller: boolean }>> => {
@@ -2813,25 +2888,6 @@ const getSellerAdminFlagsMap = async (sellerIds: number[]): Promise<Map<number, 
 const getSellerAdminFlags = async (sellerId: number): Promise<{ selfCommissionExempt: boolean; trustedSeller: boolean }> => {
   const map = await getSellerAdminFlagsMap([sellerId])
   return map.get(Number(sellerId)) || { selfCommissionExempt: false, trustedSeller: false }
-}
-
-const getPaymentProviderFromReference = (paymentReferenceId?: string | null): 'stripe' | 'swish' | 'unknown' => {
-  const reference = String(paymentReferenceId || '').trim()
-  if (!reference) return 'unknown'
-  if (/^[0-9A-F]{32}$/i.test(reference)) return 'swish'
-  if (reference.startsWith('pi_')) return 'stripe'
-  return 'unknown'
-}
-
-const calculatePaymentProcessorFee = (
-  grandTotal: number,
-  fixedCost: number,
-  percentCost: number,
-): number => {
-  const safeGrandTotal = Number.isFinite(Number(grandTotal)) ? Number(grandTotal) : 0
-  const safeFixed = Number.isFinite(Number(fixedCost)) ? Number(fixedCost) : 0
-  const safePercent = Number.isFinite(Number(percentCost)) ? Number(percentCost) : 0
-  return roundToTwo(safeFixed + (safeGrandTotal * (safePercent / 100)))
 }
 
 const getPaymentProviderCost = (
@@ -3067,6 +3123,7 @@ const calculateCommissionBreakdown = (
   }
 }
 
+/* Unused local email template helpers moved to backend/email/email.ts
 const resolveServerEmailTemplatePath = (filename: string): string => {
   const candidates = [
     path.join(__dirname, 'email', filename),
@@ -3100,17 +3157,24 @@ const getEmailFooterTemplate = (): string => {
   emailFooterTemplateCache = fs.readFileSync(emailFooterTemplatePath, 'utf8')
   return emailFooterTemplateCache
 }
+*/
 
 const sendCommissionUpdateNotificationToSellers = async (payload: {
   previous: {
     commissionPercent: number
     commissionFixed: number
     promotionCommissionPercent: number
+    serviceCommissionPercent: number
+    serviceCommissionFixed: number
+    servicePromotionCommissionPercent: number
   }
   current: {
     commissionPercent: number
     commissionFixed: number
     promotionCommissionPercent: number
+    serviceCommissionPercent: number
+    serviceCommissionFixed: number
+    servicePromotionCommissionPercent: number
   }
 }) => {
   const [sellerRows] = await db.query<RowDataPacket[]>(
@@ -3131,64 +3195,92 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
     return { sent: 0, failed: 0 }
   }
 
-  const changedRows = [
-    {
-      label: 'Commission Percentage',
-      prev: `${payload.previous.commissionPercent.toFixed(2)}%`,
-      next: `${payload.current.commissionPercent.toFixed(2)}%`,
-      changed: payload.previous.commissionPercent !== payload.current.commissionPercent,
-    },
-    {
-      label: 'Commission Fixed Amount',
-      prev: `${payload.previous.commissionFixed.toFixed(2)} SEK`,
-      next: `${payload.current.commissionFixed.toFixed(2)} SEK`,
-      changed: payload.previous.commissionFixed !== payload.current.commissionFixed,
-    },
-    {
-      label: 'Promotion Commission',
-      prev: `${payload.previous.promotionCommissionPercent.toFixed(2)}%`,
-      next: `${payload.current.promotionCommissionPercent.toFixed(2)}%`,
-      changed: payload.previous.promotionCommissionPercent !== payload.current.promotionCommissionPercent,
-    },
-  ]
+  const changedRows: Array<{
+    category: 'product' | 'service'
+    label: string
+    prev: string
+    next: string
+    changed: boolean
+  }> = [
+      {
+        category: 'product',
+        label: 'Commission Percentage',
+        prev: `${payload.previous.commissionPercent.toFixed(2)}%`,
+        next: `${payload.current.commissionPercent.toFixed(2)}%`,
+        changed: payload.previous.commissionPercent !== payload.current.commissionPercent,
+      },
+      {
+        category: 'product',
+        label: 'Commission Fixed Amount',
+        prev: `${payload.previous.commissionFixed.toFixed(2)} SEK`,
+        next: `${payload.current.commissionFixed.toFixed(2)} SEK`,
+        changed: payload.previous.commissionFixed !== payload.current.commissionFixed,
+      },
+      {
+        category: 'product',
+        label: 'Promotion Commission',
+        prev: `${payload.previous.promotionCommissionPercent.toFixed(2)}%`,
+        next: `${payload.current.promotionCommissionPercent.toFixed(2)}%`,
+        changed: payload.previous.promotionCommissionPercent !== payload.current.promotionCommissionPercent,
+      },
+      {
+        category: 'service',
+        label: 'Commission Percentage',
+        prev: `${payload.previous.serviceCommissionPercent.toFixed(2)}%`,
+        next: `${payload.current.serviceCommissionPercent.toFixed(2)}%`,
+        changed: payload.previous.serviceCommissionPercent !== payload.current.serviceCommissionPercent,
+      },
+      {
+        category: 'service',
+        label: 'Commission Fixed Amount',
+        prev: `${payload.previous.serviceCommissionFixed.toFixed(2)} SEK`,
+        next: `${payload.current.serviceCommissionFixed.toFixed(2)} SEK`,
+        changed: payload.previous.serviceCommissionFixed !== payload.current.serviceCommissionFixed,
+      },
+      {
+        category: 'service',
+        label: 'Promotion Commission',
+        prev: `${payload.previous.servicePromotionCommissionPercent.toFixed(2)}%`,
+        next: `${payload.current.servicePromotionCommissionPercent.toFixed(2)}%`,
+        changed: payload.previous.servicePromotionCommissionPercent !== payload.current.servicePromotionCommissionPercent,
+      },
+    ]
 
   const hasChanges = changedRows.some((row) => row.changed)
   const changeRowsHtml = changedRows
-    .map((row) => {
-      const rowStyle = row.changed ? 'background-color:#ecfdf5;' : 'background-color:#ffffff;'
+    .map((row, index) => {
+      const isService = row.category === 'service'
+      const borderBottom = index === changedRows.length - 1 ? 'none' : '1px solid #e2e8f0'
+      const rowBg = row.changed
+        ? isService
+          ? '#fff7ed'
+          : '#faf5ff'
+        : index % 2 === 1
+          ? '#f8fafc'
+          : '#ffffff'
+      const categoryBadge = isService
+        ? '<span style="display:inline-block;padding:2px 8px;border-radius:6px;background-color:#ffedd5;color:#c2410c;font-size:10px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;margin-right:8px;vertical-align:middle;">Service</span>'
+        : '<span style="display:inline-block;padding:2px 8px;border-radius:6px;background-color:#f3e8ff;color:#7e22ce;font-size:10px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;margin-right:8px;vertical-align:middle;">Product</span>'
+      const currentColor = row.changed ? (isService ? '#c2410c' : '#7e22ce') : '#0f172a'
       const marker = row.changed
-        ? '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#047857;color:#ffffff;font-size:11px;font-weight:700;">CHANGED</span>'
-        : '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#e5e7eb;color:#374151;font-size:11px;font-weight:700;">UNCHANGED</span>'
-      return `<tr style="${rowStyle}">
-        <td style="padding:10px;border:1px solid #d1d5db;font-weight:600;">${row.label}</td>
-        <td style="padding:10px;border:1px solid #d1d5db;">${row.prev}</td>
-        <td style="padding:10px;border:1px solid #d1d5db;">${row.next}</td>
-        <td style="padding:10px;border:1px solid #d1d5db;">${marker}</td>
+        ? '<span style="display:inline-block;padding:3px 10px;border-radius:999px;background-color:#ecfdf5;color:#047857;border:1px solid #a7f3d0;font-size:11px;font-weight:700;letter-spacing:0.3px;">UPDATED</span>'
+        : '<span style="display:inline-block;padding:3px 10px;border-radius:999px;background-color:#f1f5f9;color:#64748b;border:1px solid #e2e8f0;font-size:11px;font-weight:600;letter-spacing:0.3px;">UNCHANGED</span>'
+      return `<tr style="background-color:${rowBg};">
+        <td style="padding:13px 16px;border-bottom:${borderBottom};font-size:13px;line-height:20px;font-weight:600;color:#0f172a;vertical-align:middle;">${categoryBadge}<span style="vertical-align:middle;">${row.label}</span></td>
+        <td align="right" style="padding:13px 16px;border-bottom:${borderBottom};font-size:13px;line-height:20px;color:#64748b;font-variant-numeric:tabular-nums;white-space:nowrap;vertical-align:middle;">${row.prev}</td>
+        <td align="right" style="padding:13px 16px;border-bottom:${borderBottom};font-size:13px;line-height:20px;font-weight:700;color:${currentColor};font-variant-numeric:tabular-nums;white-space:nowrap;vertical-align:middle;">${row.next}</td>
+        <td align="center" style="padding:13px 16px;border-bottom:${borderBottom};white-space:nowrap;vertical-align:middle;">${marker}</td>
       </tr>`
     })
     .join('')
 
   const companyInfo = await getPlatformCompanyEmailInfo()
-  const footerHtml = renderTemplate(getEmailFooterTemplate(), {
-    footer_intro_text: 'Questions? Please contact platform support.',
-    company_name: String(companyInfo.company_name || ''),
-    company_email: String(companyInfo.company_email || ''),
-    company_address: String(companyInfo.company_address || ''),
-    organization_number: String(companyInfo.organization_number || ''),
-  })
-
-  const html = renderTemplate(getCommissionUpdateTemplate(), {
-    company_logo_url: String(companyInfo.company_logo_url || '').trim(),
-    email_header_logo: EMAIL_HEADER_LOGO_HTML,
-    company_name: String(companyInfo.company_name || '').trim(),
-    company_email: String(companyInfo.company_email || '').trim(),
-    company_address: String(companyInfo.company_address || '').trim(),
-    organization_number: String(companyInfo.organization_number || '').trim(),
-    change_rows: changeRowsHtml,
-    changes_note: hasChanges
+  const html = createCommissionUpdateNoticeEmailHtml({
+    company: companyInfo,
+    changeRowsHtml,
+    changesNote: hasChanges
       ? 'Highlighted rows are the values that changed.'
       : 'No value changed since the last notification; this is a manual reminder email.',
-    email_footer: footerHtml,
   })
 
   const subject = 'Platform commission has been updated'
@@ -3201,6 +3293,7 @@ const sendCommissionUpdateNotificationToSellers = async (payload: {
   return { sent, failed }
 }
 
+/* Unused local invoice template loader (moved to backend/email/email.ts)
 const invoiceTemplatePath = resolveServerEmailTemplatePath('InvoiceCustomer.hbs')
 let invoiceTemplateCache: string | null = null
 
@@ -3209,19 +3302,13 @@ const getInvoiceTemplate = (): string => {
   invoiceTemplateCache = fs.readFileSync(invoiceTemplatePath, 'utf8')
   return invoiceTemplateCache
 }
+*/
 
+/* Unused local template renderer (moved to backend/email/email.ts)
 const renderTemplate = (template: string, values: Record<string, string>): string => {
   return template.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '')
 }
-
-const generateGroupOrderId = (): string => {
-  const random = Math.random().toString(36).substring(2, 10).toUpperCase()
-  return `G-${random}`
-}
-
-const generateSellerOrderId = (groupOrderId: string, sellerId: number | string): string => {
-  return `${groupOrderId}-S${sellerId}`
-}
+*/
 
 const generateUniqueProductSku = async (sellerId: number, productName: string): Promise<string> => {
   const baseName = productName
@@ -3237,6 +3324,29 @@ const generateUniqueProductSku = async (sellerId: number, productName: string): 
     const candidate = `SKU-${baseName}-${sellerId}-${timePart}${attemptPart}${randomPart}`
 
     const [existing] = await db.query<RowDataPacket[]>('SELECT id FROM products WHERE sku = ? LIMIT 1', [
+      candidate,
+    ])
+    if (existing.length === 0) {
+      return candidate
+    }
+  }
+
+  return `SKU-${baseName}-${sellerId}-${Date.now()}`
+}
+
+const generateServiceSku = async (sellerId: number, serviceName: string): Promise<string> => {
+  const baseName = serviceName
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .toUpperCase()
+    .slice(0, 6) || 'SRV'
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const timePart = Date.now().toString().slice(-6)
+    const randomPart = Math.floor(100 + Math.random() * 900)
+    const attemptPart = attempt.toString()
+    const candidate = `SKU-${baseName}-${sellerId}-${timePart}${attemptPart}${randomPart}`
+
+    const [existing] = await db.query<RowDataPacket[]>('SELECT id FROM services WHERE sku = ? LIMIT 1', [
       candidate,
     ])
     if (existing.length === 0) {
@@ -3293,62 +3403,6 @@ type NormalizedVariant = {
   file_url: string | null
 }
 
-const toNullableNumber = (value: any): number | null => {
-  if (value === '' || value == null) return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-const parseTaxRateFromDbValue = (value: unknown): number => {
-  if (value == null) return 0
-
-  const raw = String(value).trim()
-  if (!raw) return 0
-
-  const numeric = Number(raw.replace('%', '').trim())
-  if (!Number.isFinite(numeric)) return 0
-
-  // Support both stored formats:
-  // - "8" or "8%" => 0.08
-  // - "0.08" => 0.08
-  return numeric > 1 ? numeric / 100 : numeric
-}
-
-const roundToTwo = (value: number): number => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100
-
-const normalizeCountryCode = (value: unknown): string => {
-  const raw = String(value || '').trim()
-  if (!raw) return 'SE'
-
-  if (/^[A-Za-z]{2}$/.test(raw)) {
-    return raw.toUpperCase()
-  }
-
-  const normalized = raw.toLowerCase()
-  const map: Record<string, string> = {
-    sweden: 'SE',
-    sverige: 'SE',
-    norway: 'NO',
-    norge: 'NO',
-    denmark: 'DK',
-    danmark: 'DK',
-    finland: 'FI',
-    germany: 'DE',
-    deutschland: 'DE',
-    netherlands: 'NL',
-    holland: 'NL',
-    france: 'FR',
-    italy: 'IT',
-    spain: 'ES',
-    poland: 'PL',
-    unitedkingdom: 'GB',
-    'united kingdom': 'GB',
-    uk: 'GB',
-  }
-
-  return map[normalized] || 'SE'
-}
-
 const getSellerSenderAddress = async (sellerId: number): Promise<ShipmentAddressInput> => {
   const [rows] = await db.query<RowDataPacket[]>(
     `SELECT
@@ -3401,16 +3455,8 @@ const getSellerSenderAddress = async (sellerId: number): Promise<ShipmentAddress
   }
 }
 
-const calculateTaxOnItem = (lineAmount: number, taxRate: number): number => {
-  return roundToTwo(Number(lineAmount || 0) * Number(taxRate || 0))
-}
-
 const calculateTaxOnShipment = (shipmentFee: number, vatRate: number = VAT_SHIPPING_RATE): number => {
   return roundToTwo(Number(shipmentFee || 0) * Number(vatRate || 0))
-}
-
-const calculateNetEarning = (grandTotal: number, totalTax: number, commissionAmount: number): number => {
-  return roundToTwo(Number(grandTotal || 0) - Number(totalTax || 0) - Number(commissionAmount || 0))
 }
 
 const upsertShipmentLabelExpenseForSale = async (
@@ -3671,22 +3717,6 @@ const getClientBaseUrl = (): string => {
 
   throw new Error('Cannot resolve client host. Set CLIENT_URL in environment.')
 }
-
-const escapeXml = (value: string): string =>
-  String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;')
-
-const escapeHtml = (value: string): string =>
-  String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
 
 const buildAbsoluteUrl = (baseUrl: string, routePath: string): string => {
   const normalizedBase = String(baseUrl || '').replace(/\/+$/, '')
@@ -4813,17 +4843,13 @@ app.post('/api/settings/test-email', async (req: Request, res: Response) => {
 
     const platformName = config.SMTP.fromName || config.PLATFORM_NAME || 'Platform'
     const subject = `${platformName} — Email Connection Test`
-    const body = `
-      <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-        <h2 style="color:#111827;margin-bottom:8px">✅ Email connection is working</h2>
-        <p style="color:#4b5563;line-height:1.6">
-          This is a test message from <strong>${platformName}</strong>.<br/>
-          Your email server is correctly configured and able to send emails.
-        </p>
-        <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0"/>
-        <p style="color:#9ca3af;font-size:12px">Sent to: ${recipientEmail}<br/>Sender: ${smtpUser}</p>
-      </div>
-    `
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const body = createEmailConnectionTestHtml({
+      company: companyInfo,
+      platformName,
+      recipientEmail,
+      smtpUser,
+    })
 
     await sendEmail(recipientEmail, subject, body)
 
@@ -4988,6 +5014,10 @@ app.get('/api/seller/settings/commission-preview', async (req: Request, res: Res
     return res.json({
       commission_percent: settings.percent,
       commission_fixed: settings.fixed,
+      promotion_commission_percent: settings.promotionPercent,
+      service_commission_percent: settings.servicePercent,
+      service_commission_fixed: settings.serviceFixed,
+      service_promotion_commission_percent: settings.servicePromotionPercent,
       self_commission_exempt: sellerFlags.selfCommissionExempt,
     })
   } catch (error) {
@@ -5006,6 +5036,9 @@ app.get('/api/admin/settings/commission', async (req: Request, res: Response) =>
       commission_percent: settings.percent,
       commission_fixed: settings.fixed,
       promotion_commission_percent: settings.promotionPercent,
+      service_commission_percent: settings.servicePercent,
+      service_commission_fixed: settings.serviceFixed,
+      service_promotion_commission_percent: settings.servicePromotionPercent,
     })
   } catch (error) {
     console.error('Admin commission settings read error:', error)
@@ -5020,6 +5053,12 @@ app.put('/api/admin/settings/commission', async (req: Request, res: Response) =>
   const percentRaw = Number(req.body?.commission_percent)
   const fixedRaw = Number(req.body?.commission_fixed)
   const promotionPercentRaw = Number(req.body?.promotion_commission_percent)
+  const hasServicePercent = req.body?.service_commission_percent !== undefined && req.body?.service_commission_percent !== null && req.body?.service_commission_percent !== ''
+  const hasServiceFixed = req.body?.service_commission_fixed !== undefined && req.body?.service_commission_fixed !== null && req.body?.service_commission_fixed !== ''
+  const hasServicePromotionPercent = req.body?.service_promotion_commission_percent !== undefined && req.body?.service_promotion_commission_percent !== null && req.body?.service_promotion_commission_percent !== ''
+  const servicePercentRaw = hasServicePercent ? Number(req.body?.service_commission_percent) : percentRaw
+  const serviceFixedRaw = hasServiceFixed ? Number(req.body?.service_commission_fixed) : fixedRaw
+  const servicePromotionPercentRaw = hasServicePromotionPercent ? Number(req.body?.service_promotion_commission_percent) : promotionPercentRaw
 
   if (!Number.isFinite(percentRaw) || percentRaw < 0 || percentRaw > 100) {
     return res.status(400).json({ message: 'commission_percent must be a number between 0 and 100' })
@@ -5033,9 +5072,24 @@ app.put('/api/admin/settings/commission', async (req: Request, res: Response) =>
     return res.status(400).json({ message: 'promotion_commission_percent must be a number between 0 and 100' })
   }
 
+  if (!Number.isFinite(servicePercentRaw) || servicePercentRaw < 0 || servicePercentRaw > 100) {
+    return res.status(400).json({ message: 'service_commission_percent must be a number between 0 and 100' })
+  }
+
+  if (!Number.isFinite(serviceFixedRaw) || serviceFixedRaw < 0) {
+    return res.status(400).json({ message: 'service_commission_fixed must be a non-negative number' })
+  }
+
+  if (!Number.isFinite(servicePromotionPercentRaw) || servicePromotionPercentRaw < 0 || servicePromotionPercentRaw > 100) {
+    return res.status(400).json({ message: 'service_promotion_commission_percent must be a number between 0 and 100' })
+  }
+
   const commissionPercent = roundToTwo(percentRaw)
   const commissionFixed = roundToTwo(fixedRaw)
   const promotionCommissionPercent = roundToTwo(promotionPercentRaw)
+  const serviceCommissionPercent = roundToTwo(servicePercentRaw)
+  const serviceCommissionFixed = roundToTwo(serviceFixedRaw)
+  const servicePromotionCommissionPercent = roundToTwo(servicePromotionPercentRaw)
 
   try {
     await ensureCommissionSettingsTable()
@@ -5061,12 +5115,36 @@ app.put('/api/admin/settings/commission', async (req: Request, res: Response) =>
       [String(promotionCommissionPercent)],
     )
 
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_commission_percent', ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [String(serviceCommissionPercent)],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_commission_fixed', ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [String(serviceCommissionFixed)],
+    )
+
+    await db.query(
+      `INSERT INTO app_settings (setting_key, setting_value)
+       VALUES ('service_promotion_commission_percent', ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [String(servicePromotionCommissionPercent)],
+    )
+
     return res.json({
       success: true,
       message: 'Commission settings updated successfully.',
       commission_percent: commissionPercent,
       commission_fixed: commissionFixed,
       promotion_commission_percent: promotionCommissionPercent,
+      service_commission_percent: serviceCommissionPercent,
+      service_commission_fixed: serviceCommissionFixed,
+      service_promotion_commission_percent: servicePromotionCommissionPercent,
     })
   } catch (error) {
     console.error('Admin commission settings update error:', error)
@@ -5081,6 +5159,9 @@ app.post('/api/admin/settings/commission/send-email', async (req: Request, res: 
   const previousPercentRaw = Number(req.body?.previous_commission_percent)
   const previousFixedRaw = Number(req.body?.previous_commission_fixed)
   const previousPromotionPercentRaw = Number(req.body?.previous_promotion_commission_percent)
+  const previousServicePercentRaw = Number(req.body?.previous_service_commission_percent)
+  const previousServiceFixedRaw = Number(req.body?.previous_service_commission_fixed)
+  const previousServicePromotionPercentRaw = Number(req.body?.previous_service_promotion_commission_percent)
 
   try {
     const current = await getCommissionSettings()
@@ -5095,6 +5176,15 @@ app.post('/api/admin/settings/commission/send-email', async (req: Request, res: 
       promotionCommissionPercent: Number.isFinite(previousPromotionPercentRaw)
         ? roundToTwo(previousPromotionPercentRaw)
         : current.promotionPercent,
+      serviceCommissionPercent: Number.isFinite(previousServicePercentRaw)
+        ? roundToTwo(previousServicePercentRaw)
+        : current.servicePercent,
+      serviceCommissionFixed: Number.isFinite(previousServiceFixedRaw)
+        ? roundToTwo(previousServiceFixedRaw)
+        : current.serviceFixed,
+      servicePromotionCommissionPercent: Number.isFinite(previousServicePromotionPercentRaw)
+        ? roundToTwo(previousServicePromotionPercentRaw)
+        : current.servicePromotionPercent,
     }
 
     const emailResult = await sendCommissionUpdateNotificationToSellers({
@@ -5103,6 +5193,9 @@ app.post('/api/admin/settings/commission/send-email', async (req: Request, res: 
         commissionPercent: roundToTwo(current.percent),
         commissionFixed: roundToTwo(current.fixed),
         promotionCommissionPercent: roundToTwo(current.promotionPercent),
+        serviceCommissionPercent: roundToTwo(current.servicePercent),
+        serviceCommissionFixed: roundToTwo(current.serviceFixed),
+        servicePromotionCommissionPercent: roundToTwo(current.servicePromotionPercent),
       },
     })
 
@@ -5158,7 +5251,7 @@ app.get('/api/admin/swish-config', async (req: Request, res: Response) => {
     const certDir = process.env.SWISH_CERTIFICATE_PATH || '/home/sdf/swish'
     const p12Filename = process.env.SWISH_P12_FILENAME || 'cert.p12'
     const pemFilename = process.env.SWISH_CA_FILENAME || 'cert.pem'
-    
+
     const hasP12 = fs.existsSync(path.resolve(certDir, p12Filename))
     const hasPem = fs.existsSync(path.resolve(certDir, pemFilename))
 
@@ -5192,7 +5285,7 @@ app.post('/api/admin/swish-config', swishUpload, async (req: Request, res: Respo
   for (const file of files) {
     const ext = path.extname(file.originalname)
     const base = path.basename(file.originalname, ext)
-    
+
     if (base !== 'cert') {
       return res.status(400).json({ success: false, message: `Invalid filename: ${file.originalname}. Certificates must be named 'cert' (e.g. cert.p12, cert.pem).` })
     }
@@ -5220,9 +5313,9 @@ app.post('/api/admin/swish-config', swishUpload, async (req: Request, res: Respo
       SWISH_PAYEE_ALIAS: alias,
       SWISH_ENABLED: 'true'
     }
-    
+
     updateEnvFile(updates)
-    
+
     for (const [key, val] of Object.entries(updates)) {
       process.env[key] = val
     }
@@ -7542,6 +7635,1041 @@ app.get('/api/admin/portal', async (req: Request, res: Response) => {
   }
 })
 
+app.get('/api/admin/dashboard', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  try {
+    await Promise.all([ensureProfilesStatusColumns(), ensureServiceTables(), ensureSupportMessagesTable()])
+    const paymentDateColumnExists = await hasSalesPayoutPaymentDateColumn()
+
+    const rawPeriod = String(req.query.period || '30d').toLowerCase()
+    const now = new Date()
+    let periodStart = new Date(now)
+    let prevStart = new Date(now)
+
+    if (rawPeriod === 'today') {
+      periodStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0)
+      prevStart = new Date(periodStart)
+      prevStart.setDate(prevStart.getDate() - 1)
+    } else if (rawPeriod === '7d') {
+      periodStart.setDate(now.getDate() - 7)
+      prevStart.setDate(now.getDate() - 14)
+    } else if (rawPeriod === '90d') {
+      periodStart.setDate(now.getDate() - 90)
+      prevStart.setDate(now.getDate() - 180)
+    } else if (rawPeriod === 'year') {
+      periodStart = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0)
+      prevStart = new Date(now.getFullYear() - 1, 0, 1, 0, 0, 0, 0)
+    } else {
+      periodStart.setDate(now.getDate() - 30)
+      prevStart.setDate(now.getDate() - 60)
+    }
+
+    const toSqlDate = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ')
+    const periodStartSql = toSqlDate(periodStart)
+    const prevStartSql = toSqlDate(prevStart)
+
+    const pctChange = (currentVal: number, previousVal: number) => {
+      if (previousVal <= 0) return currentVal > 0 ? 100 : 0
+      return roundToTwo(((currentVal - previousVal) / previousVal) * 100)
+    }
+
+    const [
+      [salesPeriodRows],
+      [salesPrevRows],
+      [bookingsPeriodRows],
+      [bookingsPrevRows],
+      [sellerCountsRows],
+      [pendingCountsRows],
+      [supportCountsRows],
+      [monthlySalesRows],
+      [monthlyBookingsRows],
+      [topSellerRows],
+      [recentSalesRows],
+      [recentBookingsRows],
+      [recentProfilesRows],
+    ] = await Promise.all([
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS order_count,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS gmv,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.commission_amount ELSE 0 END), 0) AS commission,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN COALESCE(st.total_tax, s.tax_amount, 0) ELSE 0 END), 0) AS tax,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS refunds
+        FROM sales s
+        LEFT JOIN (
+          SELECT sale_id, COALESCE(SUM(tax_amount), 0) AS total_tax
+          FROM sale_items
+          GROUP BY sale_id
+        ) st ON st.sale_id = s.id
+        WHERE s.order_date >= ?`,
+        [periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS order_count,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS gmv,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.commission_amount ELSE 0 END), 0) AS commission
+        FROM sales s
+        WHERE s.order_date >= ? AND s.order_date < ?`,
+        [prevStartSql, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS booking_count,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') THEN price ELSE 0 END), 0) AS total_price,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NULL THEN price ELSE 0 END), 0) AS standalone_price,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NOT NULL THEN price ELSE 0 END), 0) AS linked_price
+        FROM service_bookings
+        WHERE created_at >= ?`,
+        [periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS booking_count,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NULL THEN price ELSE 0 END), 0) AS standalone_price
+        FROM service_bookings
+        WHERE created_at >= ? AND created_at < ?`,
+        [prevStartSql, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(DISTINCT CASE WHEN COALESCE(p.status, 'pending') = 'approved' THEN p.user_id END) AS active_sellers,
+          COUNT(DISTINCT CASE WHEN COALESCE(p.status, 'pending') = 'approved' AND p.created_at >= ? THEN p.user_id END) AS new_sellers_period
+        FROM profiles p
+        INNER JOIN users u ON u.id = p.user_id AND u.role = 'seller'`,
+        [periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          (SELECT COUNT(*) FROM profiles WHERE COALESCE(status, 'pending') = 'pending') AS seller_applications,
+          (SELECT COUNT(*) FROM products WHERE approval_status = 'pending') AS product_approvals,
+          (SELECT COUNT(*) FROM services WHERE approval_status = 'pending') AS service_approvals,
+          (SELECT COUNT(*) FROM sales WHERE COALESCE(payout_status, 'pending') = 'pending' AND LOWER(COALESCE(order_status, '')) NOT IN ('cancelled', 'canceled', 'refunded')) AS pending_payouts`,
+      ),
+      db.query<RowDataPacket[]>(`SELECT COUNT(*) AS open_disputes FROM support_messages`),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          DATE_FORMAT(order_date, '%Y-%m') AS ym,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN grand_total ELSE 0 END), 0) AS total_sales
+        FROM sales
+        WHERE order_date >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 5 MONTH)
+        GROUP BY DATE_FORMAT(order_date, '%Y-%m')`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          DATE_FORMAT(created_at, '%Y-%m') AS ym,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') THEN price ELSE 0 END), 0) AS service_total,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NOT NULL THEN price ELSE 0 END), 0) AS linked_service_total
+        FROM service_bookings
+        WHERE created_at >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 5 MONTH)
+        GROUP BY DATE_FORMAT(created_at, '%Y-%m')`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          s.seller_id,
+          COALESCE(
+            NULLIF(TRIM(sp.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(sp.first_name, ''), ' ', COALESCE(sp.last_name, ''))), ''),
+            u.email
+          ) AS seller_name,
+          COALESCE(NULLIF(TRIM(sp.profile_type), ''), 'Seller') AS profile_type,
+          COALESCE(sp.status, 'approved') AS seller_status,
+          COUNT(*) AS order_count,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS revenue
+        FROM sales s
+        INNER JOIN users u ON u.id = s.seller_id
+        LEFT JOIN profiles sp ON sp.id = (
+          SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+        )
+        GROUP BY s.seller_id, seller_name, profile_type, seller_status
+        ORDER BY revenue DESC
+        LIMIT 6`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          s.id,
+          s.order_id,
+          s.order_date,
+          s.order_status,
+          s.payout_status,
+          ${paymentDateColumnExists ? 's.payout_payment_date' : 'NULL AS payout_payment_date'},
+          s.grand_total,
+          s.commission_amount,
+          COALESCE(c.name, 'Customer') AS customer_name,
+          COALESCE(
+            NULLIF(TRIM(sp.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(sp.first_name, ''), ' ', COALESCE(sp.last_name, ''))), ''),
+            u.email,
+            'Seller'
+          ) AS seller_name,
+          CASE WHEN EXISTS (SELECT 1 FROM service_bookings sb WHERE sb.sale_id = s.id) THEN 'Service' ELSE 'Product' END AS tx_type
+        FROM sales s
+        LEFT JOIN customers c ON c.id = s.customer_id
+        LEFT JOIN users u ON u.id = s.seller_id
+        LEFT JOIN profiles sp ON sp.id = (
+          SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+        )
+        ORDER BY s.order_date DESC
+        LIMIT 30`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          sb.id,
+          sb.booking_code,
+          sb.sale_id,
+          sb.price,
+          sb.buyer_name,
+          sb.status,
+          sb.created_at,
+          COALESCE(
+            NULLIF(TRIM(sp.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(sp.first_name, ''), ' ', COALESCE(sp.last_name, ''))), ''),
+            u.email,
+            'Seller'
+          ) AS seller_name
+        FROM service_bookings sb
+        LEFT JOIN users u ON u.id = sb.seller_id
+        LEFT JOIN profiles sp ON sp.id = (
+          SELECT p2.id FROM profiles p2 WHERE p2.user_id = sb.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+        )
+        ORDER BY sb.created_at DESC
+        LIMIT 20`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          p.id,
+          COALESCE(
+            NULLIF(TRIM(p.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(p.first_name, ''), ' ', COALESCE(p.last_name, ''))), ''),
+            u.email
+          ) AS seller_name,
+          COALESCE(p.status, 'pending') AS status,
+          p.created_at
+        FROM profiles p
+        INNER JOIN users u ON u.id = p.user_id
+        ORDER BY p.created_at DESC
+        LIMIT 5`,
+      ),
+    ])
+
+    const salesPeriod = salesPeriodRows[0] || {}
+    const salesPrev = salesPrevRows[0] || {}
+    const bookingsPeriod = bookingsPeriodRows[0] || {}
+    const bookingsPrev = bookingsPrevRows[0] || {}
+    const sellerCounts = sellerCountsRows[0] || {}
+    const pendingCounts = pendingCountsRows[0] || {}
+    const supportCounts = supportCountsRows[0] || {}
+
+    const currentSalesGmv = Number(salesPeriod.gmv || 0)
+    const currentStandaloneBookings = Number(bookingsPeriod.standalone_price || 0)
+    const currentLinkedBookings = Number(bookingsPeriod.linked_price || 0)
+    const currentServiceRevenue = Number(bookingsPeriod.total_price || 0)
+    const currentTotalGmv = roundToTwo(currentSalesGmv + currentStandaloneBookings)
+    const currentProductRevenue = roundToTwo(Math.max(0, currentSalesGmv - currentLinkedBookings))
+
+    const prevTotalGmv = roundToTwo(Number(salesPrev.gmv || 0) + Number(bookingsPrev.standalone_price || 0))
+    const currentCommission = roundToTwo(Number(salesPeriod.commission || 0))
+    const prevCommission = roundToTwo(Number(salesPrev.commission || 0))
+    const currentTax = roundToTwo(Number(salesPeriod.tax || 0))
+    const currentRefunds = roundToTwo(Number(salesPeriod.refunds || 0))
+
+    const productOrdersCount = Number(salesPeriod.order_count || 0)
+    const prevProductOrdersCount = Number(salesPrev.order_count || 0)
+    const serviceBookingsCount = Number(bookingsPeriod.booking_count || 0)
+    const prevServiceBookingsCount = Number(bookingsPrev.booking_count || 0)
+    const totalTransactions = productOrdersCount + serviceBookingsCount
+    const prevTransactions = prevProductOrdersCount + prevServiceBookingsCount
+
+    const sellerEarnings = roundToTwo(Math.max(0, currentTotalGmv - currentCommission - currentTax))
+
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const salesByYm = new Map<string, number>()
+    for (const r of monthlySalesRows) {
+      salesByYm.set(String(r.ym), Number(r.total_sales || 0))
+    }
+    const bookingsByYm = new Map<string, { total: number; linked: number }>()
+    for (const r of monthlyBookingsRows) {
+      bookingsByYm.set(String(r.ym), {
+        total: Number(r.service_total || 0),
+        linked: Number(r.linked_service_total || 0),
+      })
+    }
+
+    const monthlyRevenue: Array<{ month: string; products: number; services: number }> = []
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+      const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+      const totalSales = salesByYm.get(ym) || 0
+      const bInfo = bookingsByYm.get(ym) || { total: 0, linked: 0 }
+      const productsRev = roundToTwo(Math.max(0, totalSales - bInfo.linked))
+      const servicesRev = roundToTwo(bInfo.total)
+      monthlyRevenue.push({
+        month: monthNames[d.getMonth()],
+        products: productsRev,
+        services: servicesRev,
+      })
+    }
+
+    const totalBreakdown = currentProductRevenue + currentServiceRevenue
+    const productPercent = totalBreakdown > 0 ? roundToTwo((currentProductRevenue / totalBreakdown) * 100) : 0
+    const servicePercent = totalBreakdown > 0 ? roundToTwo(100 - productPercent) : 0
+
+    const topSellers = topSellerRows.map((row) => {
+      const name = String(row.seller_name || 'Seller').trim()
+      const parts = name.split(/\s+/).filter(Boolean)
+      const initials = parts.length >= 2
+        ? `${parts[0][0]}${parts[1][0]}`.toUpperCase()
+        : name.slice(0, 2).toUpperCase()
+      return {
+        id: Number(row.seller_id),
+        name,
+        category: row.profile_type === 'company' ? 'Business Seller' : 'Individual Seller',
+        revenue: roundToTwo(Number(row.revenue || 0)),
+        orders: Number(row.order_count || 0),
+        status: String(row.seller_status || 'approved').toLowerCase() === 'approved' ? 'Active' : 'Pending',
+        initials,
+      }
+    })
+
+    const normalizeStatus = (raw: string) => {
+      const s = String(raw || '').toLowerCase()
+      if (s === 'completed' || s === 'delivered' || s === 'confirmed' || s === 'paid') return 'Completed'
+      if (s === 'refunded' || s === 'cancelled' || s === 'canceled' || s === 'rejected') return 'Refunded'
+      return 'Pending'
+    }
+
+    const txFromSales = recentSalesRows.map((row) => ({
+      id: String(row.order_id || `#ORD-${row.id}`),
+      customer: String(row.customer_name || 'Customer'),
+      seller: String(row.seller_name || 'Seller'),
+      type: String(row.tx_type || 'Product'),
+      amount: roundToTwo(Number(row.grand_total || 0)),
+      commission: roundToTwo(Number(row.commission_amount || 0)),
+      status: normalizeStatus(row.order_status),
+      rawDate: row.order_date ? new Date(row.order_date).getTime() : 0,
+      date: row.order_date ? new Date(row.order_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '-',
+    }))
+
+    const txFromStandaloneBookings = recentBookingsRows
+      .filter((b) => !b.sale_id)
+      .map((row) => ({
+        id: String(row.booking_code || `#BKG-${row.id}`),
+        customer: String(row.buyer_name || 'Customer'),
+        seller: String(row.seller_name || 'Seller'),
+        type: 'Service',
+        amount: roundToTwo(Number(row.price || 0)),
+        commission: 0,
+        status: normalizeStatus(row.status),
+        rawDate: row.created_at ? new Date(row.created_at).getTime() : 0,
+        date: row.created_at ? new Date(row.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '-',
+      }))
+
+    const recentTransactions = [...txFromSales, ...txFromStandaloneBookings]
+      .sort((a, b) => b.rawDate - a.rawDate)
+      .slice(0, 30)
+
+    const activityItems: Array<{ kind: string; title: string; detail: string; timestamp: number }> = []
+    for (const p of recentProfilesRows.slice(0, 3)) {
+      activityItems.push({
+        kind: 'seller',
+        title: p.status === 'approved' ? 'Seller approved' : 'New seller registered',
+        detail: `${p.seller_name} (${p.status})`,
+        timestamp: p.created_at ? new Date(p.created_at).getTime() : 0,
+      })
+    }
+    for (const s of recentSalesRows.slice(0, 4)) {
+      activityItems.push({
+        kind: s.payout_status === 'paid' ? 'payout' : 'order',
+        title: s.payout_status === 'paid' ? 'Seller payout processed' : 'New product order',
+        detail: `${s.order_id} · ${s.seller_name}`,
+        timestamp: s.order_date ? new Date(s.order_date).getTime() : 0,
+      })
+    }
+    for (const b of recentBookingsRows.slice(0, 3)) {
+      activityItems.push({
+        kind: 'booking',
+        title: `Service booking ${String(b.status || 'PENDING').toLowerCase()}`,
+        detail: `${b.booking_code} · ${b.buyer_name}`,
+        timestamp: b.created_at ? new Date(b.created_at).getTime() : 0,
+      })
+    }
+
+    const recentActivity = activityItems
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 5)
+
+    res.json({
+      period: rawPeriod,
+      kpis: {
+        gmv: currentTotalGmv,
+        gmvChange: pctChange(currentTotalGmv, prevTotalGmv),
+        commission: currentCommission,
+        commissionChange: pctChange(currentCommission, prevCommission),
+        totalTransactions,
+        transactionsChange: pctChange(totalTransactions, prevTransactions),
+        activeSellers: Number(sellerCounts.active_sellers || 0),
+        newSellers: Number(sellerCounts.new_sellers_period || 0),
+      },
+      secondary: {
+        productOrders: productOrdersCount,
+        productOrdersChange: pctChange(productOrdersCount, prevProductOrdersCount),
+        serviceBookings: serviceBookingsCount,
+        serviceBookingsChange: pctChange(serviceBookingsCount, prevServiceBookingsCount),
+        sellerEarnings,
+        refunds: currentRefunds,
+      },
+      monthlyRevenue,
+      revenueBreakdown: {
+        totalGmv: totalBreakdown,
+        productRevenue: currentProductRevenue,
+        serviceRevenue: currentServiceRevenue,
+        productPercent,
+        servicePercent,
+      },
+      pendingActions: {
+        sellerApplications: Number(pendingCounts.seller_applications || 0),
+        productApprovals: Number(pendingCounts.product_approvals || 0),
+        serviceApprovals: Number(pendingCounts.service_approvals || 0),
+        pendingPayouts: Number(pendingCounts.pending_payouts || 0),
+        openDisputes: Number(supportCounts.open_disputes || 0),
+      },
+      topSellers,
+      recentActivity,
+      recentTransactions,
+    })
+  } catch (err) {
+    console.error('Error loading admin dashboard:', err)
+    res.status(500).json({ message: 'Database error loading dashboard' })
+  }
+})
+
+app.get('/api/seller/dashboard', async (req: Request, res: Response) => {
+  const auth = await requireSellerOrAdmin(req, res)
+  if (!auth) return
+
+  const sellerId =
+    auth.role === 'admin' && req.query.sellerId && Number.isFinite(Number(req.query.sellerId))
+      ? Number(req.query.sellerId)
+      : auth.id
+
+  try {
+    await ensureServiceTables()
+
+    const rawPeriod = String(req.query.period || '30d').toLowerCase()
+    const now = new Date()
+    let periodStart = new Date(now)
+    let prevStart = new Date(now)
+
+    if (rawPeriod === '7d') {
+      periodStart.setDate(now.getDate() - 7)
+      prevStart.setDate(now.getDate() - 14)
+    } else if (rawPeriod === '90d') {
+      periodStart.setDate(now.getDate() - 90)
+      prevStart.setDate(now.getDate() - 180)
+    } else if (rawPeriod === 'year') {
+      periodStart = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0)
+      prevStart = new Date(now.getFullYear() - 1, 0, 1, 0, 0, 0, 0)
+    } else {
+      periodStart.setDate(now.getDate() - 30)
+      prevStart.setDate(now.getDate() - 60)
+    }
+
+    const toSqlDate = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ')
+    const periodStartSql = toSqlDate(periodStart)
+    const prevStartSql = toSqlDate(prevStart)
+
+    const pctChange = (currentVal: number, previousVal: number) => {
+      if (previousVal <= 0) return currentVal > 0 ? 100 : 0
+      return roundToTwo(((currentVal - previousVal) / previousVal) * 100)
+    }
+
+    const [
+      [salesPeriodRows],
+      [salesPrevRows],
+      [bookingsPeriodRows],
+      [bookingsPrevRows],
+      [orderBreakdownRows],
+      [bookingBreakdownRows],
+      [lowStockRows],
+      [upcomingRows],
+      [recentSalesRows],
+      [recentBookingRows],
+    ] = await Promise.all([
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS order_count,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS gmv,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.commission_amount ELSE 0 END), 0) AS commission,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN COALESCE(st.total_tax, s.tax_amount, 0) ELSE 0 END), 0) AS tax
+        FROM sales s
+        LEFT JOIN (
+          SELECT sale_id, COALESCE(SUM(tax_amount), 0) AS total_tax
+          FROM sale_items
+          GROUP BY sale_id
+        ) st ON st.sale_id = s.id
+        WHERE s.seller_id = ? AND s.order_date >= ?`,
+        [sellerId, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS order_count,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.grand_total ELSE 0 END), 0) AS gmv,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN s.commission_amount ELSE 0 END), 0) AS commission,
+          COALESCE(SUM(CASE WHEN LOWER(COALESCE(s.order_status, '')) NOT IN ('refunded', 'cancelled', 'canceled') THEN COALESCE(st.total_tax, s.tax_amount, 0) ELSE 0 END), 0) AS tax
+        FROM sales s
+        LEFT JOIN (
+          SELECT sale_id, COALESCE(SUM(tax_amount), 0) AS total_tax
+          FROM sale_items
+          GROUP BY sale_id
+        ) st ON st.sale_id = s.id
+        WHERE s.seller_id = ? AND s.order_date >= ? AND s.order_date < ?`,
+        [sellerId, prevStartSql, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS booking_count,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') THEN price ELSE 0 END), 0) AS total_price,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NULL THEN price ELSE 0 END), 0) AS standalone_price,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NOT NULL THEN price ELSE 0 END), 0) AS linked_price
+        FROM service_bookings
+        WHERE seller_id = ? AND created_at >= ?`,
+        [sellerId, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(*) AS booking_count,
+          COALESCE(SUM(CASE WHEN status NOT IN ('CANCELLED', 'REJECTED') AND sale_id IS NULL THEN price ELSE 0 END), 0) AS standalone_price
+        FROM service_bookings
+        WHERE seller_id = ? AND created_at >= ? AND created_at < ?`,
+        [sellerId, prevStartSql, periodStartSql],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(CASE WHEN LOWER(COALESCE(order_status, 'pending')) IN ('pending', 'processing', 'new', 'paid') THEN 1 END) AS to_process,
+          COUNT(CASE WHEN LOWER(COALESCE(order_status, '')) IN ('shipped', 'in_transit', 'dispatched') THEN 1 END) AS shipped,
+          COUNT(CASE WHEN LOWER(COALESCE(order_status, '')) IN ('delivered', 'completed') THEN 1 END) AS completed
+        FROM sales
+        WHERE seller_id = ?`,
+        [sellerId],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          COUNT(CASE WHEN status IN ('PENDING', 'RESCHEDULE REQUESTED') THEN 1 END) AS to_confirm,
+          COUNT(CASE WHEN status = 'CONFIRMED' AND booking_date >= CURDATE() THEN 1 END) AS upcoming,
+          COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) AS completed
+        FROM service_bookings
+        WHERE seller_id = ?`,
+        [sellerId],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS low_stock_count
+        FROM (
+          SELECT p.id
+          FROM products p
+          INNER JOIN product_variants pv ON pv.product_id = p.id
+          WHERE p.seller_id = ?
+            AND LOWER(COALESCE(pv.type, '')) != 'digital'
+          GROUP BY p.id
+          HAVING SUM(COALESCE(pv.stock_quantity, 0)) <= 5
+        ) low_stock`,
+        [sellerId],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          sb.id,
+          sb.booking_code,
+          sb.buyer_name,
+          sb.booking_date,
+          sb.start_time,
+          sb.end_time,
+          sb.status,
+          COALESCE(sv.name, 'Service') AS service_name
+        FROM service_bookings sb
+        LEFT JOIN services sv ON sv.id = sb.service_id
+        WHERE sb.seller_id = ?
+          AND sb.booking_date >= CURDATE()
+          AND sb.status IN ('PENDING', 'CONFIRMED', 'RESCHEDULE REQUESTED')
+        ORDER BY sb.booking_date ASC, sb.start_time ASC
+        LIMIT 5`,
+        [sellerId],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          s.id,
+          s.order_id,
+          s.order_date,
+          s.order_status,
+          s.grand_total,
+          COALESCE(c.name, 'Customer') AS customer_name,
+          COALESCE((
+            SELECT GROUP_CONCAT(si.product_name SEPARATOR ', ')
+            FROM sale_items si
+            WHERE si.sale_id = s.id AND si.product_type = 'item'
+          ), 'Order items') AS item_summary,
+          CASE WHEN EXISTS (SELECT 1 FROM service_bookings sb WHERE sb.sale_id = s.id) THEN 'Service' ELSE 'Product' END AS tx_type
+        FROM sales s
+        LEFT JOIN customers c ON c.id = s.customer_id
+        WHERE s.seller_id = ?
+        ORDER BY s.order_date DESC
+        LIMIT 20`,
+        [sellerId],
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          sb.id,
+          sb.booking_code,
+          sb.sale_id,
+          sb.price,
+          sb.buyer_name,
+          sb.status,
+          sb.created_at,
+          COALESCE(sv.name, 'Service') AS service_name
+        FROM service_bookings sb
+        LEFT JOIN services sv ON sv.id = sb.service_id
+        WHERE sb.seller_id = ?
+        ORDER BY sb.created_at DESC
+        LIMIT 15`,
+        [sellerId],
+      ),
+    ])
+
+    const salesPeriod = salesPeriodRows[0] || {}
+    const salesPrev = salesPrevRows[0] || {}
+    const bookingsPeriod = bookingsPeriodRows[0] || {}
+    const bookingsPrev = bookingsPrevRows[0] || {}
+    const orderBreakdown = orderBreakdownRows[0] || {}
+    const bookingBreakdown = bookingBreakdownRows[0] || {}
+    const lowStock = lowStockRows[0] || {}
+
+    const salesGmv = Number(salesPeriod.gmv || 0)
+    const standaloneService = Number(bookingsPeriod.standalone_price || 0)
+    const linkedService = Number(bookingsPeriod.linked_price || 0)
+    const serviceSales = roundToTwo(Number(bookingsPeriod.total_price || 0))
+    const totalSales = roundToTwo(salesGmv + standaloneService)
+    const productSales = roundToTwo(Math.max(0, salesGmv - linkedService))
+
+    const prevTotalSales = roundToTwo(Number(salesPrev.gmv || 0) + Number(bookingsPrev.standalone_price || 0))
+    const commission = roundToTwo(Number(salesPeriod.commission || 0))
+    const tax = roundToTwo(Number(salesPeriod.tax || 0))
+    const netEarnings = roundToTwo(Math.max(0, totalSales - commission - tax))
+
+    const prevNetEarnings = roundToTwo(
+      Math.max(
+        0,
+        prevTotalSales - Number(salesPrev.commission || 0) - Number(salesPrev.tax || 0),
+      ),
+    )
+
+    const productOrdersCount = Number(salesPeriod.order_count || 0)
+    const prevProductOrdersCount = Number(salesPrev.order_count || 0)
+    const serviceBookingsCount = Number(bookingsPeriod.booking_count || 0)
+    const prevServiceBookingsCount = Number(bookingsPrev.booking_count || 0)
+
+    const breakdownTotal = productSales + serviceSales
+    const productPercent = breakdownTotal > 0 ? roundToTwo((productSales / breakdownTotal) * 100) : 0
+    const servicePercent = breakdownTotal > 0 ? roundToTwo(100 - productPercent) : 0
+
+    const normalizeStatus = (raw: string) => {
+      const s = String(raw || '').toLowerCase()
+      if (s === 'completed') return 'Completed'
+      if (s === 'delivered') return 'Delivered'
+      if (s === 'shipped' || s === 'in_transit' || s === 'dispatched') return 'Shipped'
+      if (s === 'confirmed' || s === 'paid') return 'Confirmed'
+      if (s === 'processing') return 'Processing'
+      if (s === 'cancelled' || s === 'canceled' || s === 'rejected' || s === 'refunded') return 'Cancelled'
+      return 'Pending'
+    }
+
+    const computeDurationLabel = (startTime?: string, endTime?: string) => {
+      if (!startTime || !endTime) return '-'
+      const [sh, sm] = String(startTime).split(':').map(Number)
+      const [eh, em] = String(endTime).split(':').map(Number)
+      if (!Number.isFinite(sh) || !Number.isFinite(sm) || !Number.isFinite(eh) || !Number.isFinite(em)) {
+        return `${startTime} - ${endTime}`
+      }
+      const mins = eh * 60 + em - (sh * 60 + sm)
+      return mins > 0 ? `${mins} min` : `${startTime} - ${endTime}`
+    }
+
+    const upcomingBookings = upcomingRows.map((row) => ({
+      id: Number(row.id),
+      bookingCode: String(row.booking_code || ''),
+      customer: String(row.buyer_name || 'Customer'),
+      service: String(row.service_name || 'Service'),
+      date: row.booking_date
+        ? `${new Date(row.booking_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}, ${row.start_time || ''}`
+        : '-',
+      duration: computeDurationLabel(row.start_time, row.end_time),
+      status: normalizeStatus(row.status),
+    }))
+
+    const recentProductOrders = recentSalesRows
+      .filter((r) => r.tx_type === 'Product')
+      .slice(0, 2)
+      .map((row) => ({
+        id: String(row.order_id || `#ORD-${row.id}`),
+        item: String(row.item_summary || 'Order items'),
+        amount: roundToTwo(Number(row.grand_total || 0)),
+        status: normalizeStatus(row.order_status),
+      }))
+
+    const txFromSales = recentSalesRows.map((row) => ({
+      id: String(row.order_id || `#ORD-${row.id}`),
+      customer: String(row.customer_name || 'Customer'),
+      item: String(row.item_summary || 'Order items'),
+      type: String(row.tx_type || 'Product'),
+      rawDate: row.order_date ? new Date(row.order_date).getTime() : 0,
+      date: row.order_date ? new Date(row.order_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '-',
+      amount: roundToTwo(Number(row.grand_total || 0)),
+      status: normalizeStatus(row.order_status),
+    }))
+
+    const txFromStandaloneBookings = recentBookingRows
+      .filter((b) => !b.sale_id)
+      .map((row) => ({
+        id: String(row.booking_code || `#BKG-${row.id}`),
+        customer: String(row.buyer_name || 'Customer'),
+        item: String(row.service_name || 'Service'),
+        type: 'Service',
+        rawDate: row.created_at ? new Date(row.created_at).getTime() : 0,
+        date: row.created_at ? new Date(row.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '-',
+        amount: roundToTwo(Number(row.price || 0)),
+        status: normalizeStatus(row.status),
+      }))
+
+    const transactions = [...txFromSales, ...txFromStandaloneBookings]
+      .sort((a, b) => b.rawDate - a.rawDate)
+      .slice(0, 25)
+
+    res.json({
+      period: rawPeriod,
+      metrics: {
+        totalSales,
+        totalSalesChange: pctChange(totalSales, prevTotalSales),
+        netEarnings,
+        netEarningsChange: pctChange(netEarnings, prevNetEarnings),
+        productOrders: productOrdersCount,
+        productOrdersChange: pctChange(productOrdersCount, prevProductOrdersCount),
+        serviceBookings: serviceBookingsCount,
+        serviceBookingsChange: pctChange(serviceBookingsCount, prevServiceBookingsCount),
+      },
+      earnings: {
+        grossSales: totalSales,
+        commission,
+        netEarnings,
+        productSales,
+        serviceSales,
+        productPercent,
+        servicePercent,
+      },
+      tasks: {
+        ordersToProcess: Number(orderBreakdown.to_process || 0),
+        bookingsToConfirm: Number(bookingBreakdown.to_confirm || 0),
+        lowStockProducts: Number(lowStock.low_stock_count || 0),
+      },
+      orderSummary: {
+        toProcess: Number(orderBreakdown.to_process || 0),
+        shipped: Number(orderBreakdown.shipped || 0),
+        completed: Number(orderBreakdown.completed || 0),
+      },
+      bookingSummary: {
+        toConfirm: Number(bookingBreakdown.to_confirm || 0),
+        upcoming: Number(bookingBreakdown.upcoming || 0),
+        completed: Number(bookingBreakdown.completed || 0),
+      },
+      recentProductOrders,
+      upcomingBookings,
+      transactions,
+    })
+  } catch (err) {
+    console.error('Error loading seller dashboard:', err)
+    res.status(500).json({ message: 'Database error loading seller dashboard' })
+  }
+})
+
+app.get('/api/admin/customers', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  try {
+    await Promise.all([ensureCustomersMarketingColumn(), ensureServiceTables()])
+
+    const [[customerRows], [salesRows], [bookingRows]] = await Promise.all([
+      db.query<RowDataPacket[]>(
+        `SELECT
+          c.id,
+          c.name,
+          c.email,
+          c.phone,
+          c.shipping_street,
+          c.shipping_city,
+          c.shipping_state,
+          c.shipping_zip,
+          c.shipping_country,
+          COALESCE(c.subscribe_promotions, 1) AS subscribe_promotions,
+          COALESCE(NULLIF(TRIM(c.status), ''), 'Active') AS status,
+          c.created_at
+        FROM customers c
+        ORDER BY c.id DESC`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          s.id,
+          s.order_id,
+          s.customer_id,
+          s.order_date,
+          s.order_status,
+          s.grand_total,
+          COALESCE(
+            NULLIF(TRIM(sp.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(sp.first_name, ''), ' ', COALESCE(sp.last_name, ''))), ''),
+            u.email,
+            'Seller'
+          ) AS seller_name,
+          COALESCE((
+            SELECT GROUP_CONCAT(si.product_name SEPARATOR ', ')
+            FROM sale_items si
+            WHERE si.sale_id = s.id AND si.product_type = 'item'
+          ), 'Order items') AS item_summary,
+          CASE WHEN EXISTS (SELECT 1 FROM service_bookings sb WHERE sb.sale_id = s.id) THEN 'Service' ELSE 'Product' END AS tx_type
+        FROM sales s
+        LEFT JOIN users u ON u.id = s.seller_id
+        LEFT JOIN profiles sp ON sp.id = (
+          SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+        )
+        ORDER BY s.order_date DESC`,
+      ),
+      db.query<RowDataPacket[]>(
+        `SELECT
+          sb.id,
+          sb.booking_code,
+          sb.sale_id,
+          sb.buyer_email,
+          sb.price,
+          sb.status,
+          sb.created_at,
+          COALESCE(sv.name, 'Service') AS service_name,
+          COALESCE(
+            NULLIF(TRIM(sp.company_name), ''),
+            NULLIF(TRIM(CONCAT(COALESCE(sp.first_name, ''), ' ', COALESCE(sp.last_name, ''))), ''),
+            u.email,
+            'Seller'
+          ) AS seller_name
+        FROM service_bookings sb
+        LEFT JOIN services sv ON sv.id = sb.service_id
+        LEFT JOIN users u ON u.id = sb.seller_id
+        LEFT JOIN profiles sp ON sp.id = (
+          SELECT p2.id FROM profiles p2 WHERE p2.user_id = sb.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+        )
+        ORDER BY sb.created_at DESC`,
+      ),
+    ])
+
+    const salesByCustomer = new Map<number, RowDataPacket[]>()
+    for (const s of salesRows) {
+      const cid = Number(s.customer_id)
+      if (!Number.isFinite(cid)) continue
+      const list = salesByCustomer.get(cid) || []
+      list.push(s)
+      salesByCustomer.set(cid, list)
+    }
+
+    const bookingsByEmail = new Map<string, RowDataPacket[]>()
+    for (const b of bookingRows) {
+      const emailKey = String(b.buyer_email || '').trim().toLowerCase()
+      if (!emailKey) continue
+      const list = bookingsByEmail.get(emailKey) || []
+      list.push(b)
+      bookingsByEmail.set(emailKey, list)
+    }
+
+    const normalizeTxStatus = (raw: string) => {
+      const s = String(raw || '').toLowerCase()
+      if (s === 'delivered') return 'Delivered'
+      if (s === 'completed') return 'Completed'
+      if (s === 'confirmed' || s === 'paid') return 'Confirmed'
+      if (s === 'shipped' || s === 'in_transit' || s === 'dispatched') return 'Shipped'
+      if (s === 'refunded' || s === 'cancelled' || s === 'canceled' || s === 'rejected') return 'Refunded'
+      return 'Processing'
+    }
+
+    const formatShortDate = (val: any) => {
+      if (!val) return '-'
+      const d = new Date(val)
+      if (Number.isNaN(d.getTime())) return '-'
+      return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+    }
+
+    const now = new Date()
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+    let newCustomersThisMonth = 0
+
+    const customers = customerRows.map((c) => {
+      const cid = Number(c.id)
+      const emailKey = String(c.email || '').trim().toLowerCase()
+      const cSales = salesByCustomer.get(cid) || []
+      const cBookings = bookingsByEmail.get(emailKey) || []
+
+      let spent = 0
+      let payments = 0
+      let pending = 0
+      let refunds = 0
+      let refundedAmount = 0
+
+      for (const s of cSales) {
+        const amt = Number(s.grand_total || 0)
+        const st = normalizeTxStatus(s.order_status)
+        if (st === 'Refunded') {
+          refunds += 1
+          refundedAmount += amt
+        } else {
+          spent += amt
+          if (st === 'Delivered' || st === 'Completed' || st === 'Confirmed' || st === 'Shipped') {
+            payments += amt
+          } else {
+            pending += amt
+          }
+        }
+      }
+
+      for (const b of cBookings) {
+        if (b.sale_id) continue
+        const amt = Number(b.price || 0)
+        const st = normalizeTxStatus(b.status)
+        if (st === 'Refunded') {
+          refunds += 1
+          refundedAmount += amt
+        } else {
+          spent += amt
+          if (st === 'Completed' || st === 'Confirmed') {
+            payments += amt
+          } else {
+            pending += amt
+          }
+        }
+      }
+
+      const recentFromSales = cSales.map((s) => ({
+        id: String(s.order_id || `#ORD-${s.id}`),
+        name: String(s.item_summary || 'Order items'),
+        seller: String(s.seller_name || 'Seller'),
+        rawDate: s.order_date ? new Date(s.order_date).getTime() : 0,
+        date: formatShortDate(s.order_date),
+        amount: roundToTwo(Number(s.grand_total || 0)),
+        type: String(s.tx_type || 'Product'),
+        status: normalizeTxStatus(s.order_status),
+      }))
+
+      const recentFromBookings = cBookings
+        .filter((b) => !b.sale_id)
+        .map((b) => ({
+          id: String(b.booking_code || `#BKG-${b.id}`),
+          name: String(b.service_name || 'Service'),
+          seller: String(b.seller_name || 'Seller'),
+          rawDate: b.created_at ? new Date(b.created_at).getTime() : 0,
+          date: formatShortDate(b.created_at),
+          amount: roundToTwo(Number(b.price || 0)),
+          type: 'Service',
+          status: normalizeTxStatus(b.status),
+        }))
+
+      const recent = [...recentFromSales, ...recentFromBookings]
+        .sort((a, b) => b.rawDate - a.rawDate)
+        .slice(0, 20)
+
+      const earliestSaleTs = cSales.reduce((min, s) => {
+        const ts = s.order_date ? new Date(s.order_date).getTime() : 0
+        return ts && (!min || ts < min) ? ts : min
+      }, 0)
+      const createdTs = c.created_at ? new Date(c.created_at).getTime() : earliestSaleTs
+      if (createdTs && createdTs >= monthStart) {
+        newCustomersThisMonth += 1
+      }
+
+      const latestActivityTs = Math.max(recent[0]?.rawDate || 0, createdTs || 0)
+
+      const activity: string[] = []
+      for (const item of recent.slice(0, 4)) {
+        activity.push(
+          item.type === 'Service'
+            ? `Booked service: ${item.name} (${item.status})`
+            : `Placed order ${item.id}: ${item.name} (${item.status})`,
+        )
+      }
+      if (activity.length === 0) {
+        activity.push('Customer profile created')
+      }
+
+      const locationParts = [c.shipping_city, c.shipping_country].filter(Boolean)
+      const addressParts = [c.shipping_street, c.shipping_zip, c.shipping_city, c.shipping_country].filter(Boolean)
+
+      const productOrderCount = cSales.filter((s) => s.tx_type !== 'Service').length
+      const serviceBookingCount = cBookings.length
+
+      return {
+        numericId: cid,
+        id: `CUS-${cid}`,
+        name: String(c.name || 'Customer'),
+        email: String(c.email || ''),
+        phone: String(c.phone || '-'),
+        location: locationParts.join(', ') || '-',
+        address: addressParts.join(', ') || '-',
+        subscribePromotions: Boolean(c.subscribe_promotions),
+        joined: createdTs ? formatShortDate(createdTs) : '-',
+        status: String(c.status || 'Active'),
+        orders: productOrderCount,
+        bookings: serviceBookingCount,
+        spent: roundToTwo(spent),
+        refunds,
+        refundedAmount: roundToTwo(refundedAmount),
+        payments: roundToTwo(payments),
+        pending: roundToTwo(pending),
+        lastActive: latestActivityTs ? formatShortDate(latestActivityTs) : '-',
+        recent,
+        activity,
+      }
+    })
+
+    res.json({
+      customers,
+      summary: {
+        totalCustomers: customers.length,
+        activeCustomers: customers.filter((c) => c.status === 'Active').length,
+        totalSpent: roundToTwo(customers.reduce((sum, c) => sum + c.spent, 0)),
+        newCustomersThisMonth,
+      },
+    })
+  } catch (err) {
+    console.error('Error loading admin customers:', err)
+    res.status(500).json({ message: 'Database error loading customers' })
+  }
+})
+
+app.post('/api/admin/customers/:id/status', async (req: Request, res: Response) => {
+  const auth = await requireAdmin(req, res)
+  if (!auth) return
+
+  const customerId = Number(req.params.id)
+  const nextStatus = String(req.body?.status || '').trim()
+  if (!Number.isFinite(customerId) || customerId <= 0) {
+    return res.status(400).json({ message: 'Invalid customer ID' })
+  }
+  if (!['Active', 'Inactive', 'Suspended'].includes(nextStatus)) {
+    return res.status(400).json({ message: 'Invalid status value' })
+  }
+
+  try {
+    await ensureCustomersMarketingColumn()
+    await db.query('UPDATE customers SET status = ? WHERE id = ?', [nextStatus, customerId])
+    res.json({ id: customerId, status: nextStatus })
+  } catch (err) {
+    console.error('Error updating customer status:', err)
+    res.status(500).json({ message: 'Database error updating customer status' })
+  }
+})
+
 app.get('/api/admin/sellers/:sellerId/profile', async (req: Request, res: Response) => {
   const auth = await requireAdmin(req, res)
   if (!auth) return
@@ -7655,7 +8783,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
   if (!auth) return
 
   try {
-    await Promise.all([ensureSalesPayoutColumns(), ensureSalesPaymentIntentIdColumn()])
+    await Promise.all([ensureSalesPayoutColumns(), ensureSalesPaymentIntentIdColumn(), ensureServiceTables()])
     const runtimeSettings = await getRuntimeSettings()
     const [paymentDateColumnExists, paymentIntentIdColumnExists, payoutReferenceColumnExists] = await Promise.all([
       hasSalesPayoutPaymentDateColumn(),
@@ -7676,6 +8804,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
       `SELECT
         s.id as sale_id,
         s.order_id,
+        s.group_order_id,
         ${paymentIntentIdSelect},
         ${payoutReferenceSelect},
         s.customer_id,
@@ -7716,7 +8845,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
         si.product_id,
         si.product_name,
         si.customization_value,
-        COALESCE(p.type, 'physical') as item_type,
+        CASE WHEN si.product_type = 'item' AND si.product_id IS NULL THEN 'service' ELSE COALESCE(p.type, 'physical') END as item_type,
         p.category as item_category,
         p.main_image_url as item_main_image_url,
         COALESCE(pv.length_cm, pv_fallback.length_cm) as item_length_cm,
@@ -7726,7 +8855,13 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
         si.quantity,
         si.unit_price,
         (si.unit_price * si.quantity) as total_price,
-        si.tax_amount as item_tax_amount
+        si.tax_amount as item_tax_amount,
+        sb.id as service_booking_id,
+        sb.service_id as service_booking_service_id,
+        sb.booking_date as service_booking_date,
+        sb.start_time as service_start_time,
+        sb.end_time as service_end_time,
+        sb.status as service_booking_status
       FROM sales s
       LEFT JOIN (
         SELECT sale_id, COALESCE(SUM(tax_amount), 0) as total_tax
@@ -7743,6 +8878,13 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
         LIMIT 1
       )
       LEFT JOIN bank_accounts ba ON ba.user_id = s.seller_id
+      LEFT JOIN service_bookings sb ON sb.id = (
+        SELECT sb2.id
+        FROM service_bookings sb2
+        WHERE sb2.sale_id = s.id
+        ORDER BY sb2.id ASC
+        LIMIT 1
+      )
       LEFT JOIN sale_items si ON s.id = si.sale_id
       LEFT JOIN products p ON si.product_id = p.id
       LEFT JOIN product_variants pv ON pv.product_id = si.product_id
@@ -7767,6 +8909,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
         ordersMap.set(row.sale_id, {
           id: row.sale_id,
           order_id: row.order_id,
+          group_order_id: row.group_order_id || null,
           payment_intent_id: row.payment_intent_id || null,
           payout_reference: row.payout_reference || null,
           customer_id: row.customer_id,
@@ -7776,6 +8919,11 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
           order_status: row.order_status,
           payment_status: row.payment_status,
           shipping_status: row.shipping_status,
+          service_booking_id: row.service_booking_id || null,
+          service_booking_date: row.service_booking_date ? formatIsoDate(row.service_booking_date) : null,
+          service_start_time: row.service_start_time || null,
+          service_end_time: row.service_end_time || null,
+          service_booking_status: row.service_booking_status || null,
           tax_amount: Number(row.tax_amount || 0),
           shipping_fee: Number(row.shipping_fee || 0),
           discount_amount: Number(row.discount_amount || 0),
@@ -7815,6 +8963,7 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
           id: row.item_id,
           product_type: row.product_type,
           product_id: row.product_id,
+          service_id: row.item_type === 'service' ? (row.service_booking_service_id || null) : null,
           product_name: row.product_name,
           customization_value: row.customization_value || null,
           sku: null,
@@ -8113,7 +9262,14 @@ app.post('/api/admin/orders/message-seller', async (req: Request, res: Response)
     : subject
 
   try {
-    await sendEmail(sellerEmail, subjectWithPrefix, body)
+    const companyInfo = await getPlatformCompanyEmailInfo()
+    const html = createCustomMessageEmailHtml({
+      company: companyInfo,
+      heading: subjectWithPrefix,
+      bodyText: body,
+      badgeLabel: orderId ? `Order ${orderId}` : 'Order Message',
+    })
+    await sendEmail(sellerEmail, subjectWithPrefix, html)
 
     return res.status(200).json({
       message: 'Seller email sent successfully',
@@ -8698,7 +9854,7 @@ app.post('/api/admin/database/reset', async (req: Request, res: Response) => {
     console.log('[DB Reset] Database cleared (app_settings preserved)')
     return res.json({ success: true, message: 'Database reset complete. Admin account and app settings preserved.' })
   } catch (error) {
-    await db.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => {})
+    await db.query('SET FOREIGN_KEY_CHECKS = 1').catch(() => { })
     console.error('[DB Reset] Failed:', error)
     return res.status(500).json({ message: 'Database reset failed.' })
   }
@@ -8739,12 +9895,18 @@ app.post('/api/admin/sellers/bulk-email', async (req: Request, res: Response) =>
     const adminEmail = companyInfo.company_email
 
     const allRecipients = Array.from(new Set([...sellerEmails, ...(adminEmail ? [adminEmail] : [])]))
+    const html = createCustomMessageEmailHtml({
+      company: companyInfo,
+      heading: subject,
+      bodyText: body,
+      badgeLabel: 'Seller Notice',
+    })
 
     let sent = 0
     let failed = 0
     for (const email of allRecipients) {
       try {
-        await sendEmail(email, subject, body)
+        await sendEmail(email, subject, html)
         sent++
       } catch (err) {
         console.error('[bulk-email] Failed to send message:', err)
@@ -9265,11 +10427,16 @@ app.post('/api/products', productUpload, async (req: Request, res: Response) => 
     // Notify admin itself ("seller communication") when a new product is added
     try {
       const adminEmails = await getAdminEmails()
+      const companyInfo = await getPlatformCompanyEmailInfo()
       const subject = `New Product Added: ${name}`
-      const html = `<p>A new product has been added by seller <strong>${sellerEmail}</strong> (ID: ${auth.id}).</p>
-<p>Product Name: <strong>${name}</strong></p>
-<p>Product ID: <strong>${result.insertId}</strong></p>
-<p>Approval Status: <strong>${sellerApprovalStatus}</strong></p>`
+      const html = createAdminNewProductEmailHtml({
+        company: companyInfo,
+        productId: result.insertId,
+        productName: name,
+        sellerEmail,
+        sellerId: auth.id,
+        approvalStatus: sellerApprovalStatus,
+      })
       for (const adminEmail of adminEmails) {
         await sendEmail(adminEmail, subject, html, { purpose: 'sellers' })
       }
@@ -9769,6 +10936,13 @@ app.get('/api/products', async (req: Request, res: Response) => {
       `SELECT
         p.id,
         p.seller_id,
+        u.email AS seller_email,
+        COALESCE(
+          NULLIF(MAX(prof.display_name), ''),
+          NULLIF(MAX(prof.company_name), ''),
+          NULLIF(MAX(prof.first_name), ''),
+          SUBSTRING_INDEX(u.email, '@', 1)
+        ) AS seller_name,
         p.name,
         ${skuSelect},
         p.subtitle,
@@ -9783,6 +10957,7 @@ app.get('/api/products', async (req: Request, res: Response) => {
         ${isPromotedSelect},
         p.main_image_url,
         p.status,
+        p.is_promoted,
         p.created_at,
         p.updated_at,
         p.seo_meta,
@@ -9795,6 +10970,7 @@ app.get('/api/products', async (req: Request, res: Response) => {
       FROM products p
       LEFT JOIN product_images pi ON p.id = pi.product_id
       LEFT JOIN users u ON p.seller_id = u.id
+      LEFT JOIN profiles prof ON p.seller_id = prof.user_id
       ${whereClause}
       GROUP BY p.id
       ORDER BY p.created_at DESC`,
@@ -9882,10 +11058,11 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
     await ensureProductsShippingColumns()
     const pageRaw = Number(req.query.page)
     const limitRaw = Number(req.query.limit)
+    const offsetRaw = Number(req.query.offset)
     const sellerIdRaw = Number(req.query.seller_id)
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 60) : 24
-    const offset = (page - 1) * limit
+    const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : (page - 1) * limit
     const sellerFilterSql = Number.isFinite(sellerIdRaw) && sellerIdRaw > 0 ? ' AND p.seller_id = ?' : ''
     const sellerFilterParams = Number.isFinite(sellerIdRaw) && sellerIdRaw > 0 ? [Math.floor(sellerIdRaw)] : []
 
@@ -9898,7 +11075,7 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
        )
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'${sellerFilterSql}`,
+        AND COALESCE(sp.is_blocked, 0) = 0${sellerFilterSql}`,
       sellerFilterParams,
     )
     const total = Number(countRows[0]?.total || 0)
@@ -9917,6 +11094,7 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
         p.tax_class,
         p.main_image_url,
         p.status,
+        p.is_promoted,
         p.created_at,
         p.updated_at,
         p.shipping_fee,
@@ -9946,10 +11124,10 @@ app.get('/api/public/products', async (req: Request, res: Response) => {
       )
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
         ${sellerFilterSql}
       GROUP BY p.id
-      ORDER BY p.created_at DESC
+      ORDER BY p.is_promoted DESC, p.created_at DESC
       LIMIT ? OFFSET ?`,
       [...sellerFilterParams, limit, offset],
     )
@@ -10062,7 +11240,7 @@ app.get('/api/public/sellers/search', async (req: Request, res: Response) => {
       INNER JOIN profiles sp ON sp.user_id = u.id
       INNER JOIN products p ON p.seller_id = u.id
       WHERE u.role = 'seller'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
         AND (
           COALESCE(NULLIF(TRIM(sp.display_name), ''), '') LIKE ?
           OR COALESCE(NULLIF(TRIM(sp.company_name), ''), '') LIKE ?
@@ -10119,7 +11297,7 @@ app.get('/api/public/sellers/:id', async (req: Request, res: Response) => {
       INNER JOIN profiles sp ON sp.user_id = u.id
       WHERE u.id = ?
         AND u.role = 'seller'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
       GROUP BY u.id
       LIMIT 1`,
       [sellerId],
@@ -10291,6 +11469,7 @@ app.get('/api/public/products/:id', async (req: Request, res: Response) => {
         p.tax_class,
         p.main_image_url,
         p.status,
+        p.is_promoted,
         p.created_at,
         p.updated_at,
         p.shipping_fee,
@@ -10321,7 +11500,7 @@ app.get('/api/public/products/:id', async (req: Request, res: Response) => {
       WHERE p.id = ?
         AND p.status = 'active'
         AND p.approval_status = 'approved'
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
       GROUP BY p.id
       LIMIT 1`,
       [productId],
@@ -10421,7 +11600,7 @@ app.get('/api/public/products/promoted', async (req: Request, res: Response) => 
       WHERE p.status = 'active'
         AND p.approval_status = 'approved'
         AND p.is_promoted = TRUE
-        AND COALESCE(sp.status, 'pending') = 'verified'
+        AND COALESCE(sp.is_blocked, 0) = 0
       GROUP BY p.id
       ORDER BY p.updated_at DESC
       LIMIT 8`,
@@ -10556,21 +11735,21 @@ app.post('/api/public/delivery-review/:token', async (req: Request, res: Respons
 
   const messages = language === 'sv'
     ? {
-        invalidLink: 'Ogiltig omdömeslänk.',
-        notFound: 'Omdömesbegäran hittades inte.',
-        alreadySubmitted: 'Det här omdömet har redan skickats in.',
-        invalidRating: 'Välj ett betyg mellan 1 och 5 stjärnor.',
-        invalidComment: 'Skriv en kommentar innan du skickar.',
-        success: 'Tack! Ditt omdöme har skickats.',
-      }
+      invalidLink: 'Ogiltig omdömeslänk.',
+      notFound: 'Omdömesbegäran hittades inte.',
+      alreadySubmitted: 'Det här omdömet har redan skickats in.',
+      invalidRating: 'Välj ett betyg mellan 1 och 5 stjärnor.',
+      invalidComment: 'Skriv en kommentar innan du skickar.',
+      success: 'Tack! Ditt omdöme har skickats.',
+    }
     : {
-        invalidLink: 'Invalid review link.',
-        notFound: 'Review request not found.',
-        alreadySubmitted: 'This review has already been submitted.',
-        invalidRating: 'Please select a rating between 1 and 5 stars.',
-        invalidComment: 'Please write a comment before submitting.',
-        success: 'Thank you! Your review has been submitted.',
-      }
+      invalidLink: 'Invalid review link.',
+      notFound: 'Review request not found.',
+      alreadySubmitted: 'This review has already been submitted.',
+      invalidRating: 'Please select a rating between 1 and 5 stars.',
+      invalidComment: 'Please write a comment before submitting.',
+      success: 'Thank you! Your review has been submitted.',
+    }
 
   if (!token) {
     return res.status(400).json({ message: messages.invalidLink })
@@ -10814,6 +11993,7 @@ app.get('/api/products/:id', async (req: Request, res: Response) => {
         p.approval_status,
         p.main_image_url,
         p.status,
+        p.is_promoted,
         p.created_at,
         p.updated_at,
         p.shipping_fee,
@@ -11022,6 +12202,30 @@ app.get('/api/shipment-fee', async (req: Request, res: Response) => {
   }
 })
 
+let hasCustomersMarketingColumnCache: boolean | null = null
+
+const ensureCustomersMarketingColumn = async () => {
+  try {
+    if (hasCustomersMarketingColumnCache === true) return
+    const [promoCols] = await db.query<RowDataPacket[]>(`SHOW COLUMNS FROM customers LIKE 'subscribe_promotions'`)
+    if (promoCols.length === 0) {
+      await db.query(`ALTER TABLE customers ADD COLUMN subscribe_promotions TINYINT(1) NOT NULL DEFAULT 1`)
+    }
+    const [statusCols] = await db.query<RowDataPacket[]>(`SHOW COLUMNS FROM customers LIKE 'status'`)
+    if (statusCols.length === 0) {
+      await db.query(`ALTER TABLE customers ADD COLUMN status VARCHAR(30) NOT NULL DEFAULT 'Active'`)
+    }
+    const [createdCols] = await db.query<RowDataPacket[]>(`SHOW COLUMNS FROM customers LIKE 'created_at'`)
+    if (createdCols.length === 0) {
+      await db.query(`ALTER TABLE customers ADD COLUMN created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP`)
+    }
+    hasCustomersMarketingColumnCache = true
+  } catch (error) {
+    hasCustomersMarketingColumnCache = null
+    console.error('Failed ensuring customers admin columns:', error)
+  }
+}
+
 // ===== Create/Update Customer =====
 app.post('/api/customers', async (req: Request, res: Response) => {
   const {
@@ -11037,14 +12241,32 @@ app.post('/api/customers', async (req: Request, res: Response) => {
     shipping_city,
     shipping_state,
     shipping_zip,
-    shipping_country
+    shipping_country,
+    subscribe_promotions
   } = req.body
 
   if (!name || !email) {
     return res.status(400).json({ message: 'Name and email are required' })
   }
 
+  const trimmedName = String(name || '').trim()
+  if (!/^[\p{L}\s]+$/u.test(trimmedName)) {
+    return res.status(400).json({ message: 'Full name must contain only alphabets and spaces.', field: 'name' })
+  }
+  const trimmedPhone = String(phone || '').trim()
+  if (trimmedPhone && !/^[0-9+]+$/.test(trimmedPhone)) {
+    return res.status(400).json({ message: 'Phone number must contain only numbers and +.', field: 'phone' })
+  }
+  const trimmedZip = String(shipping_zip || billing_zip || '').trim()
+  if (trimmedZip && !/^[0-9\s]+$/.test(trimmedZip)) {
+    return res.status(400).json({ message: 'Zip code must contain only numbers and spaces.', field: 'shipping_zip' })
+  }
+
+  const subscribePromotionsFlag = subscribe_promotions === undefined ? 1 : subscribe_promotions ? 1 : 0
+
   try {
+    await ensureCustomersMarketingColumn()
+
     const [existing] = await db.query<RowDataPacket[]>(
       'SELECT id FROM customers WHERE email = ?',
       [email]
@@ -11065,7 +12287,8 @@ app.post('/api/customers', async (req: Request, res: Response) => {
           shipping_city = ?,
           shipping_state = ?,
           shipping_zip = ?,
-          shipping_country = ?
+          shipping_country = ?,
+          subscribe_promotions = ?
         WHERE id = ?`,
         [
           name,
@@ -11080,6 +12303,7 @@ app.post('/api/customers', async (req: Request, res: Response) => {
           shipping_state || null,
           shipping_zip || null,
           shipping_country || null,
+          subscribePromotionsFlag,
           existing[0].id
         ]
       )
@@ -11099,6 +12323,7 @@ app.post('/api/customers', async (req: Request, res: Response) => {
         shipping_state,
         shipping_zip,
         shipping_country,
+        subscribe_promotions: Boolean(subscribePromotionsFlag),
       })
     }
 
@@ -11107,8 +12332,9 @@ app.post('/api/customers', async (req: Request, res: Response) => {
       `INSERT INTO customers (
         name, email, phone,
         billing_street, billing_city, billing_state, billing_zip, billing_country,
-        shipping_street, shipping_city, shipping_state, shipping_zip, shipping_country
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        shipping_street, shipping_city, shipping_state, shipping_zip, shipping_country,
+        subscribe_promotions
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name,
         email,
@@ -11122,7 +12348,8 @@ app.post('/api/customers', async (req: Request, res: Response) => {
         shipping_city || null,
         shipping_state || null,
         shipping_zip || null,
-        shipping_country || null
+        shipping_country || null,
+        subscribePromotionsFlag
       ]
     )
 
@@ -11178,11 +12405,173 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     let totalTax = 0
 
     for (const orderProduct of products) {
-      const productId = Number(orderProduct?.product_id)
+      const isServiceItem = orderProduct?.item_kind === 'service' || Number(orderProduct?.service_id) > 0
       const quantity = Number(orderProduct?.quantity)
       const variantIdRaw = orderProduct?.variant_id
       const variantId = variantIdRaw == null ? null : Number(variantIdRaw)
       const customization_value = orderProduct?.customization_value ? String(orderProduct.customization_value).trim() : null
+
+      if (isServiceItem) {
+        await ensureServiceTables()
+        const serviceId = Number(orderProduct?.service_id || orderProduct?.product_id)
+        const bookingDate = orderProduct?.booking_date ? String(orderProduct.booking_date).slice(0, 10) : null
+        const startTime = orderProduct?.start_time ? String(orderProduct.start_time).slice(0, 5) : null
+        const endTime = orderProduct?.end_time ? String(orderProduct.end_time).slice(0, 5) : null
+        const selectedCity = orderProduct?.selected_city ? String(orderProduct.selected_city).trim() : null
+
+        if (!Number.isFinite(serviceId) || serviceId <= 0 || !Number.isFinite(quantity) || quantity <= 0) {
+          return res.status(400).json({ message: 'Invalid service or quantity in order' })
+        }
+
+        let serviceRow: RowDataPacket | null = null
+        if (variantId != null && Number.isFinite(variantId)) {
+          const [selectedServiceRows] = await db.query<RowDataPacket[]>(
+            `SELECT
+               s.id AS service_id,
+               s.seller_id,
+               s.name,
+               s.tax_class,
+               s.is_promoted,
+               s.service_location_type,
+               s.premises_address,
+               s.use_profile_address,
+               sv.id AS variant_id,
+               sv.variant_name,
+               sv.variant_value,
+               sv.sku,
+               sv.price,
+               COALESCE(sv.discount_price, sv.price) AS effective_price,
+               pr.profile_type AS seller_profile_type,
+               pr.company_address,
+               pr.street,
+               pr.zip,
+               pr.city,
+               pr.country,
+               u.email AS seller_email,
+               COALESCE(pr.display_name, pr.company_name, u.email) AS seller_name
+             FROM services s
+             JOIN users u ON u.id = s.seller_id
+             LEFT JOIN service_variants sv ON sv.service_id = s.id AND sv.id = ?
+             LEFT JOIN profiles pr ON pr.user_id = s.seller_id
+               AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
+             WHERE s.id = ? AND s.status = 'active' AND s.approval_status = 'approved'
+             LIMIT 1`,
+            [variantId, serviceId],
+          )
+          serviceRow = selectedServiceRows[0] || null
+        } else {
+          const [defaultServiceRows] = await db.query<RowDataPacket[]>(
+            `SELECT
+               s.id AS service_id,
+               s.seller_id,
+               s.name,
+               s.tax_class,
+               s.is_promoted,
+               s.service_location_type,
+               s.premises_address,
+               s.use_profile_address,
+               sv.id AS variant_id,
+               sv.variant_name,
+               sv.variant_value,
+               sv.sku,
+               sv.price,
+               COALESCE(sv.discount_price, sv.price) AS effective_price,
+               pr.profile_type AS seller_profile_type,
+               pr.company_address,
+               pr.street,
+               pr.zip,
+               pr.city,
+               pr.country,
+               u.email AS seller_email,
+               COALESCE(pr.display_name, pr.company_name, u.email) AS seller_name
+             FROM services s
+             JOIN users u ON u.id = s.seller_id
+             LEFT JOIN service_variants sv ON sv.service_id = s.id
+             LEFT JOIN profiles pr ON pr.user_id = s.seller_id
+               AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
+             WHERE s.id = ? AND s.status = 'active' AND s.approval_status = 'approved'
+             ORDER BY sv.id ASC
+             LIMIT 1`,
+            [serviceId],
+          )
+          serviceRow = defaultServiceRows[0] || null
+        }
+
+        if (!serviceRow) {
+          return res.status(400).json({ message: `Service not found or inactive (service_id: ${serviceId})` })
+        }
+
+        let resolvedEndTime = endTime
+        if (bookingDate && startTime) {
+          const availableSlots = await computeAvailableSlotsForService(serviceId, bookingDate, bookingDate)
+          const matchedSlot = availableSlots.find((sl) => sl.date === bookingDate && sl.start_time === startTime && !sl.is_booked)
+          if (!matchedSlot) {
+            return res.status(409).json({
+              message: `Selected time slot is no longer available for service: ${serviceRow.name} (${bookingDate} ${startTime})`,
+            })
+          }
+          resolvedEndTime = matchedSlot.end_time || endTime
+        }
+
+        const serviceLocationType = String(serviceRow.service_location_type || 'seller_premises').trim()
+        const resolvedPremisesAddress =
+          String(serviceRow.premises_address || '').trim() ||
+          (serviceRow.use_profile_address
+            ? String(
+              serviceRow.company_address ||
+              [serviceRow.street, serviceRow.zip, serviceRow.city, serviceRow.country]
+                .filter(Boolean)
+                .join(', '),
+            ).trim()
+            : '') ||
+          null
+
+        const unitPrice = Number(serviceRow.effective_price || serviceRow.price || 0)
+        const totalPrice = unitPrice * quantity
+        const isPrivateSeller = String(serviceRow.seller_profile_type || '').toLowerCase() === 'private'
+        const taxRate = isPrivateSeller ? 0 : parseTaxRateFromDbValue(serviceRow.tax_class)
+        const taxAmount = calculateTaxOnItem(totalPrice, taxRate)
+
+        grandTotal += totalPrice
+        totalTax += taxAmount
+
+        if (!ordersBySeller[serviceRow.seller_id]) {
+          ordersBySeller[serviceRow.seller_id] = []
+        }
+
+        ordersBySeller[serviceRow.seller_id].push({
+          item_kind: 'service',
+          product_id: null,
+          service_id: serviceRow.service_id,
+          product_name: serviceRow.name,
+          seller_id: serviceRow.seller_id,
+          seller_email: serviceRow.seller_email,
+          seller_name: serviceRow.seller_name,
+          variant_id: serviceRow.variant_id || null,
+          variant_name: serviceRow.variant_name || null,
+          variant_value: serviceRow.variant_value || null,
+          variant_sku: serviceRow.sku || null,
+          type: 'service',
+          file_url: null,
+          quantity,
+          unit_price: unitPrice,
+          total_price: totalPrice,
+          tax_amount: taxAmount,
+          commission_amount: 0,
+          is_private_seller: isPrivateSeller,
+          is_promoted: Boolean(serviceRow.is_promoted),
+          customization_value,
+          booking_date: bookingDate,
+          start_time: startTime,
+          end_time: resolvedEndTime,
+          selected_city: selectedCity,
+          service_location_type: serviceLocationType,
+          premises_address: resolvedPremisesAddress,
+        })
+        continue
+      }
+
+      const productId = Number(orderProduct?.product_id)
 
       if (!Number.isFinite(productId) || productId <= 0 || !Number.isFinite(quantity) || quantity <= 0) {
         return res.status(400).json({ message: 'Invalid product or quantity in order' })
@@ -11197,6 +12586,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
              p.seller_id,
              p.name,
              p.tax_class,
+             p.is_promoted,
              pv.id AS variant_id,
              pv.variant_name,
              pv.variant_value,
@@ -11223,6 +12613,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
              p.seller_id,
              p.name,
              p.tax_class,
+             p.is_promoted,
              pv.id AS variant_id,
              pv.variant_name,
              pv.variant_value,
@@ -11288,6 +12679,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         tax_amount: taxAmount,
         commission_amount: 0,
         is_private_seller: isPrivateSeller,
+        is_promoted: Boolean(variant.is_promoted),
         customization_value,
       })
     }
@@ -11297,6 +12689,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       `SELECT
          name,
          email,
+         phone,
          shipping_street,
          shipping_city,
          shipping_state,
@@ -11358,7 +12751,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
           // Individual item shipment
           let totalItemFee = 0
           for (const item of ordersBySeller[sellerId]) {
-            if (item.type !== 'digital') {
+            if (item.type === 'physical') {
               const [prodRows] = await db.query<RowDataPacket[]>(
                 'SELECT shipping_fee FROM products WHERE id = ? LIMIT 1',
                 [Number(item.product_id)]
@@ -11385,7 +12778,9 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         // Apply free shipping threshold if enabled (for both package and individual item shipments)
         if (profile.package_free_threshold_enabled) {
           const threshold = Number(profile.package_free_threshold || 0)
-          const sellerSubtotal = (ordersBySeller[sellerId] as any[]).reduce((sum, item) => sum + Number(item.total_price || 0), 0)
+          const sellerSubtotal = (ordersBySeller[sellerId] as any[])
+            .filter((item) => item.item_kind !== 'service')
+            .reduce((sum, item) => sum + Number(item.total_price || 0), 0)
           if (sellerSubtotal >= threshold) {
             feeNoVat = 0
           }
@@ -11402,21 +12797,24 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
     const shippingFeeWithVat = shippingFeeNoVat + shippingFeeVat
 
-    const orderProductsForCommission = Object.values(ordersBySeller).reduce<OrderProduct[]>(
-      (acc, items) => {
-        for (const item of items as any[]) {
-          acc.push({
-            seller_id: Number(item.seller_id),
-            total_price: Number(item.total_price || 0),
-            tax_amount: Number(item.tax_amount || 0),
-            quantity: Number(item.quantity || 0),
-            product_id: Number(item.product_id || 0),
-          })
+    const productItemsForCommission: OrderProduct[] = []
+    const serviceItemsForCommission: OrderProduct[] = []
+    for (const items of Object.values(ordersBySeller)) {
+      for (const item of items as any[]) {
+        const entry: OrderProduct = {
+          seller_id: Number(item.seller_id),
+          total_price: Number(item.total_price || 0),
+          tax_amount: Number(item.tax_amount || 0),
+          quantity: Number(item.quantity || 0),
+          product_id: Number(item.product_id || 0),
         }
-        return acc
-      },
-      [],
-    )
+        if (item.item_kind === 'service') {
+          serviceItemsForCommission.push(entry)
+        } else {
+          productItemsForCommission.push(entry)
+        }
+      }
+    }
 
     const sellerIdsForCommission = Object.keys(ordersBySeller)
       .map((sellerId) => Number(sellerId))
@@ -11429,17 +12827,136 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         .map(([sellerId]) => sellerId),
     )
 
-    const commissionBreakdown = calculateCommissionBreakdown(
-      orderProductsForCommission,
+    const productCommissionBreakdown = calculateCommissionBreakdown(
+      productItemsForCommission,
       sellerShippingPolicyMap,
       commissionSettings.percent,
       commissionSettings.fixed,
       commissionExemptSellerIds,
     )
 
-    const sellerCommissionMap = new Map(
-      commissionBreakdown.sellerBreakdown.map((item) => [item.seller_id, item]),
+    const serviceCommissionBreakdown = calculateCommissionBreakdown(
+      serviceItemsForCommission,
+      new Map(),
+      commissionSettings.servicePercent,
+      commissionSettings.serviceFixed,
+      commissionExemptSellerIds,
     )
+
+    const sellerCommissionMap = new Map<
+      number,
+      {
+        seller_id: number
+        amountBeforeCommission: number
+        taxAmount: number
+        shippingAmount: number
+        amountBeforeCommissionWithShipping: number
+        commissionAmount: number
+        amountAfterCommission: number
+      }
+    >()
+
+    for (const part of [...productCommissionBreakdown.sellerBreakdown, ...serviceCommissionBreakdown.sellerBreakdown]) {
+      const existing = sellerCommissionMap.get(part.seller_id)
+      if (!existing) {
+        sellerCommissionMap.set(part.seller_id, { ...part })
+      } else {
+        existing.amountBeforeCommission = roundToTwo(existing.amountBeforeCommission + part.amountBeforeCommission)
+        existing.taxAmount = roundToTwo(existing.taxAmount + part.taxAmount)
+        existing.shippingAmount = roundToTwo(existing.shippingAmount + part.shippingAmount)
+        existing.amountBeforeCommissionWithShipping = roundToTwo(
+          existing.amountBeforeCommissionWithShipping + part.amountBeforeCommissionWithShipping,
+        )
+        existing.commissionAmount = roundToTwo(existing.commissionAmount + part.commissionAmount)
+        existing.amountAfterCommission = roundToTwo(existing.amountAfterCommission + part.amountAfterCommission)
+      }
+    }
+
+    const calculateBucketCommission = (
+      sId: number,
+      isServiceOrder: boolean,
+      bucketItems: any[],
+      shippingWithVat: number,
+    ): number => {
+      if (commissionExemptSellerIds.has(sId)) return 0
+      const defaultPercent = isServiceOrder
+        ? Number(commissionSettings.servicePercent || 0)
+        : Number(commissionSettings.percent || 0)
+      const promoPercent = isServiceOrder
+        ? Number(commissionSettings.servicePromotionPercent || 0)
+        : Number(commissionSettings.promotionPercent || 0)
+      const fixedCommission = isServiceOrder
+        ? Number(commissionSettings.serviceFixed || 0)
+        : Number(commissionSettings.fixed || 0)
+
+      let itemsGrossTotal = 0
+      let percentageCommission = 0
+      for (const item of bucketItems) {
+        const itemGross = Number(item.total_price || 0) + Number(item.tax_amount || 0)
+        if (itemGross <= 0) continue
+        itemsGrossTotal += itemGross
+        const appliedPercent = item?.is_promoted ? promoPercent : defaultPercent
+        percentageCommission += roundToTwo(itemGross * (appliedPercent / 100))
+      }
+      if (!isServiceOrder && shippingWithVat > 0) {
+        const allPromoted = bucketItems.length > 0 && bucketItems.every((item) => Boolean(item?.is_promoted))
+        const shippingPercent = allPromoted ? promoPercent : defaultPercent
+        percentageCommission += roundToTwo(shippingWithVat * (shippingPercent / 100))
+      }
+      const bucketGross = roundToTwo(itemsGrossTotal + shippingWithVat)
+      if (bucketGross <= 0) return 0
+      return roundToTwo(percentageCommission + fixedCommission)
+    }
+
+    const orderBucketsToCreate: Array<{ sellerId: number; kind: 'product' | 'service'; items: any[] }> = []
+    for (const [sellerIdRaw, sellerItems] of Object.entries(ordersBySeller)) {
+      const sId = Number(sellerIdRaw)
+      const productItems = (sellerItems as any[]).filter((item) => item.item_kind !== 'service')
+      const serviceItems = (sellerItems as any[]).filter((item) => item.item_kind === 'service')
+      if (productItems.length > 0) {
+        orderBucketsToCreate.push({ sellerId: sId, kind: 'product', items: productItems })
+      }
+      if (serviceItems.length > 0) {
+        orderBucketsToCreate.push({ sellerId: sId, kind: 'service', items: serviceItems })
+      }
+    }
+
+    const totalBucketCommission = roundToTwo(
+      orderBucketsToCreate.reduce((sum, b) => {
+        const isServiceOrder = b.kind === 'service'
+        const shipping = isServiceOrder
+          ? 0
+          : roundToTwo(
+              (sellerShippingPolicyMap.get(b.sellerId)?.feeNoVat || 0) +
+                (sellerShippingPolicyMap.get(b.sellerId)?.vatAmount || 0),
+            )
+        return sum + calculateBucketCommission(b.sellerId, isServiceOrder, b.items, shipping)
+      }, 0),
+    )
+
+    const combinedSellerBreakdown = Array.from(sellerCommissionMap.values())
+    const commissionBreakdown = {
+      totalAmountBeforeCommission: roundToTwo(
+        productCommissionBreakdown.totalAmountBeforeCommission + serviceCommissionBreakdown.totalAmountBeforeCommission,
+      ),
+      totalTaxAmount: roundToTwo(productCommissionBreakdown.totalTaxAmount + serviceCommissionBreakdown.totalTaxAmount),
+      totalShippingAmount: roundToTwo(
+        productCommissionBreakdown.totalShippingAmount + serviceCommissionBreakdown.totalShippingAmount,
+      ),
+      totalGrandAmount: roundToTwo(
+        productCommissionBreakdown.totalGrandAmount + serviceCommissionBreakdown.totalGrandAmount,
+      ),
+      totalCommission: totalBucketCommission,
+      commissionPercent:
+        serviceItemsForCommission.length > 0 && productItemsForCommission.length === 0
+          ? commissionSettings.servicePercent
+          : commissionSettings.percent,
+      commissionFixed:
+        serviceItemsForCommission.length > 0 && productItemsForCommission.length === 0
+          ? commissionSettings.serviceFixed
+          : commissionSettings.fixed,
+      sellerBreakdown: combinedSellerBreakdown,
+    }
 
     // Charge customer shipping fee WITH VAT
     const finalTotal = commissionBreakdown.totalGrandAmount
@@ -11514,11 +13031,15 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
     const allDigitalDownloadTokens: Array<{ product_name: string; token: string }> = []
     const digitalOnlySaleIds: number[] = []
 
-    for (const [sellerId, items] of Object.entries(ordersBySeller)) {
+    for (const bucket of orderBucketsToCreate) {
+      const { sellerId, kind, items } = bucket
+      const isServiceOrder = kind === 'service'
       const sellerTotal = items.reduce((sum: number, item: any) => sum + Number(item.total_price || 0), 0)
       const sellerTax = items.reduce((sum: number, item: any) => sum + Number(item.tax_amount || 0), 0)
-      const sellerHasPhysicalItems = (items as any[]).some((item) => item.type === 'physical')
-      const policyShipping = sellerShippingPolicyMap.get(Number(sellerId)) || { feeNoVat: 0, vatAmount: 0 }
+      const sellerHasPhysicalItems = !isServiceOrder && items.some((item) => item.type === 'physical')
+      const policyShipping = isServiceOrder
+        ? { feeNoVat: 0, vatAmount: 0 }
+        : (sellerShippingPolicyMap.get(sellerId) || { feeNoVat: 0, vatAmount: 0 })
       const sellerShippingNoVat = policyShipping.feeNoVat
       const sellerShippingVat = policyShipping.vatAmount
       const sellerShippingWithVat = sellerShippingNoVat + sellerShippingVat
@@ -11526,10 +13047,10 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
 
       // Commission is on (total + tax + shipment + shipping VAT)
       const sellerGrandTotal = sellerTotal + sellerTax + sellerShippingWithVat
-      const sellerCommissionBreakdown = sellerCommissionMap.get(Number(sellerId))
-      const sellerCommission = Number(sellerCommissionBreakdown?.commissionAmount || 0)
+      const sellerCommission = calculateBucketCommission(sellerId, isServiceOrder, items, sellerShippingWithVat)
 
-      const orderIdUnique = generateSellerOrderId(groupOrderId, sellerId)
+      const baseSellerOrderId = generateSellerOrderId(groupOrderId, sellerId)
+      const orderIdUnique = isServiceOrder ? `${baseSellerOrderId}-SRV` : baseSellerOrderId
 
       // Create order in sales table
       const [orderResult] = await db.query<ResultSetHeader>(
@@ -11556,11 +13077,20 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         digitalOnlySaleIds.push(saleId)
       }
 
-      // Create line items for each product
+      // Create line items for each product or service
       for (const item of items as any[]) {
-        const lineItemProductName = item.variant_name && item.variant_value
+        const baseProductName = item.variant_name && item.variant_value
           ? `${item.product_name} (${item.variant_name}: ${item.variant_value})`
           : item.product_name
+        const citySuffix =
+          item.item_kind === 'service' && item.selected_city
+            ? ` (${item.selected_city})`
+            : ''
+        const slotSuffix =
+          item.item_kind === 'service' && item.booking_date && item.start_time
+            ? ` [${item.booking_date} ${item.start_time}${item.end_time ? `-${item.end_time}` : ''}]`
+            : ''
+        const lineItemProductName = `${baseProductName}${citySuffix}${slotSuffix}`
 
         await db.query<ResultSetHeader>(
           `INSERT INTO sale_items (
@@ -11569,7 +13099,7 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
           [
             saleId,
             'item',
-            item.product_id,
+            item.item_kind === 'service' ? null : item.product_id,
             lineItemProductName,
             item.quantity,
             item.unit_price,
@@ -11577,6 +13107,115 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
             item.customization_value || null,
           ]
         )
+
+        // Create service_bookings record for paid service items with a selected slot
+        if (item.item_kind === 'service' && item.booking_date && item.start_time) {
+          try {
+            const bookingCode = `SRV-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`
+            const bookingToken = crypto.randomBytes(24).toString('hex')
+            const variantLabel = item.variant_name && item.variant_value
+              ? `${item.variant_name}: ${item.variant_value}`
+              : null
+
+            const buyerAddressStr = [
+              customerRows[0].shipping_street,
+              customerRows[0].shipping_city,
+              customerRows[0].shipping_state,
+              customerRows[0].shipping_zip,
+              customerRows[0].shipping_country,
+            ]
+              .map((part) => String(part || '').trim())
+              .filter(Boolean)
+              .join(', ') || null
+
+            const [bookingResult] = await db.query<ResultSetHeader>(
+              `INSERT INTO service_bookings (
+                booking_code, booking_token, service_id, seller_id, sale_id, variant_id, variant_label, selected_city, price,
+                buyer_name, buyer_email, buyer_phone, buyer_address, buyer_notes, booking_date, start_time, end_time, status
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+              [
+                bookingCode,
+                bookingToken,
+                item.service_id,
+                item.seller_id,
+                saleId,
+                item.variant_id || null,
+                variantLabel,
+                item.selected_city || null,
+                item.total_price,
+                String(customerRows[0].name || ''),
+                String(customerRows[0].email || ''),
+                customerRows[0].phone ? String(customerRows[0].phone) : null,
+                buyerAddressStr,
+                item.customization_value || null,
+                item.booking_date,
+                item.start_time,
+                item.end_time || item.start_time,
+              ],
+            )
+
+            const isAtSellerPremises =
+              item.service_location_type === 'seller_premises' || item.service_location_type === 'both'
+            const serviceLocationLabel =
+              item.service_location_type === 'buyer_place'
+                ? "Buyer's place"
+                : item.service_location_type === 'both'
+                  ? "Buyer's place or seller's premises"
+                  : "Seller's premises"
+
+            if (item.seller_email) {
+              const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${bookingResult.insertId}`
+              await sendServiceBookingNotificationEmail({
+                to: String(item.seller_email),
+                subject: `New Paid Service Booking: ${item.product_name} (${bookingCode})`,
+                recipientName: String(item.seller_name || 'Seller'),
+                heading: 'New Paid Service Booking',
+                intro: `${customerRows[0].name} (${customerRows[0].email}) has paid for and booked your service (Order ${orderIdUnique}).`,
+                statusBadge: 'PENDING',
+                statusColor: '#ea580c',
+                bookingCode,
+                serviceName: String(item.product_name),
+                variantLabel,
+                bookingDate: item.booking_date,
+                bookingTime: `${item.start_time} - ${item.end_time || item.start_time}`,
+                serviceLocation: serviceLocationLabel,
+                premisesAddress: isAtSellerPremises ? item.premises_address : null,
+                note: buyerAddressStr ? `Buyer Address: ${buyerAddressStr}` : null,
+                actionLabel: 'Open Booking in Dashboard',
+                actionUrl: sellerUrl,
+                purpose: 'sellers',
+              })
+            }
+
+            if (isAtSellerPremises && item.premises_address && customerRows[0].email) {
+              const contactInfo = await resolveSellerServiceContactInfo(Number(item.seller_id), item)
+              const buyerBookingUrl = `${getClientBaseUrlForServices()}/service-booking/${bookingToken}`
+              await sendServiceBookingNotificationEmail({
+                to: String(customerRows[0].email),
+                subject: `Service Location & Booking Details: ${item.product_name} (${bookingCode})`,
+                recipientName: String(customerRows[0].name || 'Customer'),
+                heading: 'Service Premises Address & Booking Details',
+                intro: `Thank you for your payment (Order ${orderIdUnique}). Your service "${item.product_name}" is provided at the seller's premises. Please find the premises address and schedule below.`,
+                statusBadge: 'BOOKED',
+                statusColor: '#7c3aed',
+                bookingCode,
+                serviceName: String(item.product_name),
+                variantLabel,
+                bookingDate: item.booking_date,
+                bookingTime: `${item.start_time} - ${item.end_time || item.start_time}`,
+                serviceLocation: serviceLocationLabel,
+                premisesAddress: String(item.premises_address),
+                sellerPhone: contactInfo.sellerPhone,
+                note: item.selected_city ? `Selected City: ${item.selected_city}` : null,
+                actionLabel: 'View Booking Details',
+                actionUrl: buyerBookingUrl,
+                purpose: 'customers',
+              })
+            }
+          } catch (bookingErr) {
+            console.error('Failed to record service booking for paid order:', bookingErr)
+          }
+        }
 
         // Update selected variant stock (only for physical products)
         if (item.type === 'physical') {
@@ -11931,10 +13570,48 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         total_amount: finalTotal,
       })
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error('Order creation error:', err)
-    res.status(500).json({ message: 'Failed to process order' })
+    logCheckoutErrorToFile({
+      source: 'backend',
+      stage: 'POST /api/customer/orders',
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+      customer_id: req.body?.customer_id || null,
+      item_count: Array.isArray(req.body?.products) ? req.body.products.length : 0,
+    })
+    res.status(500).json({
+      message: 'Failed to process order',
+      details: err?.message || 'Unexpected server error while creating the order.',
+    })
   }
+})
+
+const logCheckoutErrorToFile = (context: Record<string, any>) => {
+  try {
+    const logsDir = path.join(__dirname, 'logs')
+    fs.mkdirSync(logsDir, { recursive: true })
+    const logFile = path.join(logsDir, 'checkout-errors.log')
+    const line = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...context,
+    })
+    fs.appendFileSync(logFile, `${line}\n`, 'utf8')
+  } catch (logErr) {
+    console.error('Failed to write checkout error log:', logErr)
+  }
+}
+
+app.post('/api/public/checkout-error-log', (req: Request, res: Response) => {
+  logCheckoutErrorToFile({
+    source: 'frontend',
+    stage: String(req.body?.stage || 'checkout'),
+    message: String(req.body?.message || 'Unknown checkout error'),
+    details: req.body?.details || null,
+    customer_email: req.body?.customer_email ? String(req.body.customer_email) : null,
+    payment_method: req.body?.payment_method ? String(req.body.payment_method) : null,
+  })
+  res.status(204).end()
 })
 
 app.get('/api/public/download/:token', async (req: Request, res: Response) => {
@@ -12066,149 +13743,66 @@ app.post('/api/public/shipment-estimate', async (req: Request, res: Response) =>
           })
         }
 
-        feeNoVat = Number(profile.package_flat_fee || 0)
-      }
-
-      // Apply free shipping threshold if enabled (for both package and individual item shipments)
-      if (profile.package_free_threshold_enabled) {
-        const threshold = Number(profile.package_free_threshold || 0)
-        // Calculate subtotal for this seller's items
-        const sellerItems = itemsRaw.filter((item: any) => Number(item.seller_id) === sellerId)
-        const sellerSubtotal = sellerItems.reduce((sum: number, item: any) => sum + (Number(item.unit_price || 0) * Number(item.quantity || 1)), 0)
-        if (sellerSubtotal >= threshold) {
-          feeNoVat = 0
+                        feeNoVat = Number(profile.package_flat_fee || 0);
+            }
+            // Apply free shipping threshold if enabled (for both package and individual item shipments)
+            if (profile.package_free_threshold_enabled) {
+                const threshold = Number(profile.package_free_threshold || 0);
+                const sellerItems = itemsRaw.filter((item: any) => Number(item.seller_id) === sellerId);
+                const sellerSubtotal = sellerItems.reduce((sum: any, item: any) => sum + (Number(item.unit_price || 0) * Number(item.quantity || 1)), 0);
+                if (sellerSubtotal >= threshold) {
+                    feeNoVat = 0;
+                }
+            }
+            // If the seller is a private seller, VAT on shipping is always 0%
+            if (sellerIsPrivate) {
+                vatRateDecimal = 0;
+            }
+            const vatAmount = calculateTaxOnShipment(feeNoVat, vatRateDecimal);
+            if (feeNoVat <= 0)
+                continue;
+            shipmentSummary.push({
+                seller_id: sellerId,
+                shipment_name: shippingMode === 'item' ? 'Individual Item Shipment' : 'Package Shipment',
+                fee_no_vat: feeNoVat,
+                vat_amount: vatAmount,
+                fee_incl_vat: feeNoVat + vatAmount,
+            });
+            shipmentFeeNoVat += feeNoVat;
+            shipmentVat += vatAmount;
         }
-      }
-
-      // If the seller is a private seller, VAT on shipping is always 0%
-      if (sellerIsPrivate) {
-        vatRateDecimal = 0
-      }
-
-      const vatAmount = calculateTaxOnShipment(feeNoVat, vatRateDecimal)
-
-      if (feeNoVat <= 0) continue
-
-      shipmentSummary.push({
-        seller_id: sellerId,
-        shipment_name: shippingMode === 'item' ? 'Individual Item Shipment' : 'Package Shipment',
-        fee_no_vat: feeNoVat,
-        vat_amount: vatAmount,
-        fee_incl_vat: feeNoVat + vatAmount,
-      })
-
-      shipmentFeeNoVat += feeNoVat
-      shipmentVat += vatAmount
+        return res.json({
+            shipment_summary: shipmentSummary,
+            shipment_fee_no_vat: shipmentFeeNoVat,
+            shipment_vat: shipmentVat,
+            shipment_fee_incl_vat: shipmentFeeNoVat + shipmentVat,
+        });
     }
-
-    return res.json({
-      shipment_summary: shipmentSummary,
-      shipment_fee_no_vat: shipmentFeeNoVat,
-      shipment_vat: shipmentVat,
-      shipment_fee_incl_vat: shipmentFeeNoVat + shipmentVat,
-    })
-  } catch (error) {
-    console.error('Shipment estimate error:', error)
-    return res.status(500).json({ message: 'Failed to estimate shipment fee' })
-  }
-})
-
-// ===== Create Order (Manual - for Seller Use) =====
-app.post('/api/orders', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const {
-    order_id,
-    customer_id,
-    total_amount,
-    tax_amount,
-    shipping_fee,
-  } = req.body
-
-  if (!order_id || !customer_id || !total_amount) {
-    return res.status(400).json({ message: 'Required fields are missing' })
-  }
-
-  // Calculate grand total including shipment
-  const grand_total = Number(total_amount) + Number(tax_amount || 0) + Number(shipping_fee || 0)
-
-  try {
-    const commissionSettings = await getCommissionSettings()
-    const sellerAdminFlags = await getSellerAdminFlags(auth.id)
-    const commission_amount = sellerAdminFlags.selfCommissionExempt
-      ? 0
-      : calculateCommissionAmount(
-        grand_total,
-        commissionSettings.rate,
-        commissionSettings.fixed,
-      )
-
-    const [result] = await db.query<ResultSetHeader>(
-      `INSERT INTO sales (
-        order_id, customer_id, seller_id, order_status,
-        tax_amount, grand_total, commission_amount, payout_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)` ,
-      [
-        order_id,
-        customer_id,
-        auth.id,
-        'pending',
-        tax_amount || 0,
-        grand_total,
-        commission_amount,
-        'unpaid',
-      ]
-    )
-
-    res.status(201).json({
-      id: result.insertId,
-      order_id,
-      message: 'Order created successfully',
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+    catch (error: any) {
+        console.error('Shipment estimate error:', error);
+        return res.status(500).json({ message: 'Failed to estimate shipment fee' });
+    }
+});
 // ===== Get Dashboard Metrics =====
 app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const sellerId = auth.id
-
-    // Get total products count
-    const [productCount] = await db.query<RowDataPacket[]>(
-      'SELECT COUNT(*) as count FROM products WHERE seller_id = ?',
-      [sellerId]
-    )
-
-    // Get total orders count and revenue for active seller orders.
-    const [orderStats] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        const sellerId = auth.id;
+        const [productCount] = await db.query<any>('SELECT COUNT(*) as count FROM products WHERE seller_id = ?', [sellerId]);
+        const [orderStats] = await db.query<any>(`SELECT
         COUNT(*) as order_count,
         COALESCE(SUM(grand_total), 0) as total_revenue
        FROM sales
-      WHERE seller_id = ?
-        AND order_status <> 'cancelled'`,
-      [sellerId]
-    )
-
-    // Get unique customers count
-    const [customerCount] = await db.query<RowDataPacket[]>(
-      `SELECT COUNT(DISTINCT customer_id) as count
+       WHERE seller_id = ?
+         AND order_status <> 'cancelled'`, [sellerId]);
+        const [customerCount] = await db.query<any>(`SELECT COUNT(DISTINCT customer_id) as count
        FROM sales
       WHERE seller_id = ?
-        AND order_status <> 'cancelled'`,
-      [sellerId]
-    )
-
-    // Get monthly sales data (last 12 months)
-    const [monthlySales] = await db.query<RowDataPacket[]>(
-      `SELECT
+        AND order_status <> 'cancelled'`, [sellerId]);
+        // Get monthly sales data (last 12 months)
+        const [monthlySales] = await db.query<any>(`SELECT
         DATE_FORMAT(order_date, '%Y-%m') as month,
         COALESCE(SUM(grand_total), 0) as revenue,
         COUNT(*) as order_count
@@ -12217,80 +13811,65 @@ app.get('/api/dashboard/metrics', async (req: Request, res: Response) => {
         AND order_status <> 'cancelled'
        AND order_date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
        GROUP BY DATE_FORMAT(order_date, '%Y-%m')
-       ORDER BY month ASC`,
-      [sellerId]
-    )
-
-    // Get current month revenue
-    const [currentMonthRevenue] = await db.query<RowDataPacket[]>(
-      `SELECT COALESCE(SUM(grand_total), 0) as revenue
+       ORDER BY month ASC`, [sellerId]);
+        // Get current month revenue
+        const [currentMonthRevenue] = await db.query<any>(`SELECT COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
       WHERE seller_id = ?
         AND order_status <> 'cancelled'
        AND YEAR(order_date) = YEAR(NOW())
-       AND MONTH(order_date) = MONTH(NOW())`,
-      [sellerId]
-    )
-
-    // Get previous month revenue for comparison
-    const [previousMonthRevenue] = await db.query<RowDataPacket[]>(
-      `SELECT COALESCE(SUM(grand_total), 0) as revenue
+       AND MONTH(order_date) = MONTH(NOW())`, [sellerId]);
+        // Get previous month revenue for comparison
+        const [previousMonthRevenue] = await db.query<any>(`SELECT COALESCE(SUM(grand_total), 0) as revenue
        FROM sales
       WHERE seller_id = ?
         AND order_status <> 'cancelled'
        AND YEAR(order_date) = YEAR(DATE_SUB(NOW(), INTERVAL 1 MONTH))
-       AND MONTH(order_date) = MONTH(DATE_SUB(NOW(), INTERVAL 1 MONTH))`,
-      [sellerId]
-    )
-
-    // Calculate percentage changes
-    const currentRevenue = orderStats[0].total_revenue || 0
-    const currentMonthRev = currentMonthRevenue[0].revenue || 0
-    const previousMonthRev = previousMonthRevenue[0].revenue || 0
-
-    const revenueChange = previousMonthRev > 0
-      ? ((currentMonthRev - previousMonthRev) / previousMonthRev) * 100
-      : 0
-
-    res.status(200).json({
-      products: {
-        count: productCount[0].count || 0
-      },
-      orders: {
-        count: orderStats[0].order_count || 0,
-        total_revenue: currentRevenue
-      },
-      customers: {
-        count: customerCount[0].count || 0
-      },
-      monthly: {
-        current_revenue: currentMonthRev,
-        previous_revenue: previousMonthRev,
-        revenue_change_percent: Math.round(revenueChange * 100) / 100
-      },
-      monthly_sales: monthlySales.map((row: any) => ({
-        month: row.month,
-        revenue: row.revenue,
-        order_count: row.order_count
-      }))
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+       AND MONTH(order_date) = MONTH(DATE_SUB(NOW(), INTERVAL 1 MONTH))`, [sellerId]);
+        // Calculate percentage changes
+        const currentRevenue = orderStats[0].total_revenue || 0;
+        const currentMonthRev = currentMonthRevenue[0].revenue || 0;
+        const previousMonthRev = previousMonthRevenue[0].revenue || 0;
+        const revenueChange = previousMonthRev > 0
+            ? ((currentMonthRev - previousMonthRev) / previousMonthRev) * 100
+            : 0;
+        res.status(200).json({
+            products: {
+                count: productCount[0].count || 0
+            },
+            orders: {
+                count: orderStats[0].order_count || 0,
+                total_revenue: currentRevenue
+            },
+            customers: {
+                count: customerCount[0].count || 0
+            },
+            monthly: {
+                current_revenue: currentMonthRev,
+                previous_revenue: previousMonthRev,
+                revenue_change_percent: Math.round(revenueChange * 100) / 100
+            },
+            monthly_sales: monthlySales.map((row: any) => ({
+                month: row.month,
+                revenue: row.revenue,
+                order_count: row.order_count
+            }))
+        });
+    }
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 // ===== Get Customer Demographics by Country =====
 app.get('/api/dashboard/customer-demographics', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const sellerId = auth.id
-
-    // Get customers grouped by country
-    const [countryData] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        const sellerId = auth.id;
+        // Get customers grouped by country
+        const [countryData] = await db.query<any>(`SELECT
         COALESCE(c.shipping_country, 'Unknown') as country,
         COUNT(DISTINCT c.id) as customer_count
        FROM sales s
@@ -12299,13 +13878,9 @@ app.get('/api/dashboard/customer-demographics', async (req: Request, res: Respon
         AND s.order_status <> 'cancelled'
        GROUP BY c.shipping_country
        ORDER BY customer_count DESC
-       LIMIT 10`,
-      [sellerId]
-    )
-
-    // Get customers grouped by city and country
-    const [cityData] = await db.query<RowDataPacket[]>(
-      `SELECT
+       LIMIT 10`, [sellerId]);
+        // Get customers grouped by city and country
+        const [cityData] = await db.query<any>(`SELECT
         COALESCE(c.shipping_city, 'Unknown') as city,
         COALESCE(c.shipping_country, 'Unknown') as country,
         COUNT(DISTINCT c.id) as customer_count
@@ -12315,140 +13890,45 @@ app.get('/api/dashboard/customer-demographics', async (req: Request, res: Respon
         AND s.order_status <> 'cancelled'
        GROUP BY c.shipping_city, c.shipping_country
        ORDER BY customer_count DESC
-       LIMIT 20`,
-      [sellerId]
-    )
-
-    // Calculate total customers
-    const totalCustomers = countryData.reduce((sum: number, row: any) => sum + row.customer_count, 0)
-
-    // Add percentages
-    const countriesWithPercentage = countryData.map((row: any) => ({
-      country: row.country,
-      customer_count: row.customer_count,
-      percentage: totalCustomers > 0 ? Math.round((row.customer_count / totalCustomers) * 100) : 0
-    }))
-
-    res.status(200).json({
-      total_customers: totalCustomers,
-      by_country: countriesWithPercentage,
-      by_city: cityData.map((row: any) => ({
-        city: row.city,
-        country: row.country,
-        customer_count: row.customer_count
-      }))
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
-// ===== Get Statistics Chart Data (Monthly, Quarterly, Annually) =====
-app.get('/api/dashboard/statistics', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const sellerId = auth.id
-        const monthLabelFromParts = (yearValue: unknown, monthValue: unknown): string => {
-          const year = Number(yearValue)
-          const month = Number(monthValue)
-          if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) return ''
-          const date = new Date(Date.UTC(year, month - 1, 1))
-          return date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })
-        }
-
-    const [orderDateColumnExists] = await Promise.all([
-      hasSalesOrderDateColumn(),
-    ])
-    const dateColumn = orderDateColumnExists ? 'order_date' : 'created_at'
-    const activeOrderFilter = " AND order_status <> 'cancelled'"
-
-    // Get monthly sales and revenue data (last 12 months)
-    const [monthlyData] = await db.query<RowDataPacket[]>(
-      `SELECT
-        YEAR(${dateColumn}) as year_num,
-        MONTH(${dateColumn}) as month_num,
-        COUNT(*) as sales_count,
-        COALESCE(SUM(grand_total), 0) as revenue
-       FROM sales
-        WHERE seller_id = ?${activeOrderFilter}
-       AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
-       GROUP BY YEAR(${dateColumn}), MONTH(${dateColumn})
-       ORDER BY YEAR(${dateColumn}) ASC, MONTH(${dateColumn}) ASC`,
-      [sellerId]
-    )
-
-    // Get quarterly sales and revenue data (last 4 quarters)
-    const [quarterlyData] = await db.query<RowDataPacket[]>(
-      `SELECT
-        YEAR(${dateColumn}) as year_num,
-        QUARTER(${dateColumn}) as quarter_num,
-        COUNT(*) as sales_count,
-        COALESCE(SUM(grand_total), 0) as revenue
-       FROM sales
-        WHERE seller_id = ?${activeOrderFilter}
-       AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
-       GROUP BY YEAR(${dateColumn}), QUARTER(${dateColumn})
-       ORDER BY YEAR(${dateColumn}) ASC, QUARTER(${dateColumn}) ASC`,
-      [sellerId]
-    )
-
-    // Get annual sales and revenue data (last 5 years)
-    const [annualData] = await db.query<RowDataPacket[]>(
-      `SELECT
-        YEAR(${dateColumn}) as year,
-        COUNT(*) as sales_count,
-        COALESCE(SUM(grand_total), 0) as revenue
-       FROM sales
-      WHERE seller_id = ?${activeOrderFilter}
-       AND ${dateColumn} >= DATE_SUB(NOW(), INTERVAL 5 YEAR)
-       GROUP BY YEAR(${dateColumn})
-       ORDER BY YEAR(${dateColumn})`,
-      [sellerId]
-    )
-
-    res.status(200).json({
-      monthly: {
-        labels: monthlyData.map((row: any) => monthLabelFromParts(row.year_num, row.month_num)),
-        sales: monthlyData.map((row: any) => row.sales_count),
-        revenue: monthlyData.map((row: any) => Number(row.revenue) || 0)
-      },
-      quarterly: {
-        labels: quarterlyData.map((row: any) => `${row.year_num}-Q${row.quarter_num}`),
-        sales: quarterlyData.map((row: any) => row.sales_count),
-        revenue: quarterlyData.map((row: any) => Number(row.revenue) || 0)
-      },
-      annual: {
-        labels: annualData.map((row: any) => row.year.toString()),
-        sales: annualData.map((row: any) => row.sales_count),
-        revenue: annualData.map((row: any) => Number(row.revenue) || 0)
-      }
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
-// ===== Get Payments and Earnings Data =====
+       LIMIT 20`, [sellerId]);
+        // Calculate total customers
+        const totalCustomers = countryData.reduce((sum: any, row: any) => sum + row.customer_count, 0);
+        // Add percentages
+        const countriesWithPercentage = countryData.map((row: any) => ({
+            country: row.country,
+            customer_count: row.customer_count,
+            percentage: totalCustomers > 0 ? Math.round((row.customer_count / totalCustomers) * 100) : 0
+        }));
+        res.status(200).json({
+            total_customers: totalCustomers,
+            by_country: countriesWithPercentage,
+            by_city: cityData.map((row: any) => ({
+                city: row.city,
+                country: row.country,
+                customer_count: row.customer_count
+            }))
+        });
+    }
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
+// ===== Get Seller Payments =====
 app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const sellerId = auth.id
-    const { month, year } = req.query
-
-    // Current month/year
-    const currentDate = new Date()
-    const currentMonth = month ? Number(month) : currentDate.getMonth() + 1
-    const currentYear = year ? Number(year) : currentDate.getFullYear()
-
-    // Get current month sales rows for aggregate calculations
-    const [currentMonthSales] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureSalesPayoutColumns();
+        const sellerId = auth.id;
+        const { month, year } = req.query;
+        // Current month/year
+        const currentDate = new Date();
+        const currentMonth = month ? Number(month) : currentDate.getMonth() + 1;
+        const currentYear = year ? Number(year) : currentDate.getFullYear();
+        // Get current month sales rows for aggregate calculations
+        const [currentMonthSales] = await db.query<any>(`SELECT
         s.id,
         s.grand_total,
         s.commission_amount,
@@ -12462,36 +13942,27 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
        WHERE s.seller_id = ?
       AND s.payout_status = 'paid'
        AND YEAR(s.order_date) = ?
-       AND MONTH(s.order_date) = ?`,
-      [sellerId, currentYear, currentMonth]
-    )
-
-    const currentPeriodStats = currentMonthSales.reduce(
-      (acc, sale: any) => {
-        const grandTotal = Number(sale.grand_total || 0)
-        const commissionAmount = Number(sale.commission_amount || 0)
-        const totalTax = Number(sale.total_tax || 0)
-        acc.order_count += 1
-        acc.total_revenue += grandTotal
-        acc.total_commission += commissionAmount
-        acc.total_tax += totalTax
-        acc.net_earnings += calculateNetEarning(grandTotal, totalTax, commissionAmount)
-        return acc
-      },
-      {
-        order_count: 0,
-        total_revenue: 0,
-        total_commission: 0,
-        total_tax: 0,
-        net_earnings: 0,
-      }
-    )
-
-    await ensureSalesPayoutColumns()
-
-    // Get current month orders with details
-    const [currentMonthOrders] = await db.query<RowDataPacket[]>(
-      `SELECT
+       AND MONTH(s.order_date) = ?`, [sellerId, currentYear, currentMonth]);
+        const currentPeriodStats = currentMonthSales.reduce((acc: any, sale: any) => {
+            const grandTotal = Number(sale.grand_total || 0);
+            const commissionAmount = Number(sale.commission_amount || 0);
+            const totalTax = Number(sale.total_tax || 0);
+            acc.order_count += 1;
+            acc.total_revenue += grandTotal;
+            acc.total_commission += commissionAmount;
+            acc.total_tax += totalTax;
+            acc.net_earnings += calculateNetEarning(grandTotal, totalTax, commissionAmount);
+            return acc;
+        }, {
+            order_count: 0,
+            total_revenue: 0,
+            total_commission: 0,
+            total_tax: 0,
+            net_earnings: 0,
+        });
+        await ensureSalesPayoutColumns();
+        // Get current month orders with details
+        const [currentMonthOrders] = await db.query<any>(`SELECT
         s.id,
         s.order_id,
         s.payout_reference,
@@ -12528,13 +13999,9 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
       AND s.payout_status = 'paid'
       AND YEAR(s.order_date) = ?
       AND MONTH(s.order_date) = ?
-      ORDER BY s.order_date DESC`,
-      [sellerId, currentYear, currentMonth]
-    )
-
-    // Get monthly earnings history (last 12 months)
-    const [monthlyHistory] = await db.query<RowDataPacket[]>(
-      `SELECT
+      ORDER BY s.order_date DESC`, [sellerId, currentYear, currentMonth]);
+        // Get monthly earnings history (last 12 months)
+        const [monthlyHistory] = await db.query<any>(`SELECT
         YEAR(s.order_date) as year,
         MONTH(s.order_date) as month,
         DATE_FORMAT(s.order_date, '%Y-%m') as period,
@@ -12552,13 +14019,9 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
       AND s.payout_status = 'paid'
        AND s.order_date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
        GROUP BY YEAR(s.order_date), MONTH(s.order_date), DATE_FORMAT(s.order_date, '%Y-%m')
-       ORDER BY year DESC, month DESC`,
-      [sellerId]
-    )
-
-    // Get payout status summary
-    const [payoutSummary] = await db.query<RowDataPacket[]>(
-      `SELECT
+       ORDER BY year DESC, month DESC`, [sellerId]);
+        // Get payout status summary
+        const [payoutSummary] = await db.query<any>(`SELECT
         s.payout_status,
         COUNT(*) as count,
         COALESCE(SUM(s.grand_total), 0) as total_revenue,
@@ -12572,72 +14035,69 @@ app.get('/api/dashboard/payments', async (req: Request, res: Response) => {
        ) st ON st.sale_id = s.id
        WHERE s.seller_id = ?
       AND s.payout_status = 'paid'
-       GROUP BY s.payout_status`,
-      [sellerId]
-    )
-
-    res.status(200).json({
-      current_period: {
-        month: currentMonth,
-        year: currentYear,
-        order_count: currentPeriodStats.order_count,
-        total_revenue: roundToTwo(currentPeriodStats.total_revenue),
-        net_earnings: roundToTwo(currentPeriodStats.net_earnings),
-        total_commission: roundToTwo(currentPeriodStats.total_commission),
-        total_tax: roundToTwo(currentPeriodStats.total_tax),
-      },
-      orders: currentMonthOrders.map((order: any) => ({
-        id: order.id,
-        order_id: order.order_id,
-        payment_reference: order.payout_reference || '',
-        order_date: order.order_date,
-        customer_name: order.customer_name,
-        customer_email: order.customer_email,
-        grand_total: parseFloat(order.grand_total),
-        tax_amount: parseFloat(order.tax_amount),
-        commission_amount: parseFloat(order.commission_amount),
-        net_amount: calculateNetEarning(order.grand_total, order.tax_amount, order.commission_amount),
-        payment_status: order.payment_status,
-        payout_status: order.payout_status,
-        payout_payment_date: order.payout_payment_date || order.updated_at || null,
-        order_status: order.order_status,
-      })),
-      monthly_history: monthlyHistory.map((row: any) => ({
-        year: row.year,
-        month: row.month,
-        period: row.period,
-        order_count: row.order_count,
-        total_revenue: parseFloat(row.total_revenue),
-        net_earnings: calculateNetEarning(row.total_revenue, row.total_tax, row.total_commission),
-        total_commission: parseFloat(row.total_commission),
-      })),
-      payout_summary: payoutSummary.map((row: any) => ({
-        status: row.payout_status,
-        count: row.count,
-        amount: calculateNetEarning(row.total_revenue, row.total_tax, row.total_commission),
-      })),
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+       GROUP BY s.payout_status`, [sellerId]);
+        res.status(200).json({
+            current_period: {
+                month: currentMonth,
+                year: currentYear,
+                order_count: currentPeriodStats.order_count,
+                total_revenue: roundToTwo(currentPeriodStats.total_revenue),
+                net_earnings: roundToTwo(currentPeriodStats.net_earnings),
+                total_commission: roundToTwo(currentPeriodStats.total_commission),
+                total_tax: roundToTwo(currentPeriodStats.total_tax),
+            },
+            orders: currentMonthOrders.map((order: any) => ({
+                id: order.id,
+                order_id: order.order_id,
+                payment_reference: order.payout_reference || '',
+                order_date: order.order_date,
+                customer_name: order.customer_name,
+                customer_email: order.customer_email,
+                grand_total: parseFloat(order.grand_total),
+                tax_amount: parseFloat(order.tax_amount),
+                commission_amount: parseFloat(order.commission_amount),
+                net_amount: calculateNetEarning(order.grand_total, order.tax_amount, order.commission_amount),
+                payment_status: order.payment_status,
+                payout_status: order.payout_status,
+                payout_payment_date: order.payout_payment_date || order.updated_at || null,
+                order_status: order.order_status,
+            })),
+            monthly_history: monthlyHistory.map((row: any) => ({
+                year: row.year,
+                month: row.month,
+                period: row.period,
+                order_count: row.order_count,
+                total_revenue: parseFloat(row.total_revenue),
+                net_earnings: calculateNetEarning(row.total_revenue, row.total_tax, row.total_commission),
+                total_commission: parseFloat(row.total_commission),
+            })),
+            payout_summary: payoutSummary.map((row: any) => ({
+                status: row.payout_status,
+                count: row.count,
+                amount: calculateNetEarning(row.total_revenue, row.total_tax, row.total_commission),
+            })),
+        });
+    }
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 // ===== Get Orders =====
 app.get('/api/orders', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    await ensureSalesPayoutColumns()
-    await ensureSalesShipmentColumns()
-    const paymentDateColumnExists = await hasSalesPayoutPaymentDateColumn()
-    const payoutPaymentDateSelect = paymentDateColumnExists
-      ? 's.payout_payment_date'
-      : 'NULL AS payout_payment_date'
-
-    const [allItems] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureSalesPayoutColumns();
+        await ensureSalesShipmentColumns();
+        await ensureServiceTables();
+        await ensureDisputeTables();
+        const paymentDateColumnExists = await hasSalesPayoutPaymentDateColumn();
+        const payoutPaymentDateSelect = paymentDateColumnExists
+            ? 's.payout_payment_date'
+            : 'NULL AS payout_payment_date';
+        const [allItems] = await db.query<any>(`SELECT
         s.id as sale_id,
         s.order_id,
         s.group_order_id,
@@ -12674,7 +14134,7 @@ app.get('/api/orders', async (req: Request, res: Response) => {
         si.product_id,
         si.product_name,
         si.customization_value,
-        COALESCE(p.type, 'physical') as item_type,
+        CASE WHEN si.product_type = 'item' AND si.product_id IS NULL THEN 'service' ELSE COALESCE(p.type, 'physical') END as item_type,
         p.category as item_category,
         p.main_image_url as item_main_image_url,
         COALESCE(pv.length_cm, pv_fallback.length_cm) as item_length_cm,
@@ -12684,7 +14144,16 @@ app.get('/api/orders', async (req: Request, res: Response) => {
         si.quantity,
         si.unit_price,
         (si.unit_price * si.quantity) as total_price,
-        si.tax_amount as item_tax_amount
+        si.tax_amount as item_tax_amount,
+        sb.id as service_booking_id,
+        sb.service_id as service_booking_service_id,
+        sb.booking_date as service_booking_date,
+        sb.start_time as service_start_time,
+        sb.end_time as service_end_time,
+        sb.status as service_booking_status,
+        dsp.id as dispute_id,
+        dsp.case_number as dispute_case_number,
+        dsp.status as dispute_status
       FROM sales s
       LEFT JOIN (
         SELECT sale_id, COALESCE(SUM(tax_amount), 0) as total_tax
@@ -12692,6 +14161,20 @@ app.get('/api/orders', async (req: Request, res: Response) => {
         GROUP BY sale_id
       ) st ON st.sale_id = s.id
       LEFT JOIN customers c ON s.customer_id = c.id
+      LEFT JOIN service_bookings sb ON sb.id = (
+        SELECT sb2.id
+        FROM service_bookings sb2
+        WHERE sb2.sale_id = s.id
+        ORDER BY sb2.id ASC
+        LIMIT 1
+      )
+      LEFT JOIN disputes dsp ON dsp.id = (
+        SELECT d2.id
+        FROM disputes d2
+        WHERE d2.sale_id = s.id
+        ORDER BY d2.id DESC
+        LIMIT 1
+      )
       LEFT JOIN sale_items si ON s.id = si.sale_id
       LEFT JOIN products p ON si.product_id = p.id
       LEFT JOIN product_variants pv ON pv.product_id = si.product_id
@@ -12707,96 +14190,99 @@ app.get('/api/orders', async (req: Request, res: Response) => {
         LIMIT 1
       )
       WHERE s.seller_id = ?
-      ORDER BY s.order_date DESC, si.id`,
-      [auth.id]
-    )
-
-    // Group items by order
-    const ordersMap = new Map<number, any>()
-
-    for (const row of allItems) {
-      if (!ordersMap.has(row.sale_id)) {
-        ordersMap.set(row.sale_id, {
-          id: row.sale_id,
-          order_id: row.order_id,
-          group_order_id: row.group_order_id,
-          customer_id: row.customer_id,
-          seller_id: row.seller_id,
-          order_date: row.order_date,
-          order_status: row.order_status,
-          payment_status: row.payment_status,
-          shipping_status: row.shipping_status,
-          tax_amount: row.tax_amount,
-          shipping_fee: row.shipping_fee,
-          discount_amount: row.discount_amount,
-          grand_total: row.grand_total,
-          commission_amount: row.commission_amount,
-          shipment_tracking_number: row.shipment_tracking_number || null,
-          shipment_label_url: row.shipment_label_url || null,
-          shipment_label_mime_type: row.shipment_label_mime_type || null,
-          shipment_label_generated_at: row.shipment_label_generated_at || null,
-          shipment_booking_id: row.shipment_booking_id || null,
-          payout_status: row.payout_status,
-          payout_payment_date: row.payout_payment_date || (row.payout_status === 'paid' ? row.updated_at : null),
-          seller_net_amount: calculateNetEarning(row.grand_total, row.tax_amount, row.commission_amount),
-          created_at: row.created_at,
-          updated_at: row.updated_at,
-          customer_name: row.customer_name,
-          customer_email: row.customer_email,
-          customer_phone: row.customer_phone,
-          shipping_street: row.shipping_street,
-          shipping_city: row.shipping_city,
-          shipping_state: row.shipping_state,
-          shipping_zip: row.shipping_zip,
-          shipping_country: row.shipping_country,
-          items: [],
-        })
-      }
-
-      const order = ordersMap.get(row.sale_id)!
-      if (row.item_id) {
-        order.items.push({
-          id: row.item_id,
-          product_type: row.product_type,
-          product_id: row.product_id,
-          product_name: row.product_name,
-          customization_value: row.customization_value || null,
-          sku: null,
-          type: row.item_type || 'physical',
-          category: row.item_category || null,
-          main_image_url: row.item_main_image_url || null,
-          length_cm: row.item_length_cm != null ? Number(row.item_length_cm) : null,
-          width_cm: row.item_width_cm != null ? Number(row.item_width_cm) : null,
-          height_cm: row.item_height_cm != null ? Number(row.item_height_cm) : null,
-          weight_kg: row.item_weight_kg != null ? Number(row.item_weight_kg) : null,
-          quantity: row.quantity,
-          unit_price: row.unit_price,
-          total_price: row.total_price,
-          tax_amount: row.item_tax_amount,
-          commission_amount: 0,
-          status: 'pending',
-        })
-      }
+      ORDER BY s.order_date DESC, si.id`, [auth.id]);
+        // Group items by order
+        const ordersMap = new Map();
+        for (const row of allItems) {
+            if (!ordersMap.has(row.sale_id)) {
+                ordersMap.set(row.sale_id, {
+                    id: row.sale_id,
+                    order_id: row.order_id,
+                    group_order_id: row.group_order_id,
+                    customer_id: row.customer_id,
+                    seller_id: row.seller_id,
+                    order_date: row.order_date,
+                    order_status: row.order_status,
+                    payment_status: row.payment_status,
+                    shipping_status: row.shipping_status,
+                    service_booking_id: row.service_booking_id || null,
+                    service_booking_date: row.service_booking_date ? formatIsoDate(row.service_booking_date) : null,
+                    service_start_time: row.service_start_time || null,
+                    service_end_time: row.service_end_time || null,
+                    service_booking_status: row.service_booking_status || null,
+                    has_dispute: Boolean(row.dispute_id),
+                    has_active_dispute: Boolean(row.dispute_id && !['Resolved', 'Closed'].includes(String(row.dispute_status || ''))),
+                    dispute_id: row.dispute_id ? Number(row.dispute_id) : null,
+                    dispute_case_number: row.dispute_case_number || null,
+                    dispute_status: row.dispute_status || null,
+                    tax_amount: row.tax_amount,
+                    shipping_fee: row.shipping_fee,
+                    discount_amount: row.discount_amount,
+                    grand_total: row.grand_total,
+                    commission_amount: row.commission_amount,
+                    shipment_tracking_number: row.shipment_tracking_number || null,
+                    shipment_label_url: row.shipment_label_url || null,
+                    shipment_label_mime_type: row.shipment_label_mime_type || null,
+                    shipment_label_generated_at: row.shipment_label_generated_at || null,
+                    shipment_booking_id: row.shipment_booking_id || null,
+                    payout_status: row.payout_status,
+                    payout_payment_date: row.payout_payment_date || (row.payout_status === 'paid' ? row.updated_at : null),
+                    seller_net_amount: calculateNetEarning(row.grand_total, row.tax_amount, row.commission_amount),
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    customer_name: row.customer_name,
+                    customer_email: row.customer_email,
+                    customer_phone: row.customer_phone,
+                    shipping_street: row.shipping_street,
+                    shipping_city: row.shipping_city,
+                    shipping_state: row.shipping_state,
+                    shipping_zip: row.shipping_zip,
+                    shipping_country: row.shipping_country,
+                    items: [],
+                });
+            }
+            const order = ordersMap.get(row.sale_id);
+            if (row.item_id) {
+                order.items.push({
+                    id: row.item_id,
+                    product_type: row.product_type,
+                    product_id: row.product_id,
+                    service_id: row.item_type === 'service' ? (row.service_booking_service_id || null) : null,
+                    product_name: row.product_name,
+                    customization_value: row.customization_value || null,
+                    sku: null,
+                    type: row.item_type || 'physical',
+                    category: row.item_category || null,
+                    main_image_url: row.item_main_image_url || null,
+                    length_cm: row.item_length_cm != null ? Number(row.item_length_cm) : null,
+                    width_cm: row.item_width_cm != null ? Number(row.item_width_cm) : null,
+                    height_cm: row.item_height_cm != null ? Number(row.item_height_cm) : null,
+                    weight_kg: row.item_weight_kg != null ? Number(row.item_weight_kg) : null,
+                    quantity: row.quantity,
+                    unit_price: row.unit_price,
+                    total_price: row.total_price,
+                    tax_amount: row.item_tax_amount,
+                    commission_amount: 0,
+                    status: 'pending',
+                });
+            }
+        }
+        res.status(200).json(Array.from(ordersMap.values()));
     }
-
-    res.status(200).json(Array.from(ordersMap.values()))
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 // ===== Get Order by ID =====
 app.get('/api/orders/:id', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const orderId = req.params.id
-
-  try {
-    await ensureSalesShipmentColumns()
-    const [orders] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const orderId = req.params.id;
+    try {
+        await ensureSalesShipmentColumns();
+        const [orders] = await db.query<any>(`SELECT
         s.*,
         c.name as customer_name,
         c.email as customer_email,
@@ -12813,17 +14299,12 @@ app.get('/api/orders/:id', async (req: Request, res: Response) => {
         c.billing_country
       FROM sales s
       LEFT JOIN customers c ON s.customer_id = c.id
-      WHERE s.id = ? AND s.seller_id = ?`,
-      [orderId, auth.id]
-    )
-
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' })
-    }
-
-    // Get order items
-    const [items] = await db.query<RowDataPacket[]>(
-      `SELECT
+      WHERE s.id = ? AND s.seller_id = ?`, [orderId, auth.id]);
+        if (orders.length === 0) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        // Get order items
+        const [items] = await db.query<any>(`SELECT
         si.id,
         si.product_type,
         si.product_id,
@@ -12837,34 +14318,28 @@ app.get('/api/orders/:id', async (req: Request, res: Response) => {
         p.brand
       FROM sale_items si
       LEFT JOIN products p ON si.product_id = p.id
-      WHERE si.sale_id = ?`,
-      [orderId]
-    )
-
-    res.status(200).json({
-      ...orders[0],
-      items,
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+      WHERE si.sale_id = ?`, [orderId]);
+        res.status(200).json({
+            ...orders[0],
+            items,
+        });
+    }
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => {
-  const auth = await requireSellerOrAdmin(req, res)
-  if (!auth) return
-
-  const orderId = Number(req.params.id)
-  const smtpConfigured = Boolean(config.SMTP.host && config.SMTP.user && config.SMTP.pass)
-
-  if (!Number.isFinite(orderId) || orderId <= 0) {
-    return res.status(400).json({ message: 'Invalid order id' })
-  }
-
-  try {
-    const [orderRows] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireSellerOrAdmin(req, res);
+    if (!auth)
+        return;
+    const orderId = Number(req.params.id);
+    const smtpConfigured = Boolean(config.SMTP.host && config.SMTP.user && config.SMTP.pass);
+    if (!Number.isFinite(orderId) || orderId <= 0) {
+        return res.status(400).json({ message: 'Invalid order id' });
+    }
+    try {
+        const [orderRows] = await db.query<any>(`SELECT
         s.id,
         s.order_id,
         s.order_date,
@@ -12898,26 +14373,18 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
         LIMIT 1
       )
       WHERE s.id = ?
-      LIMIT 1`,
-      [orderId],
-    )
-
-    if (orderRows.length === 0) {
-      return res.status(404).json({ message: 'Order not found' })
-    }
-
-    const order = orderRows[0]
-
-    if (auth.role === 'seller' && Number(order.seller_id) !== auth.id) {
-      return res.status(403).json({ message: 'You do not have permission to send invoice for this order' })
-    }
-
-    if (!order.customer_email) {
-      return res.status(400).json({ message: 'Customer email is missing for this order' })
-    }
-
-    const [itemRows] = await db.query<RowDataPacket[]>(
-      `SELECT
+      LIMIT 1`, [orderId]);
+        if (orderRows.length === 0) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        const order = orderRows[0];
+        if (auth.role === 'seller' && Number(order.seller_id) !== auth.id) {
+            return res.status(403).json({ message: 'You do not have permission to send invoice for this order' });
+        }
+        if (!order.customer_email) {
+            return res.status(400).json({ message: 'Customer email is missing for this order' });
+        }
+        const [itemRows] = await db.query<any>(`SELECT
         product_type,
         product_name,
         quantity,
@@ -12926,601 +14393,542 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
         (unit_price * quantity) AS total_price
       FROM sale_items
       WHERE sale_id = ?
-      ORDER BY id ASC`,
-      [orderId],
-    )
-
-    const isPrivateSeller = String(order.seller_profile_type || '').toLowerCase() === 'private'
-
-    const invoiceItems = itemRows.map((item: any) => ({
-      product_type: String(item.product_type || '').toLowerCase() === 'shipment' ? 'shipment' as const : 'item' as const,
-      product_name: String(item.product_name || ''),
-      quantity: String(item.product_type || '').toLowerCase() === 'shipment' ? null : Number(item.quantity || 0),
-      unit_price: Number(item.unit_price || 0),
-      tax_amount: Number(item.tax_amount || 0),
-      total_price: Number(item.total_price || 0),
-      seller_key: String(order.seller_id || ''),
-      is_private_seller: String(item.product_type || '').toLowerCase() === 'shipment' ? false : isPrivateSeller,
-    }))
-
-    const totalInvoiceTax = invoiceItems.reduce((sum: number, item: any) => sum + Number(item.tax_amount || 0), 0)
-
-    const tax = Number(order.tax_amount || 0)
-    const commission = Number(order.commission_amount || 0)
-    const grandTotal = Number(order.grand_total || 0)
-    const netAmount = calculateNetEarning(grandTotal, tax, commission)
-
-    const shippingParts = [
-      order.shipping_street,
-      order.shipping_city,
-      order.shipping_state,
-      order.shipping_zip,
-      order.shipping_country,
-    ]
-      .filter((part) => Boolean(part && String(part).trim()))
-      .join(', ')
-
-    const companyInfo = await getPlatformCompanyEmailInfo()
-
-    const html = createInvoiceEmailHtml({
-      company: companyInfo,
-      customer_name: String(order.customer_name || 'Customer'),
-      order_id: String(order.order_id || order.id),
-      order_date: new Date(order.order_date).toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      }),
-      customer_email: String(order.customer_email || ''),
-      shipping_address: shippingParts || 'N/A',
-      seller_email: String(order.seller_email || ''),
-      grand_total: grandTotal,
-      tax_amount: totalInvoiceTax,
-      commission_amount: commission,
-      net_amount: netAmount,
-      items: invoiceItems,
-    })
-
-    const receiverEmail = String(order.customer_email)
-
-    if (!receiverEmail) {
-      return res.status(400).json({ message: 'Receiver email is missing' })
-    }
-
-    const subject = `Invoice for Order ${order.order_id}`
-    await sendEmail(receiverEmail, subject, html, { purpose: 'customers' })
-
-    res.status(200).json({
-      message: 'Invoice email sent successfully',
-      order_id: order.order_id,
-      customer_email: order.customer_email,
-      receiver_email: receiverEmail,
-      smtp_configured: smtpConfigured,
-      sender_email: config.SMTP.user || null,
-    })
-  } catch (error) {
-    console.error('Failed to send invoice email:', error)
-    const errorMessage = error instanceof Error ? error.message : 'Failed to send invoice email'
-    res.status(500).json({ message: errorMessage })
-  }
-})
-
-// ===== Update Order/Shipment Status =====
-app.put('/api/orders/:id', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const orderId = req.params.id
-  const {
-    order_status,
-    payout_status,
-    shipping_status,
-    tracking_number,
-    tracking_url,
-    send_tracking_email,
-    status_reason,
-  } = req.body
-
-  const shippingToOrderStatus: Record<string, string> = {
-    pending: 'pending',
-    label_generated: 'processing',
-    in_transit: 'shipped',
-    shipped: 'shipped',
-    delivered: 'delivered',
-    returned: 'returned',
-    cancelled: 'cancelled',
-    processing: 'processing',
-  }
-
-  const resolvedOrderStatus =
-    order_status || (shipping_status ? shippingToOrderStatus[String(shipping_status)] : undefined)
-
-  try {
-    // Check if order exists and belongs to the user
-    const [orders] = await db.query<RowDataPacket[]>(
-      'SELECT id, seller_id, order_id FROM sales WHERE id = ?',
-      [orderId]
-    )
-
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' })
-    }
-
-    if (orders[0].seller_id !== auth.id) {
-      return res.status(403).json({ message: 'You do not have permission to update this order' })
-    }
-
-    // Build update query dynamically based on provided fields
-    const updates: string[] = []
-    const values: any[] = []
-    const paymentDateColumnExists = payout_status ? await hasSalesPayoutPaymentDateColumn() : false
-
-    if (resolvedOrderStatus) {
-      updates.push('order_status = ?')
-      values.push(resolvedOrderStatus)
-    }
-
-    const statusReason = String(status_reason || '').trim()
-    if (resolvedOrderStatus === 'cancelled' || resolvedOrderStatus === 'returned') {
-      if (!statusReason) {
-        return res.status(400).json({
-          message: resolvedOrderStatus === 'returned' ? 'Return reason is required' : 'Cancellation reason is required',
-        })
-      }
-
-      await ensureSalesStatusReasonColumn()
-      updates.push('status_reason = ?')
-      values.push(statusReason)
-    }
-
-    if (resolvedOrderStatus === 'shipped') {
-      const tn = tracking_number ? String(tracking_number).trim() : null
-      if (!tn) {
-        return res.status(400).json({ message: 'A tracking number is required to mark an order as shipped.' })
-      }
-    }
-
-    if (payout_status) {
-      updates.push('payout_status = ?')
-      values.push(payout_status)
-
-      if (paymentDateColumnExists) {
-        if (payout_status === 'paid') {
-          updates.push('payout_payment_date = ?')
-          values.push(toCETDateTime())
-        } else if (payout_status === 'unpaid') {
-          updates.push('payout_payment_date = NULL')
+      ORDER BY id ASC`, [orderId]);
+        const isPrivateSeller = String(order.seller_profile_type || '').toLowerCase() === 'private';
+        const invoiceItems = itemRows.map((item: any) => ({
+            product_type: String(item.product_type || '').toLowerCase() === 'shipment' ? 'shipment' : 'item',
+            product_name: String(item.product_name || ''),
+            quantity: String(item.product_type || '').toLowerCase() === 'shipment' ? null : Number(item.quantity || 0),
+            unit_price: Number(item.unit_price || 0),
+            tax_amount: Number(item.tax_amount || 0),
+            total_price: Number(item.total_price || 0),
+            seller_key: String(order.seller_id || ''),
+            is_private_seller: String(item.product_type || '').toLowerCase() === 'shipment' ? false : isPrivateSeller,
+        }));
+        const totalInvoiceTax = invoiceItems.reduce((sum: any, item: any) => sum + Number(item.tax_amount || 0), 0);
+        const tax = Number(order.tax_amount || 0);
+        const commission = Number(order.commission_amount || 0);
+        const grandTotal = Number(order.grand_total || 0);
+        const netAmount = calculateNetEarning(grandTotal, tax, commission);
+        const shippingParts = [
+            order.shipping_street,
+            order.shipping_city,
+            order.shipping_state,
+            order.shipping_zip,
+            order.shipping_country,
+        ]
+            .filter((part: any) => Boolean(part && String(part).trim()))
+            .join(', ');
+        const companyInfo = await getPlatformCompanyEmailInfo();
+        const html = createInvoiceEmailHtml({
+            company: companyInfo,
+            customer_name: String(order.customer_name || 'Customer'),
+            order_id: String(order.order_id || order.id),
+            order_date: new Date(order.order_date).toLocaleDateString('en-US', {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+            }),
+            customer_email: String(order.customer_email || ''),
+            shipping_address: shippingParts || 'N/A',
+            seller_email: String(order.seller_email || ''),
+            grand_total: grandTotal,
+            tax_amount: totalInvoiceTax,
+            commission_amount: commission,
+            net_amount: netAmount,
+            items: invoiceItems,
+        });
+        const receiverEmail = String(order.customer_email);
+        if (!receiverEmail) {
+            return res.status(400).json({ message: 'Receiver email is missing' });
         }
-      }
+        const subject = `Invoice for Order ${order.order_id}`;
+        await sendEmail(receiverEmail, subject, html, { purpose: 'customers' });
+        res.status(200).json({
+            message: 'Invoice email sent successfully',
+            order_id: order.order_id,
+            customer_email: order.customer_email,
+            receiver_email: receiverEmail,
+            smtp_configured: smtpConfigured,
+            sender_email: config.SMTP.user || null,
+        });
     }
-
-    const trackingNumber = tracking_number ? String(tracking_number).trim() : null
-    const trackingUrl = tracking_url ? String(tracking_url).trim() : null
-    if (trackingNumber) {
-      updates.push('shipment_tracking_number = ?')
-      values.push(trackingNumber)
+    catch (error: any) {
+        console.error('Failed to send invoice email:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Failed to send invoice email';
+        res.status(500).json({ message: errorMessage });
     }
-
-    if (updates.length === 0) {
-      return res.status(400).json({ message: 'No fields to update' })
+});
+// ===== Update Order/Shipment Status =====
+app.post('/api/orders/validate-tracking-url', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const rawUrl = String(req.body?.url || '').trim();
+    if (!rawUrl) {
+        return res.status(400).json({ valid: false, message: 'Tracking URL is empty.' });
     }
+    let parsed: URL;
+    try {
+        parsed = new URL(rawUrl);
+    }
+    catch {
+        return res.status(400).json({ valid: false, message: 'Tracking URL must be a valid URL starting with http:// or https://.' });
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return res.status(400).json({ valid: false, message: 'Tracking URL must start with http:// or https://.' });
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+        !host ||
+        !host.includes('.') ||
+        host === 'localhost' ||
+        /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.|169\.254\.|0\.)/.test(host) ||
+        host === '::1'
+    ) {
+        return res.status(400).json({ valid: false, message: 'Please enter a valid public tracking URL.' });
+    }
+    try {
+        let response = await fetch(parsed.toString(), {
+            method: 'HEAD',
+            redirect: 'follow',
+            signal: AbortSignal.timeout(4500),
+            headers: { 'User-Agent': 'BarakahMart-TrackingCheck/1.0' },
+        });
+        if (response.status === 405 || response.status === 501) {
+            response = await fetch(parsed.toString(), {
+                method: 'GET',
+                redirect: 'follow',
+                signal: AbortSignal.timeout(4500),
+                headers: { 'User-Agent': 'BarakahMart-TrackingCheck/1.0' },
+            });
+        }
+        if (response.status === 404 || response.status === 410 || response.status >= 500) {
+            return res.status(400).json({ valid: false, message: `Tracking URL returned HTTP ${response.status} and does not appear to work.` });
+        }
+        return res.json({ valid: true, status: response.status });
+    }
+    catch {
+        return res.status(400).json({ valid: false, message: 'Tracking URL could not be reached. Please check the link and try again.' });
+    }
+});
 
-    values.push(orderId)
-
-    await db.query(
-      `UPDATE sales SET ${updates.join(', ')} WHERE id = ?`,
-      values
-    )
-
-    let emailSent = false
-    if (resolvedOrderStatus === 'shipped' && send_tracking_email === true && trackingNumber) {
-      try {
-        const [orderRows] = await db.query<RowDataPacket[]>(
-          `SELECT s.order_id, s.order_date,
+app.put('/api/orders/:id', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const orderId = req.params.id;
+    const { order_status, payout_status, shipping_status, tracking_number, tracking_url, send_tracking_email, status_reason, } = req.body;
+    const shippingToOrderStatus: Record<string, string> = {
+        pending: 'pending',
+        label_generated: 'processing',
+        in_transit: 'shipped',
+        shipped: 'shipped',
+        delivered: 'delivered',
+        returned: 'returned',
+        cancelled: 'cancelled',
+        processing: 'processing',
+    };
+    const resolvedOrderStatus = order_status || (shipping_status ? shippingToOrderStatus[String(shipping_status)] : undefined);
+    try {
+        // Check if order exists and belongs to the user
+        const [orders] = await db.query<any>('SELECT id, seller_id, order_id FROM sales WHERE id = ?', [orderId]);
+        if (orders.length === 0) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        if (orders[0].seller_id !== auth.id) {
+            return res.status(403).json({ message: 'You do not have permission to update this order' });
+        }
+        // Build update query dynamically based on provided fields
+        const updates = [];
+        const values = [];
+        const paymentDateColumnExists = payout_status ? await hasSalesPayoutPaymentDateColumn() : false;
+        if (resolvedOrderStatus) {
+            updates.push('order_status = ?');
+            values.push(resolvedOrderStatus);
+        }
+        const statusReason = String(status_reason || '').trim();
+        if (resolvedOrderStatus === 'returned') {
+            await ensureDisputeTables();
+            const [disputeRows] = await db.query<any>('SELECT id FROM disputes WHERE sale_id = ? LIMIT 1', [orders[0].id]);
+            if (!disputeRows.length) {
+                return res.status(403).json({
+                    message: 'Return status can only be selected when there is a dispute for this order.',
+                });
+            }
+        }
+        if (resolvedOrderStatus === 'cancelled' || resolvedOrderStatus === 'returned') {
+            if (!statusReason) {
+                return res.status(400).json({
+                    message: resolvedOrderStatus === 'returned' ? 'Return reason is required' : 'Cancellation reason is required',
+                });
+            }
+            await ensureSalesStatusReasonColumn();
+            updates.push('status_reason = ?');
+            values.push(statusReason);
+        }
+        if (resolvedOrderStatus === 'shipped') {
+            const tn = tracking_number ? String(tracking_number).trim() : null;
+            if (!tn) {
+                return res.status(400).json({ message: 'A tracking number is required to mark an order as shipped.' });
+            }
+        }
+        if (payout_status) {
+            updates.push('payout_status = ?');
+            values.push(payout_status);
+            if (paymentDateColumnExists) {
+                if (payout_status === 'paid') {
+                    updates.push('payout_payment_date = ?');
+                    values.push(toCETDateTime());
+                }
+                else if (payout_status === 'unpaid') {
+                    updates.push('payout_payment_date = NULL');
+                }
+            }
+        }
+        const trackingNumber = tracking_number ? String(tracking_number).trim() : null;
+        const trackingUrl = tracking_url ? String(tracking_url).trim() : null;
+        if (trackingNumber) {
+            updates.push('shipment_tracking_number = ?');
+            values.push(trackingNumber);
+        }
+        if (updates.length === 0) {
+            return res.status(400).json({ message: 'No fields to update' });
+        }
+        values.push(orderId);
+        await db.query<any>(`UPDATE sales SET ${updates.join(', ')} WHERE id = ?`, values);
+        let emailSent = false;
+        if (resolvedOrderStatus === 'shipped' && send_tracking_email === true && trackingNumber) {
+            try {
+                const [orderRows] = await db.query<any>(`SELECT s.order_id, s.order_date,
                   c.name AS customer_name, c.email AS customer_email,
                   c.shipping_street, c.shipping_city, c.shipping_state, c.shipping_zip, c.shipping_country
            FROM sales s
            LEFT JOIN customers c ON s.customer_id = c.id
            WHERE s.id = ?
-           LIMIT 1`,
-          [orderId]
-        )
-        if (orderRows.length > 0) {
-          const o = orderRows[0]
-          const customerEmail = String(o.customer_email || '')
-          if (customerEmail) {
-            const shippingParts = [o.shipping_street, o.shipping_city, o.shipping_state, o.shipping_zip, o.shipping_country]
-              .filter((p) => Boolean(p && String(p).trim()))
-              .join(', ')
-            const defaultTrackingBase = String(config.POSTNORD_TRACKING_BASE_URL || '').trim()
-            const defaultTrackingUrl = defaultTrackingBase
-              ? `${defaultTrackingBase}${encodeURIComponent(trackingNumber)}`
-              : null
-            const finalTrackingUrl = trackingUrl || defaultTrackingUrl || ''
-            const companyInfo = await getPlatformCompanyEmailInfo()
-            const html = createShipmentNotificationEmailHtml({
-              company: companyInfo,
-              customer_name: String(o.customer_name || 'Customer'),
-              order_id: String(o.order_id || orderId),
-              order_date: o.order_date ? new Date(o.order_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '',
-              tracking_number: trackingNumber,
-              tracking_url: finalTrackingUrl,
-              shipping_address: shippingParts || 'N/A',
-            })
-            await sendEmail(customerEmail, `Your order has been shipped! Tracking: ${trackingNumber}`, html, { purpose: 'customers' })
-            emailSent = true
-          }
+           LIMIT 1`, [orderId]);
+                if (orderRows.length > 0) {
+                    const o = orderRows[0];
+                    const customerEmail = String(o.customer_email || '');
+                    if (customerEmail) {
+                        const shippingParts = [o.shipping_street, o.shipping_city, o.shipping_state, o.shipping_zip, o.shipping_country]
+                            .filter((p: any) => Boolean(p && String(p).trim()))
+                            .join(', ');
+                        const defaultTrackingBase = String(config.POSTNORD_TRACKING_BASE_URL || '').trim();
+                        const defaultTrackingUrl = defaultTrackingBase
+                            ? `${defaultTrackingBase}${encodeURIComponent(trackingNumber)}`
+                            : null;
+                        const finalTrackingUrl = trackingUrl || defaultTrackingUrl || '';
+                        const companyInfo = await getPlatformCompanyEmailInfo();
+                        const html = createShipmentNotificationEmailHtml({
+                            company: companyInfo,
+                            customer_name: String(o.customer_name || 'Customer'),
+                            order_id: String(o.order_id || orderId),
+                            order_date: o.order_date ? new Date(o.order_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }) : '',
+                            tracking_number: trackingNumber,
+                            tracking_url: finalTrackingUrl,
+                            shipping_address: shippingParts || 'N/A',
+                        });
+                        await sendEmail(customerEmail, `Your order has been shipped! Tracking: ${trackingNumber}`, html, { purpose: 'customers' });
+                        emailSent = true;
+                    }
+                }
+            }
+            catch (emailErr: any) {
+                console.error('[Shipment email error]', emailErr);
+            }
         }
-      } catch (emailErr) {
-        console.error('[Shipment email error]', emailErr)
-      }
+        emitToSeller(auth.id, 'order:updated', {
+            sale_id: Number(orderId),
+            order_id: String(orders[0].order_id || orderId),
+            order_status: resolvedOrderStatus || null,
+            payout_status: payout_status || null,
+            shipping_status: shipping_status || null,
+        });
+        emitToAdmin('order:status-changed', {
+            sale_id: Number(orderId),
+            seller_id: auth.id,
+            order_id: String(orders[0].order_id || orderId),
+            order_status: resolvedOrderStatus || null,
+            payout_status: payout_status || null,
+        });
+        res.status(200).json({
+            id: orderId,
+            message: 'Order updated successfully',
+            email_sent: emailSent,
+        });
     }
-
-    emitToSeller(auth.id, 'order:updated', {
-      sale_id: Number(orderId),
-      order_id: String(orders[0].order_id || orderId),
-      order_status: resolvedOrderStatus || null,
-      payout_status: payout_status || null,
-      shipping_status: shipping_status || null,
-    })
-    emitToAdmin('order:status-changed', {
-      sale_id: Number(orderId),
-      seller_id: auth.id,
-      order_id: String(orders[0].order_id || orderId),
-      order_status: resolvedOrderStatus || null,
-      payout_status: payout_status || null,
-    })
-
-    res.status(200).json({
-      id: orderId,
-      message: 'Order updated successfully',
-      email_sent: emailSent,
-    })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 // ===== Shipment Cost Check =====
 app.post('/api/shipment/cost', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  try {
-    const payload = req.body || {}
-    const portalFareEndpointPath = '/api/pricing/agreementProduct'
-
-    // Fetch seller records from DB using exact table/column names.
-    const [sellerUserRows] = await db.query<RowDataPacket[]>(
-      'SELECT * FROM users WHERE id = ? LIMIT 1',
-      [auth.id],
-    )
-    const [sellerProfileRows] = await db.query<RowDataPacket[]>(
-      `SELECT *
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        const payload = req.body || {};
+        const portalFareEndpointPath = '/api/pricing/agreementProduct';
+        // Fetch seller records from DB using exact table/column names.
+        const [sellerUserRows] = await db.query<any>('SELECT * FROM users WHERE id = ? LIMIT 1', [auth.id]);
+        const [sellerProfileRows] = await db.query<any>(`SELECT *
        FROM profiles
        WHERE user_id = ?
        ORDER BY created_at DESC, id DESC
-       LIMIT 1`,
-      [auth.id],
-    )
-
-    const db_seller_user = sellerUserRows[0]
-    const db_seller_profile = sellerProfileRows[0]
-
-    // Map sender directly from DB columns and allow payload override if provided.
-    const senderAddressFromDb = {
-      name: String(
-        db_seller_profile?.company_name
-        || `${String(db_seller_profile?.first_name || '').trim()} ${String(db_seller_profile?.last_name || '').trim()}`.trim()
-        || 'Sender',
-      ).trim(),
-      street: String(db_seller_profile?.street || '').trim(),
-      city: String(db_seller_profile?.city || '').trim(),
-      postalCode: String(db_seller_profile?.zip || '').trim(),
-      countryCode: normalizeCountryCode(db_seller_profile?.country || 'SE'),
-      emailAddress: String(db_seller_user?.email || '').trim() || undefined,
-      smsNo: String(db_seller_profile?.phone || '').trim() || undefined,
-      phoneNo: String(db_seller_profile?.phone || '').trim() || undefined,
-    }
-
-    const senderAddress = payload.senderAddress && typeof payload.senderAddress === 'object'
-      ? {
-          ...senderAddressFromDb,
-          ...payload.senderAddress,
-          emailAddress: String(payload.senderAddress.emailAddress || senderAddressFromDb.emailAddress || '').trim() || undefined,
+       LIMIT 1`, [auth.id]);
+        const db_seller_user = sellerUserRows[0];
+        const db_seller_profile = sellerProfileRows[0];
+        // Map sender directly from DB columns and allow payload override if provided.
+        const senderAddressFromDb = {
+            name: String(db_seller_profile?.company_name
+                || `${String(db_seller_profile?.first_name || '').trim()} ${String(db_seller_profile?.last_name || '').trim()}`.trim()
+                || 'Sender').trim(),
+            street: String(db_seller_profile?.street || '').trim(),
+            city: String(db_seller_profile?.city || '').trim(),
+            postalCode: String(db_seller_profile?.zip || '').trim(),
+            countryCode: normalizeCountryCode(db_seller_profile?.country || 'SE'),
+            emailAddress: String(db_seller_user?.email || '').trim() || undefined,
+            smsNo: String(db_seller_profile?.phone || '').trim() || undefined,
+            phoneNo: String(db_seller_profile?.phone || '').trim() || undefined,
+        };
+        const senderAddress = payload.senderAddress && typeof payload.senderAddress === 'object'
+            ? {
+                ...senderAddressFromDb,
+                ...payload.senderAddress,
+                emailAddress: String(payload.senderAddress.emailAddress || senderAddressFromDb.emailAddress || '').trim() || undefined,
+            }
+            : senderAddressFromDb;
+        const normalizedSenderAddress = {
+            ...senderAddress,
+            countryCode: normalizeCountryCode(senderAddress.countryCode),
+        };
+        const customerIdFromPayload = Number(payload.customer_id ?? payload.customerId);
+        const saleIdFromPayload = Number(payload.sale_id ?? payload.saleId);
+        let customerId = Number.isFinite(customerIdFromPayload) && customerIdFromPayload > 0
+            ? customerIdFromPayload
+            : NaN;
+        let db_customer;
+        if ((!Number.isFinite(customerId) || customerId <= 0) && Number.isFinite(saleIdFromPayload) && saleIdFromPayload > 0) {
+            const [saleRows] = await db.query<any>('SELECT * FROM sales WHERE id = ? AND seller_id = ? LIMIT 1', [saleIdFromPayload, auth.id]);
+            if (saleRows.length > 0) {
+                const resolvedCustomerId = Number(saleRows[0].customer_id);
+                if (Number.isFinite(resolvedCustomerId) && resolvedCustomerId > 0) {
+                    customerId = resolvedCustomerId;
+                }
+            }
         }
-      : senderAddressFromDb
-
-    const normalizedSenderAddress = {
-      ...senderAddress,
-      countryCode: normalizeCountryCode(senderAddress.countryCode),
-    }
-
-    const customerIdFromPayload = Number(payload.customer_id ?? payload.customerId)
-    const saleIdFromPayload = Number(payload.sale_id ?? payload.saleId)
-    let customerId = Number.isFinite(customerIdFromPayload) && customerIdFromPayload > 0
-      ? customerIdFromPayload
-      : NaN
-    let db_customer: RowDataPacket | undefined
-
-    if ((!Number.isFinite(customerId) || customerId <= 0) && Number.isFinite(saleIdFromPayload) && saleIdFromPayload > 0) {
-      const [saleRows] = await db.query<RowDataPacket[]>(
-        'SELECT * FROM sales WHERE id = ? AND seller_id = ? LIMIT 1',
-        [saleIdFromPayload, auth.id],
-      )
-      if (saleRows.length > 0) {
-        const resolvedCustomerId = Number(saleRows[0].customer_id)
-        if (Number.isFinite(resolvedCustomerId) && resolvedCustomerId > 0) {
-          customerId = resolvedCustomerId
+        if (Number.isFinite(customerId) && customerId > 0) {
+            const [customerRows] = await db.query<any>('SELECT * FROM customers WHERE id = ? LIMIT 1', [customerId]);
+            if (customerRows.length > 0) {
+                db_customer = customerRows[0];
+            }
         }
-      }
-    }
-
-    if (Number.isFinite(customerId) && customerId > 0) {
-      const [customerRows] = await db.query<RowDataPacket[]>(
-        'SELECT * FROM customers WHERE id = ? LIMIT 1',
-        [customerId],
-      )
-      if (customerRows.length > 0) {
-        db_customer = customerRows[0]
-      }
-    }
-
-    const toEmail = String(db_customer?.email || '').trim() || undefined
-
-    const toMobilePhone = String(db_customer?.phone || '').trim() || undefined
-
-    const dbRecipientAddress = db_customer?.shipping_street || db_customer?.shipping_city || db_customer?.shipping_zip || db_customer?.shipping_country
-      ? {
-          name: String(db_customer?.name || '').trim() || undefined,
-          street: String(db_customer?.shipping_street || '').trim() || undefined,
-          city: String(db_customer?.shipping_city || '').trim() || undefined,
-          state: String(db_customer?.shipping_state || '').trim() || undefined,
-          postalCode: String(db_customer?.shipping_zip || '').trim() || undefined,
-          countryCode: normalizeCountryCode(db_customer?.shipping_country),
-          emailAddress: toEmail,
-          smsNo: toMobilePhone,
-          phoneNo: toMobilePhone,
+        const toEmail = String(db_customer?.email || '').trim() || undefined;
+        const toMobilePhone = String(db_customer?.phone || '').trim() || undefined;
+        const dbRecipientAddress = db_customer?.shipping_street || db_customer?.shipping_city || db_customer?.shipping_zip || db_customer?.shipping_country
+            ? {
+                name: String(db_customer?.name || '').trim() || undefined,
+                street: String(db_customer?.shipping_street || '').trim() || undefined,
+                city: String(db_customer?.shipping_city || '').trim() || undefined,
+                state: String(db_customer?.shipping_state || '').trim() || undefined,
+                postalCode: String(db_customer?.shipping_zip || '').trim() || undefined,
+                countryCode: normalizeCountryCode(db_customer?.shipping_country),
+                emailAddress: toEmail,
+                smsNo: toMobilePhone,
+                phoneNo: toMobilePhone,
+            }
+            : undefined;
+        const rawRecipientAddress = payload.address && typeof payload.address === 'object'
+            ? payload.address
+            : (payload.shippingAddress && typeof payload.shippingAddress === 'object'
+                ? payload.shippingAddress
+                : undefined);
+        const recipientAddress = rawRecipientAddress
+            ? {
+                ...dbRecipientAddress,
+                ...rawRecipientAddress,
+                countryCode: normalizeCountryCode(rawRecipientAddress.countryCode),
+                emailAddress: String(rawRecipientAddress.emailAddress || toEmail || '').trim() || undefined,
+                smsNo: String(rawRecipientAddress.smsNo || toMobilePhone || '').trim() || undefined,
+                phoneNo: String(rawRecipientAddress.phoneNo || toMobilePhone || '').trim() || undefined,
+            }
+            : dbRecipientAddress;
+        const servicePointAddressLine1 = String(payload.servicePointAddressLine1
+            || db_customer?.shipping_street
+            || recipientAddress?.street
+            || '').trim() || undefined;
+        const servicePointArea = String(payload.servicePointArea
+            || db_customer?.shipping_city
+            || recipientAddress?.city
+            || '').trim() || undefined;
+        const prefs = payload.shipmentPreferences || {};
+        const productType = prefs.weightClass === 'light' ? 'LETTER' : 'PARCEL';
+        let shipTo = 'HOME';
+        let pickup = 'NO_PICKUP';
+        let packageType;
+        if (prefs.pickupOption === 'pickup_possible') {
+            shipTo = 'HOME';
+            pickup = 'BOOK_PICKUP';
+            packageType = undefined;
         }
-      : undefined
-
-    const rawRecipientAddress = payload.address && typeof payload.address === 'object'
-      ? payload.address
-      : (payload.shippingAddress && typeof payload.shippingAddress === 'object'
-        ? payload.shippingAddress
-        : undefined)
-
-    const recipientAddress = rawRecipientAddress
-      ? {
-          ...dbRecipientAddress,
-          ...rawRecipientAddress,
-          countryCode: normalizeCountryCode(rawRecipientAddress.countryCode),
-          emailAddress: String(rawRecipientAddress.emailAddress || toEmail || '').trim() || undefined,
-          smsNo: String(rawRecipientAddress.smsNo || toMobilePhone || '').trim() || undefined,
-          phoneNo: String(rawRecipientAddress.phoneNo || toMobilePhone || '').trim() || undefined,
+        else if (prefs.deliverTo === 'service_point') {
+            shipTo = 'SERVICEPOINT';
+            pickup = 'NO_PICKUP';
+            packageType = undefined;
         }
-      : dbRecipientAddress
-
-    const servicePointAddressLine1 = String(
-      payload.servicePointAddressLine1
-      || db_customer?.shipping_street
-      || recipientAddress?.street
-      || '',
-    ).trim() || undefined
-
-    const servicePointArea = String(
-      payload.servicePointArea
-      || db_customer?.shipping_city
-      || recipientAddress?.city
-      || '',
-    ).trim() || undefined
-
-    const prefs = payload.shipmentPreferences || {}
-    const productType: string =
-      prefs.weightClass === 'light' ? 'LETTER' : 'PARCEL'
-
-    let shipTo: 'HOME' | 'SERVICEPOINT' = 'HOME'
-    let pickup: 'NO_PICKUP' | 'BOOK_PICKUP' = 'NO_PICKUP'
-    let packageType: string | undefined
-
-    if (prefs.pickupOption === 'pickup_possible') {
-      shipTo = 'HOME'
-      pickup = 'BOOK_PICKUP'
-      packageType = undefined
-    } else if (prefs.deliverTo === 'service_point') {
-      shipTo = 'SERVICEPOINT'
-      pickup = 'NO_PICKUP'
-      packageType = undefined
-    } else {
-      shipTo = 'HOME'
-      pickup = 'NO_PICKUP'
-      packageType = prefs.deliveryTimeOption === 'standard' ? '1DAY' : '3DAY'
+        else {
+            shipTo = 'HOME';
+            pickup = 'NO_PICKUP';
+            packageType = prefs.deliveryTimeOption === 'standard' ? '1DAY' : '3DAY';
+        }
+        const additionalInformation = typeof prefs.additionalInformation === 'boolean' ? prefs.additionalInformation : true;
+        const cost = await estimateShipmentCost({
+            address: recipientAddress,
+            senderAddress: normalizedSenderAddress,
+            dimensions: payload.dimensions,
+            weightKg: Number(payload.weightKg),
+            toEmail,
+            toMobilePhone,
+            serviceCode: payload.serviceCode,
+            additionalServiceCodes: payload.additionalServiceCodes,
+            endpointPath: portalFareEndpointPath,
+            shipTo: shipTo as any,
+            pickup: pickup as any,
+            packageType,
+            productType,
+            additionalInformation,
+            // Ensure required PostNord fare fields are always present.
+            servicePointAddressLine1,
+            servicePointArea,
+            language: String(payload.language || 'en').trim() || 'en',
+        });
+        return res.status(200).json(cost);
     }
-
-    const additionalInformation: boolean =
-      typeof prefs.additionalInformation === 'boolean' ? prefs.additionalInformation : true
-
-    const cost = await estimateShipmentCost({
-      address: recipientAddress,
-      senderAddress: normalizedSenderAddress,
-      dimensions: payload.dimensions,
-      weightKg: Number(payload.weightKg),
-      toEmail,
-      toMobilePhone,
-      serviceCode: payload.serviceCode,
-      additionalServiceCodes: payload.additionalServiceCodes,
-      endpointPath: portalFareEndpointPath,
-      shipTo,
-      pickup,
-      packageType,
-      productType,
-      additionalInformation,
-      // Ensure required PostNord fare fields are always present.
-      servicePointAddressLine1,
-      servicePointArea,
-      language: String(payload.language || 'en').trim() || 'en',
-    })
-
-    return res.status(200).json(cost)
-  } catch (error) {
-    console.error('Shipment cost check failed:', error)
-    const message = error instanceof Error ? error.message : 'Failed to check shipment cost'
-    const statusCodeRaw = (error as { statusCode?: unknown })?.statusCode
-    const details = (error as { details?: unknown })?.details
-    const statusCode = typeof statusCodeRaw === 'number' && statusCodeRaw >= 400 && statusCodeRaw < 600
-      ? statusCodeRaw
-      : 500
-    const explanationText = Array.isArray((details as any)?.compositeFault?.faults)
-      ? (details as any).compositeFault.faults
-          .map((fault: any) => String(fault?.explanationText || fault?.message || '').trim())
-          .filter((value: string) => Boolean(value))
-          .join(' | ')
-      : undefined
-
-    return res.status(statusCode).json({
-      message,
-      explanationText,
-      details,
-    })
-  }
-})
-
+    catch (error: any) {
+        console.error('Shipment cost check failed:', error);
+        const message = error instanceof Error ? error.message : 'Failed to check shipment cost';
+        const statusCodeRaw = error?.statusCode;
+        const details = error?.details;
+        const statusCode = typeof statusCodeRaw === 'number' && statusCodeRaw >= 400 && statusCodeRaw < 600
+            ? statusCodeRaw
+            : 500;
+        const explanationText = Array.isArray(details?.compositeFault?.faults)
+            ? details.compositeFault.faults
+                .map((fault: any) => String(fault?.explanationText || fault?.message || '').trim())
+                .filter((value: any) => Boolean(value))
+                .join(' | ')
+            : undefined;
+        return res.status(statusCode).json({
+            message,
+            explanationText,
+            details,
+        });
+    }
+});
 // ===== Shipment Label Generate + Store =====
 app.post('/api/shipment/label', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const payload = req.body || {}
-  const saleId = Number(payload.sale_id)
-
-  try {
-    await ensureShipmentLabelsTable()
-    await ensureSalesShipmentColumns()
-
-    let orderId: string | null = null
-    let customerId: number | null = null
-    if (Number.isFinite(saleId) && saleId > 0) {
-      const [orderRows] = await db.query<RowDataPacket[]>(
-        'SELECT id, order_id, seller_id, customer_id FROM sales WHERE id = ? LIMIT 1',
-        [saleId],
-      )
-
-      if (!orderRows.length) {
-        return res.status(404).json({ message: 'Order not found for provided sale_id' })
-      }
-
-      if (Number(orderRows[0].seller_id) !== auth.id) {
-        return res.status(403).json({ message: 'You do not have permission for this order' })
-      }
-
-      orderId = String(orderRows[0].order_id || '') || null
-      customerId = Number(orderRows[0].customer_id || 0) || null
-    }
-
-    const [sellerUserRows] = await db.query<RowDataPacket[]>(
-      'SELECT * FROM users WHERE id = ? LIMIT 1',
-      [auth.id],
-    )
-    const [sellerProfileRows] = await db.query<RowDataPacket[]>(
-      `SELECT *
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const payload = req.body || {};
+    const saleId = Number(payload.sale_id);
+    try {
+        await ensureShipmentLabelsTable();
+        await ensureSalesShipmentColumns();
+        let orderId = null;
+        let customerId = null;
+        if (Number.isFinite(saleId) && saleId > 0) {
+            const [orderRows] = await db.query<any>('SELECT id, order_id, seller_id, customer_id FROM sales WHERE id = ? LIMIT 1', [saleId]);
+            if (!orderRows.length) {
+                return res.status(404).json({ message: 'Order not found for provided sale_id' });
+            }
+            if (Number(orderRows[0].seller_id) !== auth.id) {
+                return res.status(403).json({ message: 'You do not have permission for this order' });
+            }
+            orderId = String(orderRows[0].order_id || '') || null;
+            customerId = Number(orderRows[0].customer_id || 0) || null;
+        }
+        const [sellerUserRows] = await db.query<any>('SELECT * FROM users WHERE id = ? LIMIT 1', [auth.id]);
+        const [sellerProfileRows] = await db.query<any>(`SELECT *
        FROM profiles
        WHERE user_id = ?
        ORDER BY created_at DESC, id DESC
-       LIMIT 1`,
-      [auth.id],
-    )
-
-    const dbSellerUser = sellerUserRows[0]
-    const dbSellerProfile = sellerProfileRows[0]
-
-    const senderAddress = {
-      name: String(
-        dbSellerProfile?.company_name
-        || `${String(dbSellerProfile?.first_name || '').trim()} ${String(dbSellerProfile?.last_name || '').trim()}`.trim()
-        || 'Sender',
-      ).trim(),
-      companyName: String(dbSellerProfile?.company_name || '').trim() || undefined,
-      street: String(dbSellerProfile?.street || '').trim(),
-      postalCode: String(dbSellerProfile?.zip || '').trim(),
-      city: String(dbSellerProfile?.city || '').trim(),
-      countryCode: normalizeCountryCode(dbSellerProfile?.country || 'SE'),
-      contactName: `${String(dbSellerProfile?.first_name || '').trim()} ${String(dbSellerProfile?.last_name || '').trim()}`.trim() || undefined,
-      emailAddress: String(dbSellerUser?.email || '').trim() || undefined,
-      phoneNo: String(dbSellerProfile?.phone || '').trim() || undefined,
-      smsNo: String(dbSellerProfile?.phone || '').trim() || undefined,
-    }
-
-    let dbCustomer: RowDataPacket | undefined
-    if (!customerId) {
-      const customerIdFromPayload = Number(payload.customer_id ?? payload.customerId)
-      if (Number.isFinite(customerIdFromPayload) && customerIdFromPayload > 0) {
-        customerId = customerIdFromPayload
-      }
-    }
-
-    if (Number.isFinite(customerId) && Number(customerId) > 0) {
-      const [customerRows] = await db.query<RowDataPacket[]>(
-        'SELECT * FROM customers WHERE id = ? LIMIT 1',
-        [customerId],
-      )
-      if (customerRows.length > 0) {
-        dbCustomer = customerRows[0]
-      }
-    }
-
-    const recipientAddress = {
-      name: String(dbCustomer?.name || payload.address?.name || 'Customer').trim(),
-      companyName: String(dbCustomer?.name || payload.address?.companyName || '').trim() || undefined,
-      street: String(dbCustomer?.shipping_street || payload.address?.street || '').trim(),
-      postalCode: String(dbCustomer?.shipping_zip || payload.address?.postalCode || '').trim(),
-      city: String(dbCustomer?.shipping_city || payload.address?.city || '').trim(),
-      countryCode: normalizeCountryCode(dbCustomer?.shipping_country || payload.address?.countryCode || 'SE'),
-      contactName: String(dbCustomer?.name || payload.address?.contactName || payload.address?.name || '').trim() || undefined,
-      emailAddress: String(dbCustomer?.email || payload.address?.emailAddress || '').trim() || undefined,
-      phoneNo: String(dbCustomer?.phone || payload.address?.phoneNo || payload.address?.phone || '').trim() || undefined,
-      smsNo: String(dbCustomer?.phone || payload.address?.smsNo || payload.address?.phone || '').trim() || undefined,
-    }
-
-    const generated = await generateShipmentLabel({
-      address: recipientAddress,
-      senderAddress,
-      dimensions: payload.dimensions,
-      weightKg: Number(payload.weightKg),
-      referenceNo: payload.referenceNo,
-      serviceCode: payload.serviceCode,
-      additionalServiceCodes: payload.additionalServiceCodes,
-      paperSize: payload.paperSize,
-      labelType: payload.labelType,
-      endpointPath: payload.endpointPath,
-      externalPayload: payload.externalPayload,
-    })
-
-    if (!generated.contentBuffer) {
-      return res.status(502).json({
-        message: 'Provider did not return a downloadable label binary.',
-        provider_response: generated.raw,
-      })
-    }
-
-    const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR)
-    ensureDir(labelsDir)
-
-    const ext = generated.fileName.includes('.')
-      ? generated.fileName.split('.').pop()
-      : generated.mimeType.includes('pdf') ? 'pdf' : generated.mimeType.startsWith('image/') ? 'png' : 'bin'
-
-    const savedFileName = `label-${Date.now()}-${Math.floor(Math.random() * 100000)}.${ext}`
-    const savedFilePath = path.join(labelsDir, savedFileName)
-    fs.writeFileSync(savedFilePath, generated.contentBuffer)
-
-    const fileUrl = `/uploads/shipment_labels/${savedFileName}`
-    const estimatedCostRaw = Number(payload.estimatedCost)
-    const estimatedCost = Number.isFinite(estimatedCostRaw) ? roundToTwo(estimatedCostRaw) : null
-    const estimatedCurrency = payload.estimatedCurrency ? String(payload.estimatedCurrency).toUpperCase() : null
-
-    await db.query<ResultSetHeader>(
-      `INSERT INTO shipment_labels (
+       LIMIT 1`, [auth.id]);
+        const dbSellerUser = sellerUserRows[0];
+        const dbSellerProfile = sellerProfileRows[0];
+        const senderAddress = {
+            name: String(dbSellerProfile?.company_name
+                || `${String(dbSellerProfile?.first_name || '').trim()} ${String(dbSellerProfile?.last_name || '').trim()}`.trim()
+                || 'Sender').trim(),
+            companyName: String(dbSellerProfile?.company_name || '').trim() || undefined,
+            street: String(dbSellerProfile?.street || '').trim(),
+            postalCode: String(dbSellerProfile?.zip || '').trim(),
+            city: String(dbSellerProfile?.city || '').trim(),
+            countryCode: normalizeCountryCode(dbSellerProfile?.country || 'SE'),
+            contactName: `${String(dbSellerProfile?.first_name || '').trim()} ${String(dbSellerProfile?.last_name || '').trim()}`.trim() || undefined,
+            emailAddress: String(dbSellerUser?.email || '').trim() || undefined,
+            phoneNo: String(dbSellerProfile?.phone || '').trim() || undefined,
+            smsNo: String(dbSellerProfile?.phone || '').trim() || undefined,
+        };
+        let dbCustomer;
+        if (!customerId) {
+            const customerIdFromPayload = Number(payload.customer_id ?? payload.customerId);
+            if (Number.isFinite(customerIdFromPayload) && customerIdFromPayload > 0) {
+                customerId = customerIdFromPayload;
+            }
+        }
+        if (Number.isFinite(customerId) && Number(customerId) > 0) {
+            const [customerRows] = await db.query<any>('SELECT * FROM customers WHERE id = ? LIMIT 1', [customerId]);
+            if (customerRows.length > 0) {
+                dbCustomer = customerRows[0];
+            }
+        }
+        const recipientAddress = {
+            name: String(dbCustomer?.name || payload.address?.name || 'Customer').trim(),
+            companyName: String(dbCustomer?.name || payload.address?.companyName || '').trim() || undefined,
+            street: String(dbCustomer?.shipping_street || payload.address?.street || '').trim(),
+            postalCode: String(dbCustomer?.shipping_zip || payload.address?.postalCode || '').trim(),
+            city: String(dbCustomer?.shipping_city || payload.address?.city || '').trim(),
+            countryCode: normalizeCountryCode(dbCustomer?.shipping_country || payload.address?.countryCode || 'SE'),
+            contactName: String(dbCustomer?.name || payload.address?.contactName || payload.address?.name || '').trim() || undefined,
+            emailAddress: String(dbCustomer?.email || payload.address?.emailAddress || '').trim() || undefined,
+            phoneNo: String(dbCustomer?.phone || payload.address?.phoneNo || payload.address?.phone || '').trim() || undefined,
+            smsNo: String(dbCustomer?.phone || payload.address?.smsNo || payload.address?.phone || '').trim() || undefined,
+        };
+        const generated = await generateShipmentLabel({
+            address: recipientAddress,
+            senderAddress,
+            dimensions: payload.dimensions,
+            weightKg: Number(payload.weightKg),
+            referenceNo: payload.referenceNo,
+            serviceCode: payload.serviceCode,
+            additionalServiceCodes: payload.additionalServiceCodes,
+            paperSize: payload.paperSize,
+            labelType: payload.labelType,
+            endpointPath: payload.endpointPath,
+            externalPayload: payload.externalPayload,
+        });
+        if (!generated.contentBuffer) {
+            return res.status(502).json({
+                message: 'Provider did not return a downloadable label binary.',
+                provider_response: generated.raw,
+            });
+        }
+        const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR);
+        ensureDir(labelsDir);
+        const ext = generated.fileName.includes('.')
+            ? generated.fileName.split('.').pop()
+            : generated.mimeType.includes('pdf') ? 'pdf' : generated.mimeType.startsWith('image/') ? 'png' : 'bin';
+        const savedFileName = `label-${Date.now()}-${Math.floor(Math.random() * 100000)}.${ext}`;
+        const savedFilePath = path.join(labelsDir, savedFileName);
+        fs.writeFileSync(savedFilePath, generated.contentBuffer);
+        const fileUrl = `/uploads/shipment_labels/${savedFileName}`;
+        const estimatedCostRaw = Number(payload.estimatedCost);
+        const estimatedCost = Number.isFinite(estimatedCostRaw) ? roundToTwo(estimatedCostRaw) : null;
+        const estimatedCurrency = payload.estimatedCurrency ? String(payload.estimatedCurrency).toUpperCase() : null;
+        await db.query<any>(`INSERT INTO shipment_labels (
         sale_id,
         seller_id,
         order_id,
@@ -13535,223 +14943,181 @@ app.post('/api/shipment/label', async (req: Request, res: Response) => {
         estimated_cost,
         estimated_currency,
         provider
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'postnord')`,
-      [
-        Number.isFinite(saleId) && saleId > 0 ? saleId : null,
-        auth.id,
-        orderId,
-        generated.bookingId,
-        generated.trackingNumber,
-        generated.format,
-        generated.mimeType,
-        savedFileName,
-        savedFilePath,
-        generated.contentBuffer.length,
-        fileUrl,
-        estimatedCost,
-        estimatedCurrency,
-      ],
-    )
-
-    if (Number.isFinite(saleId) && saleId > 0) {
-      const updateFields: string[] = ['order_status = ?']
-      const updateValues: unknown[] = ['shipped']
-
-      if (await hasSalesShipmentTrackingNumberColumn()) {
-        updateFields.push('shipment_tracking_number = ?')
-        updateValues.push(generated.trackingNumber || null)
-      }
-      if (await hasSalesShipmentLabelUrlColumn()) {
-        updateFields.push('shipment_label_url = ?')
-        updateValues.push(fileUrl)
-      }
-      if (await hasSalesShipmentLabelMimeTypeColumn()) {
-        updateFields.push('shipment_label_mime_type = ?')
-        updateValues.push(generated.mimeType || null)
-      }
-      if (await hasSalesShipmentLabelGeneratedAtColumn()) {
-        updateFields.push('shipment_label_generated_at = ?')
-        updateValues.push(toCETDateTime())
-      }
-      if (await hasSalesShipmentBookingIdColumn()) {
-        updateFields.push('shipment_booking_id = ?')
-        updateValues.push(generated.bookingId || null)
-      }
-
-      updateValues.push(saleId, auth.id)
-      await db.query(
-        `UPDATE sales SET ${updateFields.join(', ')} WHERE id = ? AND seller_id = ?`,
-        updateValues,
-      )
-
-      await upsertShipmentLabelExpenseForSale(saleId, auth.id, estimatedCost)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'postnord')`, [
+            Number.isFinite(saleId) && saleId > 0 ? saleId : null,
+            auth.id,
+            orderId,
+            generated.bookingId,
+            generated.trackingNumber,
+            generated.format,
+            generated.mimeType,
+            savedFileName,
+            savedFilePath,
+            generated.contentBuffer.length,
+            fileUrl,
+            estimatedCost,
+            estimatedCurrency,
+        ]);
+        if (Number.isFinite(saleId) && saleId > 0) {
+            const updateFields = ['order_status = ?'];
+            const updateValues: any[] = ['shipped'];
+            if (await hasSalesShipmentTrackingNumberColumn()) {
+                updateFields.push('shipment_tracking_number = ?');
+                updateValues.push(generated.trackingNumber || null);
+            }
+            if (await hasSalesShipmentLabelUrlColumn()) {
+                updateFields.push('shipment_label_url = ?');
+                updateValues.push(fileUrl);
+            }
+            if (await hasSalesShipmentLabelMimeTypeColumn()) {
+                updateFields.push('shipment_label_mime_type = ?');
+                updateValues.push(generated.mimeType || null);
+            }
+            if (await hasSalesShipmentLabelGeneratedAtColumn()) {
+                updateFields.push('shipment_label_generated_at = ?');
+                updateValues.push(toCETDateTime());
+            }
+            if (await hasSalesShipmentBookingIdColumn()) {
+                updateFields.push('shipment_booking_id = ?');
+                updateValues.push(generated.bookingId || null);
+            }
+            updateValues.push(saleId, auth.id);
+            await db.query<any>(`UPDATE sales SET ${updateFields.join(', ')} WHERE id = ? AND seller_id = ?`, updateValues);
+            await upsertShipmentLabelExpenseForSale(saleId, auth.id, estimatedCost);
+        }
+        return res.status(201).json({
+            message: 'Shipment label generated and stored successfully',
+            sale_id: Number.isFinite(saleId) && saleId > 0 ? saleId : null,
+            order_id: orderId,
+            booking_id: generated.bookingId,
+            tracking_number: generated.trackingNumber,
+            label_url: fileUrl,
+            label_mime_type: generated.mimeType,
+            label_format: generated.format,
+        });
     }
-
-    return res.status(201).json({
-      message: 'Shipment label generated and stored successfully',
-      sale_id: Number.isFinite(saleId) && saleId > 0 ? saleId : null,
-      order_id: orderId,
-      booking_id: generated.bookingId,
-      tracking_number: generated.trackingNumber,
-      label_url: fileUrl,
-      label_mime_type: generated.mimeType,
-      label_format: generated.format,
-    })
-  } catch (error) {
-    console.error('Shipment label generation failed:', error)
-    const message = error instanceof Error ? error.message : 'Failed to generate shipment label'
-    const statusCodeRaw = (error as { statusCode?: unknown })?.statusCode
-    const details = (error as { details?: unknown })?.details
-    const statusCode = typeof statusCodeRaw === 'number' && statusCodeRaw >= 400 && statusCodeRaw < 600
-      ? statusCodeRaw
-      : 500
-    const explanationText = Array.isArray((details as any)?.compositeFault?.faults)
-      ? (details as any).compositeFault.faults
-          .map((fault: any) => String(fault?.explanationText || fault?.message || '').trim())
-          .filter((value: string) => Boolean(value))
-          .join(' | ')
-      : undefined
-
-    return res.status(statusCode).json({
-      message,
-      explanationText,
-      details,
-    })
-  }
-})
-
+    catch (error: any) {
+        console.error('Shipment label generation failed:', error);
+        const message = error instanceof Error ? error.message : 'Failed to generate shipment label';
+        const statusCodeRaw = error?.statusCode;
+        const details = error?.details;
+        const statusCode = typeof statusCodeRaw === 'number' && statusCodeRaw >= 400 && statusCodeRaw < 600
+            ? statusCodeRaw
+            : 500;
+        const explanationText = Array.isArray(details?.compositeFault?.faults)
+            ? details.compositeFault.faults
+                .map((fault: any) => String(fault?.explanationText || fault?.message || '').trim())
+                .filter((value: any) => Boolean(value))
+                .join(' | ')
+            : undefined;
+        return res.status(statusCode).json({
+            message,
+            explanationText,
+            details,
+        });
+    }
+});
 // ===== Shipment Track =====
 app.get('/api/shipment/track/:trackingNumber', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const trackingNumber = String(req.params.trackingNumber || '').trim()
-  if (!trackingNumber) {
-    return res.status(400).json({ message: 'trackingNumber is required' })
-  }
-
-  try {
-    await ensureSalesShipmentColumns()
-
-    const tracked = await trackShipment(trackingNumber, {
-      endpointPath: String(req.query.endpointPath || '').trim() || undefined,
-      language: String(req.query.language || 'en').trim() || 'en',
-    })
-
-    const saleIdFromQuery = Number(req.query.sale_id)
-    let targetSaleId: number | null = null
-
-    if (Number.isFinite(saleIdFromQuery) && saleIdFromQuery > 0) {
-      const [orderRows] = await db.query<RowDataPacket[]>(
-        'SELECT id FROM sales WHERE id = ? AND seller_id = ? LIMIT 1',
-        [saleIdFromQuery, auth.id],
-      )
-      if (orderRows.length) {
-        targetSaleId = Number(orderRows[0].id)
-      }
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const trackingNumber = String(req.params.trackingNumber || '').trim();
+    if (!trackingNumber) {
+        return res.status(400).json({ message: 'trackingNumber is required' });
     }
-
-    if (!targetSaleId && await hasSalesShipmentTrackingNumberColumn()) {
-      const [trackingRows] = await db.query<RowDataPacket[]>(
-        `SELECT id
+    try {
+        await ensureSalesShipmentColumns();
+        const tracked = await trackShipment(trackingNumber, {
+            endpointPath: String(req.query.endpointPath || '').trim() || undefined,
+            language: String(req.query.language || 'en').trim() || 'en',
+        });
+        const saleIdFromQuery = Number(req.query.sale_id);
+        let targetSaleId = null;
+        if (Number.isFinite(saleIdFromQuery) && saleIdFromQuery > 0) {
+            const [orderRows] = await db.query<any>('SELECT id FROM sales WHERE id = ? AND seller_id = ? LIMIT 1', [saleIdFromQuery, auth.id]);
+            if (orderRows.length) {
+                targetSaleId = Number(orderRows[0].id);
+            }
+        }
+        if (!targetSaleId && await hasSalesShipmentTrackingNumberColumn()) {
+            const [trackingRows] = await db.query<any>(`SELECT id
          FROM sales
          WHERE seller_id = ? AND shipment_tracking_number = ?
          ORDER BY id DESC
-         LIMIT 1`,
-        [auth.id, trackingNumber],
-      )
-      if (trackingRows.length) {
-        targetSaleId = Number(trackingRows[0].id)
-      }
+         LIMIT 1`, [auth.id, trackingNumber]);
+            if (trackingRows.length) {
+                targetSaleId = Number(trackingRows[0].id);
+            }
+        }
+        let updatedOrderStatus = null;
+        if (targetSaleId) {
+            const [statusRows] = await db.query<any>('SELECT order_status FROM sales WHERE id = ? AND seller_id = ? LIMIT 1', [targetSaleId, auth.id]);
+            const previousStatus = String(statusRows[0]?.order_status || '').trim().toLowerCase();
+            const nextStatus = resolveOrderStatusFromTracking(tracked);
+            await db.query<any>('UPDATE sales SET order_status = ? WHERE id = ? AND seller_id = ?', [nextStatus, targetSaleId, auth.id]);
+            updatedOrderStatus = nextStatus;
+            if (nextStatus === 'delivered' && previousStatus !== 'delivered') {
+                await triggerDeliveryReviewEmailForSales([targetSaleId]);
+            }
+        }
+        return res.status(200).json({
+            ...tracked,
+            sale_id: targetSaleId,
+            updated_order_status: updatedOrderStatus,
+        });
     }
-
-    let updatedOrderStatus: string | null = null
-    if (targetSaleId) {
-      const [statusRows] = await db.query<RowDataPacket[]>(
-        'SELECT order_status FROM sales WHERE id = ? AND seller_id = ? LIMIT 1',
-        [targetSaleId, auth.id],
-      )
-      const previousStatus = String(statusRows[0]?.order_status || '').trim().toLowerCase()
-      const nextStatus = resolveOrderStatusFromTracking(tracked)
-      await db.query(
-        'UPDATE sales SET order_status = ? WHERE id = ? AND seller_id = ?',
-        [nextStatus, targetSaleId, auth.id],
-      )
-      updatedOrderStatus = nextStatus
-
-      if (nextStatus === 'delivered' && previousStatus !== 'delivered') {
-        await triggerDeliveryReviewEmailForSales([targetSaleId])
-      }
+    catch (error: any) {
+        console.error('Shipment tracking failed:', error);
+        const message = error instanceof Error ? error.message : 'Failed to track shipment';
+        return res.status(500).json({ message });
     }
-
-    return res.status(200).json({
-      ...tracked,
-      sale_id: targetSaleId,
-      updated_order_status: updatedOrderStatus,
-    })
-  } catch (error) {
-    console.error('Shipment tracking failed:', error)
-    const message = error instanceof Error ? error.message : 'Failed to track shipment'
-    return res.status(500).json({ message })
-  }
-})
-
+});
 // ===== Generate Shipment Label (legacy endpoint, now backed by shipment module) =====
 app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const saleId = Number(req.params.id)
-  if (!Number.isFinite(saleId) || saleId <= 0) {
-    return res.status(400).json({ message: 'Invalid order id' })
-  }
-
-  try {
-    const [orders] = await db.query<RowDataPacket[]>(
-      `SELECT s.id, s.order_id,
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const saleId = Number(req.params.id);
+    if (!Number.isFinite(saleId) || saleId <= 0) {
+        return res.status(400).json({ message: 'Invalid order id' });
+    }
+    try {
+        const [orders] = await db.query<any>(`SELECT s.id, s.order_id,
               c.name, c.shipping_street, c.shipping_city, c.shipping_state, c.shipping_zip, c.shipping_country
        FROM sales s
        LEFT JOIN customers c ON s.customer_id = c.id
        WHERE s.id = ? AND s.seller_id = ?
-       LIMIT 1`,
-      [saleId, auth.id],
-    )
-
-    if (!orders.length) {
-      return res.status(404).json({ message: 'Order not found' })
-    }
-
-    const order = orders[0]
-    const senderAddress = await getSellerSenderAddress(auth.id)
-    const address = {
-      name: String(order.name || 'Customer'),
-      street: String(order.shipping_street || '').trim(),
-      postalCode: String(order.shipping_zip || '').trim(),
-      city: String(order.shipping_city || '').trim(),
-      countryCode: normalizeCountryCode(order.shipping_country || 'SE'),
-    }
-
-    const generated = await generateShipmentLabel({
-      address,
-      senderAddress,
-      dimensions: { lengthCm: 20, widthCm: 20, heightCm: 10 },
-      weightKg: 1,
-      referenceNo: String(order.order_id || saleId),
-    })
-
-    await ensureShipmentLabelsTable()
-    const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR)
-    ensureDir(labelsDir)
-
-    if (generated.contentBuffer) {
-      const ext = generated.mimeType.includes('pdf') ? 'pdf' : generated.mimeType.startsWith('image/') ? 'png' : 'bin'
-      const savedFileName = `label-${Date.now()}-${Math.floor(Math.random() * 100000)}.${ext}`
-      const savedFilePath = path.join(labelsDir, savedFileName)
-      fs.writeFileSync(savedFilePath, generated.contentBuffer)
-      const fileUrl = `/uploads/shipment_labels/${savedFileName}`
-
-      await db.query<ResultSetHeader>(
-        `INSERT INTO shipment_labels (
+       LIMIT 1`, [saleId, auth.id]);
+        if (!orders.length) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        const order = orders[0];
+        const senderAddress = await getSellerSenderAddress(auth.id);
+        const address = {
+            name: String(order.name || 'Customer'),
+            street: String(order.shipping_street || '').trim(),
+            postalCode: String(order.shipping_zip || '').trim(),
+            city: String(order.shipping_city || '').trim(),
+            countryCode: normalizeCountryCode(order.shipping_country || 'SE'),
+        };
+        const generated = await generateShipmentLabel({
+            address,
+            senderAddress,
+            dimensions: { lengthCm: 20, widthCm: 20, heightCm: 10 },
+            weightKg: 1,
+            referenceNo: String(order.order_id || saleId),
+        });
+        await ensureShipmentLabelsTable();
+        const labelsDir = uploadsDir(SHIPMENT_LABEL_UPLOAD_SUBDIR);
+        ensureDir(labelsDir);
+        if (generated.contentBuffer) {
+            const ext = generated.mimeType.includes('pdf') ? 'pdf' : generated.mimeType.startsWith('image/') ? 'png' : 'bin';
+            const savedFileName = `label-${Date.now()}-${Math.floor(Math.random() * 100000)}.${ext}`;
+            const savedFilePath = path.join(labelsDir, savedFileName);
+            fs.writeFileSync(savedFilePath, generated.contentBuffer);
+            const fileUrl = `/uploads/shipment_labels/${savedFileName}`;
+            await db.query<any>(`INSERT INTO shipment_labels (
           sale_id,
           seller_id,
           order_id,
@@ -13764,99 +15130,74 @@ app.post('/api/orders/:id/generate-label', async (req: Request, res: Response) =
           file_size,
           file_url,
           provider
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'postnord')`,
-        [
-          saleId,
-          auth.id,
-          String(order.order_id || ''),
-          generated.bookingId,
-          generated.trackingNumber,
-          generated.format,
-          generated.mimeType,
-          savedFileName,
-          savedFilePath,
-          generated.contentBuffer.length,
-          fileUrl,
-        ],
-      )
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'postnord')`, [
+                saleId,
+                auth.id,
+                String(order.order_id || ''),
+                generated.bookingId,
+                generated.trackingNumber,
+                generated.format,
+                generated.mimeType,
+                savedFileName,
+                savedFilePath,
+                generated.contentBuffer.length,
+                fileUrl,
+            ]);
+        }
+        const legacyUpdateFields = ['order_status = ?'];
+        const legacyUpdateValues: any[] = ['shipped'];
+        if (await hasSalesShipmentTrackingNumberColumn()) {
+            legacyUpdateFields.push('shipment_tracking_number = ?');
+            legacyUpdateValues.push(generated.trackingNumber || null);
+        }
+        if (await hasSalesShipmentLabelUrlColumn()) {
+            const [latestLabelRows] = await db.query<any>('SELECT file_url, mime_type, booking_id, created_at FROM shipment_labels WHERE sale_id = ? ORDER BY id DESC LIMIT 1', [saleId]);
+            legacyUpdateFields.push('shipment_label_url = ?');
+            legacyUpdateValues.push(latestLabelRows[0]?.file_url || null);
+            if (await hasSalesShipmentLabelMimeTypeColumn()) {
+                legacyUpdateFields.push('shipment_label_mime_type = ?');
+                legacyUpdateValues.push(latestLabelRows[0]?.mime_type || null);
+            }
+            if (await hasSalesShipmentLabelGeneratedAtColumn()) {
+                legacyUpdateFields.push('shipment_label_generated_at = ?');
+                legacyUpdateValues.push(toCETDateTime(latestLabelRows[0]?.created_at));
+            }
+            if (await hasSalesShipmentBookingIdColumn()) {
+                legacyUpdateFields.push('shipment_booking_id = ?');
+                legacyUpdateValues.push(latestLabelRows[0]?.booking_id || generated.bookingId || null);
+            }
+        }
+        legacyUpdateValues.push(saleId, auth.id);
+        await db.query<any>(`UPDATE sales SET ${legacyUpdateFields.join(', ')} WHERE id = ? AND seller_id = ?`, legacyUpdateValues);
+        await upsertShipmentLabelExpenseForSale(saleId, auth.id, null);
+        return res.status(201).json({
+            labelNumber: generated.bookingId || `LBL-${saleId}`,
+            trackingNumber: generated.trackingNumber || null,
+            order_id: order.order_id,
+            generated_at: new Date().toISOString(),
+            message: 'Shipment label generated successfully',
+        });
     }
-
-    const legacyUpdateFields: string[] = ['order_status = ?']
-    const legacyUpdateValues: unknown[] = ['shipped']
-
-    if (await hasSalesShipmentTrackingNumberColumn()) {
-      legacyUpdateFields.push('shipment_tracking_number = ?')
-      legacyUpdateValues.push(generated.trackingNumber || null)
+    catch (err: any) {
+        console.error(err);
+        return res.status(500).json({ message: 'Database error' });
     }
-    if (await hasSalesShipmentLabelUrlColumn()) {
-      const [latestLabelRows] = await db.query<RowDataPacket[]>(
-        'SELECT file_url, mime_type, booking_id, created_at FROM shipment_labels WHERE sale_id = ? ORDER BY id DESC LIMIT 1',
-        [saleId],
-      )
-      legacyUpdateFields.push('shipment_label_url = ?')
-      legacyUpdateValues.push(latestLabelRows[0]?.file_url || null)
-
-      if (await hasSalesShipmentLabelMimeTypeColumn()) {
-        legacyUpdateFields.push('shipment_label_mime_type = ?')
-        legacyUpdateValues.push(latestLabelRows[0]?.mime_type || null)
-      }
-      if (await hasSalesShipmentLabelGeneratedAtColumn()) {
-        legacyUpdateFields.push('shipment_label_generated_at = ?')
-        legacyUpdateValues.push(toCETDateTime(latestLabelRows[0]?.created_at))
-      }
-      if (await hasSalesShipmentBookingIdColumn()) {
-        legacyUpdateFields.push('shipment_booking_id = ?')
-        legacyUpdateValues.push(latestLabelRows[0]?.booking_id || generated.bookingId || null)
-      }
-    }
-
-    legacyUpdateValues.push(saleId, auth.id)
-    await db.query(
-      `UPDATE sales SET ${legacyUpdateFields.join(', ')} WHERE id = ? AND seller_id = ?`,
-      legacyUpdateValues,
-    )
-
-    await upsertShipmentLabelExpenseForSale(saleId, auth.id, null)
-
-    return res.status(201).json({
-      labelNumber: generated.bookingId || `LBL-${saleId}`,
-      trackingNumber: generated.trackingNumber || null,
-      order_id: order.order_id,
-      generated_at: new Date().toISOString(),
-      message: 'Shipment label generated successfully',
-    })
-  } catch (err) {
-    console.error(err)
-    return res.status(500).json({ message: 'Database error' })
-  }
-})
-
-
+});
 // ===== Get Seller's Order Items =====
 app.get('/api/orders/:id/products', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  const orderId = req.params.id
-
-  try {
-    // Verify order belongs to seller
-    const [orders] = await db.query<RowDataPacket[]>(
-      'SELECT id, seller_id FROM sales WHERE id = ?',
-      [orderId]
-    )
-
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' })
-    }
-
-    if (orders[0].seller_id !== auth.id) {
-      return res.status(403).json({ message: 'You do not have permission to view this order' })
-    }
-
-    // Get order items with product details
-    const [items] = await db.query<RowDataPacket[]>(
-      `SELECT
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    const orderId = req.params.id;
+    try {
+        const [orders] = await db.query<any>('SELECT id, seller_id FROM sales WHERE id = ?', [orderId]);
+        if (orders.length === 0) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+        if (orders[0].seller_id !== auth.id) {
+            return res.status(403).json({ message: 'You do not have permission to view this order' });
+        }
+        const [items] = await db.query<any>(`SELECT
         si.id,
         si.product_type,
         si.product_id,
@@ -13871,302 +15212,246 @@ app.get('/api/orders/:id/products', async (req: Request, res: Response) => {
         p.main_image_url
       FROM sale_items si
       LEFT JOIN products p ON si.product_id = p.id
-      WHERE si.sale_id = ?`,
-      [orderId]
-    )
-
-    res.status(200).json(items)
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ message: 'Database error' })
-  }
-})
-
+      WHERE si.sale_id = ?`, [orderId]);
+        res.status(200).json(items);
+    }
+    catch (err: any) {
+        console.error(err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
 // ===== Stripe PaymentIntent =====
 app.post('/api/stripe/create-payment-intent', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  console.log('create-payment-intent:')
-  const {
-    amount,
-    currency = 'sek',
-    description = 'EVCS Payment',
-    captureMethod = 'automatic',
-  } = req.body
-
-  if (!amount || isNaN(amount) || Number(amount) <= 0) {
-    return res.status(400).json({ message: 'Valid amount is required' })
-  }
-
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(Number(amount) * 100),
-      currency,
-      description,
-      capture_method: captureMethod === 'manual' ? 'manual' : 'automatic',
-      automatic_payment_methods: {
-        enabled: true,
-      },
-    })
-
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-      amount: paymentIntent.amount,
-      currency: paymentIntent.currency,
-      captureMethod: paymentIntent.capture_method,
-    })
-  } catch (err) {
-    console.error('Stripe PaymentIntent error:', err)
-    res.status(500).json({ message: 'Failed to create payment intent' })
-  }
-})
-
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    console.log('create-payment-intent:');
+    const { amount, currency = 'sek', description = 'EVCS Payment', captureMethod = 'automatic', } = req.body;
+    if (!amount || isNaN(amount) || Number(amount) <= 0) {
+        return res.status(400).json({ message: 'Valid amount is required' });
+    }
+    try {
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: Math.round(Number(amount) * 100),
+            currency,
+            description,
+            capture_method: captureMethod === 'manual' ? 'manual' : 'automatic',
+            automatic_payment_methods: {
+                enabled: true,
+            },
+        });
+        res.json({
+            clientSecret: paymentIntent.client_secret,
+            amount: paymentIntent.amount,
+            currency: paymentIntent.currency,
+            captureMethod: paymentIntent.capture_method,
+        });
+    }
+    catch (err: any) {
+        console.error('Stripe PaymentIntent error:', err);
+        res.status(500).json({ message: 'Failed to create payment intent' });
+    }
+});
 // ===== Stripe Reserve Payment (Manual Capture) =====
 app.post('/api/stripe/reserve-payment', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  console.log('reserve-payment:')
-  const { amount, currency = 'sek', description = 'EVCS Reservation' } = req.body
-
-  if (!amount || isNaN(amount) || Number(amount) <= 0) {
-    return res.status(400).json({ message: 'Valid amount is required' })
-  }
-
-  try {
-    const originalAmount = Math.round(Number(amount) * 100)
-    const updatedAmount = Math.max(originalAmount - 500, 0) // minus $5
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: originalAmount,
-      currency,
-      description,
-      capture_method: 'manual',
-      automatic_payment_methods: {
-        enabled: true,
-      },
-    })
-    console.log('PaymentIntent created:', paymentIntent.amount)
-
-    // respond immediately for client to authorize
-    res.json({
-      id: paymentIntent.id,
-      clientSecret: paymentIntent.client_secret,
-      amountCents: originalAmount,
-      amount: originalAmount / 100,
-      updatedAmountCents: updatedAmount,
-      updatedAmount: updatedAmount / 100,
-      currency: paymentIntent.currency,
-      status: paymentIntent.status,
-    })
-
-    // schedule capture after 5 seconds
-    setTimeout(async () => {
-      try {
-        const current = await stripe.paymentIntents.retrieve(paymentIntent.id)
-        if (current.status === 'requires_capture') {
-          const captured = await stripe.paymentIntents.capture(paymentIntent.id, {
-            amount_to_capture: updatedAmount,
-          })
-          console.log('Payment captured:', updatedAmount)
-        } else {
-          console.log('Payment not ready to capture:', current.status)
-        }
-      } catch (err) {
-        console.error('Capture error:', err)
-      }
-    }, 10000)
-  } catch (err) {
-    console.error('Stripe reserve error:', err)
-    res.status(500).json({ message: 'Failed to reserve payment' })
-  }
-})
-
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    console.log('reserve-payment:');
+    const { amount, currency = 'sek', description = 'EVCS Reservation' } = req.body;
+    if (!amount || isNaN(amount) || Number(amount) <= 0) {
+        return res.status(400).json({ message: 'Valid amount is required' });
+    }
+    try {
+        const originalAmount = Math.round(Number(amount) * 100);
+        const updatedAmount = Math.max(originalAmount - 500, 0);
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: originalAmount,
+            currency,
+            description,
+            capture_method: 'manual',
+            automatic_payment_methods: {
+                enabled: true,
+            },
+        });
+        console.log('PaymentIntent created:', paymentIntent.amount);
+        res.json({
+            id: paymentIntent.id,
+            clientSecret: paymentIntent.client_secret,
+            amountCents: originalAmount,
+            amount: originalAmount / 100,
+            updatedAmountCents: updatedAmount,
+            updatedAmount: updatedAmount / 100,
+            currency: paymentIntent.currency,
+            status: paymentIntent.status,
+        });
+        setTimeout(async () => {
+            try {
+                const current = await stripe.paymentIntents.retrieve(paymentIntent.id);
+                if (current.status === 'requires_capture') {
+                    await stripe.paymentIntents.capture(paymentIntent.id, {
+                        amount_to_capture: updatedAmount,
+                    });
+                    console.log('Payment captured:', updatedAmount);
+                }
+                else {
+                    console.log('Payment not ready to capture:', current.status);
+                }
+            }
+            catch (err: any) {
+                console.error('Capture error:', err);
+            }
+        }, 10000);
+    }
+    catch (err: any) {
+        console.error('Stripe reserve error:', err);
+        res.status(500).json({ message: 'Failed to reserve payment' });
+    }
+});
 // ===== Stripe Checkout Session =====
 app.post('/api/stripe/create-checkout-session', async (req: Request, res: Response) => {
-  const auth = await requireAuth(req, res)
-  if (!auth) return
-
-  console.log('create-checkout-session:')
-  const { amount, currency = 'sek', description = 'EVCS Payment' } = req.body
-
-  if (!amount || isNaN(amount)) {
-    return res.status(400).json({ message: 'Valid amount is required' })
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency,
-            product_data: { name: description },
-            unit_amount: Math.round(Number(amount) * 100),
-          },
-          quantity: 1,
-        },
-      ],
-      success_url: `${config.CLIENT_URL}/success`,
-      cancel_url: `${config.CLIENT_URL}/cancel`,
-    })
-
-    res.json({ url: session.url })
-  } catch (err) {
-    console.error('Stripe error:', err)
-    res.status(500).json({ message: 'Stripe session creation failed' })
-  }
-})
-
-/** Returns the email address of the active contact_form account, or null if not configured */
-const getContactFormEmail = async (): Promise<string | null> => {
-  try {
-    await ensureEmailAccountPurposesColumn()
-    const [rows] = await db.query<RowDataPacket[]>(
-      `SELECT email_address FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE('contact_form')) AND is_active = 1 LIMIT 1`,
-    )
-    if (rows.length) return String(rows[0].email_address)
-  } catch {
-    // ignore — fall through to env fallback
-  }
-  return null
-}
-
-// ── Contact form ──────────────────────────────────────────────────────────────
-// Simple in-memory rate limiter: max 3 submissions per IP per 15 minutes
-const contactRateMap = new Map<string, { count: number; resetAt: number }>()
-const CONTACT_RATE_LIMIT = 3
-const CONTACT_RATE_WINDOW_MS = 15 * 60 * 1000 // 15 minutes
-
-const contactRateLimit = (ip: string): boolean => {
-  const now = Date.now()
-  const entry = contactRateMap.get(ip)
-  if (!entry || now > entry.resetAt) {
-    contactRateMap.set(ip, { count: 1, resetAt: now + CONTACT_RATE_WINDOW_MS })
-    return true // allowed
-  }
-  if (entry.count >= CONTACT_RATE_LIMIT) return false // blocked
-  entry.count += 1
-  return true
-}
-
-/** Strip all HTML/script tags and dangerous characters, then trim */
-const sanitizeField = (value: unknown, maxLen: number): string => {
-  if (typeof value !== 'string') return ''
-  return value
-    .replace(/<[^>]*>/g, '')           // strip HTML tags
-    .replace(/[<>"'`\\;]/g, '')        // remove injection chars
-    .replace(/\s+/g, ' ')             // collapse whitespace
-    .trim()
-    .slice(0, maxLen)
-}
-
-const VALID_EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/
-const VALID_ORDER_RE = /^[A-Za-z0-9\-_]{1,40}$/
-const ALLOWED_REASONS = [
-  'Order Issue',
-  'Delivery / Shipping',
-  'Return or Refund',
-  'Payment Problem',
-  'Product Question',
-  'Account Support',
-  'Other',
-]
-
-const ALLOWED_SUPPORT_TYPES = ['ask_question', 'report_issue', 'give_feedback'] as const
-type SellerSupportType = (typeof ALLOWED_SUPPORT_TYPES)[number]
-
-const SUPPORT_TYPE_LABELS: Record<SellerSupportType, string> = {
-  ask_question: 'Ask a question',
-  report_issue: 'Report issue',
-  give_feedback: 'Give feedback',
-}
-
-app.post('/api/seller/support', supportUpload, async (req: Request, res: Response) => {
-  const auth = await requireSellerOrAdmin(req, res)
-  if (!auth) return
-
-  const ip = String(req.ip || 'unknown').trim()
-
-  if (!contactRateLimit(ip)) {
-    return res.status(429).json({
-      message: 'Too many messages. Please wait 15 minutes before sending again.',
-    })
-  }
-
-  const sellerName = sanitizeField(req.body?.sellerName, 100)
-  const sellerEmailFromBody = sanitizeField(req.body?.sellerEmail, 150).toLowerCase()
-  const subject = sanitizeField(req.body?.subject, 120)
-  const type = sanitizeField(req.body?.type, 40).toLowerCase() as SellerSupportType
-  const description = sanitizeField(req.body?.description, 2000)
-
-  if (!sellerName || sellerName.length < 2) {
-    return res.status(400).json({ message: 'Seller name is required (at least 2 characters).' })
-  }
-
-  if (!subject || subject.length < 3) {
-    return res.status(400).json({ message: 'Subject is required (at least 3 characters).' })
-  }
-
-  if (!ALLOWED_SUPPORT_TYPES.includes(type)) {
-    return res.status(400).json({ message: 'Please choose a valid support type.' })
-  }
-
-  if (!description || description.length < 10) {
-    return res.status(400).json({ message: 'Description is too short (at least 10 characters).' })
-  }
-
-  const contactFormEmail = await getContactFormEmail()
-  const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
-  if (!supportEmail) {
-    console.error('[Seller Support] No contact_form email account configured in the database.')
-    return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
-  }
-
-  try {
-    const [userRows] = await db.query<RowDataPacket[]>(
-      'SELECT email, role FROM users WHERE id = ? LIMIT 1',
-      [auth.id],
-    )
-
-    const sellerEmailFromDb = sanitizeField(userRows[0]?.email, 150).toLowerCase()
-    const sellerEmail = sellerEmailFromDb || sellerEmailFromBody
-
-    if (!sellerEmail || !VALID_EMAIL_RE.test(sellerEmail)) {
-      return res.status(400).json({ message: 'A valid seller email is required.' })
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    console.log('create-checkout-session:');
+    const { amount, currency = 'sek', description = 'EVCS Payment' } = req.body;
+    if (!amount || isNaN(amount)) {
+        return res.status(400).json({ message: 'Valid amount is required' });
     }
-
-    const supportTypeLabel = SUPPORT_TYPE_LABELS[type]
-    const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : []
-    const attachmentList = files.length
-      ? `<ul>${files.map((file) => `<li>${file.originalname}</li>`).join('')}</ul>`
-      : '<p>No attachments.</p>'
-
-    const emailBody = `
-<h2 style="font-family:sans-serif;color:#1e1b4b;">New Seller Support Message</h2>
-<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;width:100%;max-width:650px;">
-  <tr><td style="padding:8px 12px;font-weight:600;color:#374151;width:170px;">Seller name</td><td style="padding:8px 12px;color:#111827;">${sellerName}</td></tr>
-  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Seller email</td><td style="padding:8px 12px;color:#111827;">${sellerEmail}</td></tr>
-  <tr><td style="padding:8px 12px;font-weight:600;color:#374151;">Support type</td><td style="padding:8px 12px;color:#111827;">${supportTypeLabel}</td></tr>
-  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Subject</td><td style="padding:8px 12px;color:#111827;">${subject}</td></tr>
-  <tr>
-    <td style="padding:8px 12px;font-weight:600;color:#374151;vertical-align:top;">Description</td>
-    <td style="padding:8px 12px;color:#111827;white-space:pre-wrap;">${description}</td>
-  </tr>
-  <tr style="background:#f9fafb;">
-    <td style="padding:8px 12px;font-weight:600;color:#374151;vertical-align:top;">Attachments</td>
-    <td style="padding:8px 12px;color:#111827;">${attachmentList}</td>
-  </tr>
-</table>
-<p style="font-family:sans-serif;font-size:12px;color:#9ca3af;margin-top:24px;">Sent from seller support panel.</p>
-    `.trim()
-
-    await ensureSupportMessagesTable()
-
-    await db.query(
-      `INSERT INTO support_messages (
+    try {
+        const session = await stripe.checkout.sessions.create({
+            mode: 'payment',
+            payment_method_types: ['card'],
+            line_items: [
+                {
+                    price_data: {
+                        currency,
+                        product_data: { name: description },
+                        unit_amount: Math.round(Number(amount) * 100),
+                    },
+                    quantity: 1,
+                },
+            ],
+            success_url: `${config.CLIENT_URL}/success`,
+            cancel_url: `${config.CLIENT_URL}/cancel`,
+        });
+        res.json({ url: session.url });
+    }
+    catch (err: any) {
+        console.error('Stripe error:', err);
+        res.status(500).json({ message: 'Stripe session creation failed' });
+    }
+});
+/** Returns the email address of the active contact_form account, or null if not configured */
+const getContactFormEmail = async () => {
+    try {
+        await ensureEmailAccountPurposesColumn();
+        const [rows] = await db.query<any>(`SELECT email_address FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE('contact_form')) AND is_active = 1 LIMIT 1`);
+        if (rows.length)
+            return String(rows[0].email_address);
+    }
+    catch {
+        // ignore — fall through to env fallback
+    }
+    return null;
+};
+// ── Contact form ──────────────────────────────────────────────────────────────
+const contactRateMap = new Map();
+const CONTACT_RATE_LIMIT = 3;
+const CONTACT_RATE_WINDOW_MS = 15 * 60 * 1000;
+const contactRateLimit = (ip: string) => {
+    const now = Date.now();
+    const entry = contactRateMap.get(ip);
+    if (!entry || now > entry.resetAt) {
+        contactRateMap.set(ip, { count: 1, resetAt: now + CONTACT_RATE_WINDOW_MS });
+        return true;
+    }
+    if (entry.count >= CONTACT_RATE_LIMIT)
+        return false;
+    entry.count += 1;
+    return true;
+};
+/** Strip all HTML/script tags and dangerous characters, then trim */
+const sanitizeField = (value: any, maxLen: number) => {
+    if (typeof value !== 'string')
+        return '';
+    return value
+        .replace(/<[^>]*>/g, '')
+        .replace(/[<>"'`\\;]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, maxLen);
+};
+const VALID_ORDER_RE = /^[A-Za-z0-9\-_]{1,40}$/;
+const ALLOWED_REASONS = [
+    'Order Issue',
+    'Delivery / Shipping',
+    'Return or Refund',
+    'Payment Problem',
+    'Product Question',
+    'Account Support',
+    'Other',
+];
+const ALLOWED_SUPPORT_TYPES = ['ask_question', 'report_issue', 'give_feedback'];
+app.post('/api/seller/support', supportUpload, async (req: Request, res: Response) => {
+    const auth = await requireSellerOrAdmin(req, res);
+    if (!auth)
+        return;
+    const ip = String(req.ip || 'unknown').trim();
+    if (!contactRateLimit(ip)) {
+        return res.status(429).json({
+            message: 'Too many messages. Please wait 15 minutes before sending again.',
+        });
+    }
+    const sellerName = sanitizeField(req.body?.sellerName, 100);
+    const sellerEmailFromBody = sanitizeField(req.body?.sellerEmail, 150).toLowerCase();
+    const subject = sanitizeField(req.body?.subject, 120);
+    const type = sanitizeField(req.body?.type, 40).toLowerCase();
+    const description = sanitizeField(req.body?.description, 2000);
+    if (!sellerName || sellerName.length < 2) {
+        return res.status(400).json({ message: 'Seller name is required (at least 2 characters).' });
+    }
+    if (!subject || subject.length < 3) {
+        return res.status(400).json({ message: 'Subject is required (at least 3 characters).' });
+    }
+    if (!ALLOWED_SUPPORT_TYPES.includes(type)) {
+        return res.status(400).json({ message: 'Please choose a valid support type.' });
+    }
+    if (!description || description.length < 10) {
+        return res.status(400).json({ message: 'Description is too short (at least 10 characters).' });
+    }
+    const contactFormEmail = await getContactFormEmail();
+    const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || '';
+    if (!supportEmail) {
+        console.error('[Seller Support] No contact_form email account configured in the database.');
+        return res.status(500).json({ message: 'Support email is not configured. Please try again later.' });
+    }
+    try {
+        const [userRows] = await db.query<any>('SELECT email, role FROM users WHERE id = ? LIMIT 1', [auth.id]);
+        const sellerEmailFromDb = sanitizeField(userRows[0]?.email, 150).toLowerCase();
+        const sellerEmail = sellerEmailFromDb || sellerEmailFromBody;
+        if (!sellerEmail || !VALID_EMAIL_RE.test(sellerEmail)) {
+            return res.status(400).json({ message: 'A valid seller email is required.' });
+        }
+        const supportTypeLabel = SUPPORT_TYPE_LABELS[type];
+        const files = Array.isArray(req.files) ? req.files : [];
+        const companyInfo = await getPlatformCompanyEmailInfo();
+        const emailBody = createSupportMessageEmailHtml({
+            company: companyInfo,
+            badgeLabel: 'Seller Support',
+            heading: 'New Seller Support Message',
+            rows: [
+                { label: 'Seller name', value: sellerName },
+                { label: 'Seller email', value: sellerEmail },
+                { label: 'Support type', value: supportTypeLabel },
+                { label: 'Subject', value: subject },
+                { label: 'Description', value: description, multiline: true },
+            ],
+            attachments: files.map((file: any) => String(file.originalname || 'attachment')),
+            footerNote: 'Sent from seller support panel.',
+        });
+        await ensureSupportMessagesTable();
+        await db.query<any>(`INSERT INTO support_messages (
         sender_name,
         sender_email,
         sender_role,
@@ -14175,50 +15460,38 @@ app.post('/api/seller/support', supportUpload, async (req: Request, res: Respons
         subject,
         order_id,
         message
-      ) VALUES (?, ?, ?, ?, 'admin', ?, ?, ?)`,
-      [
-        sellerName,
-        sellerEmail,
-        auth.role,
-        auth.id,
-        `${supportTypeLabel}: ${subject}`,
-        null,
-        description,
-      ],
-    )
-
-    await sendEmail(
-      supportEmail,
-      `[Seller Support] ${supportTypeLabel} - ${subject}`,
-      emailBody,
-      {
-        purpose: 'contact_form',
-        attachments: files.map((file) => ({
-          filename: file.originalname,
-          path: file.path,
-          contentType: file.mimetype,
-        })),
-      },
-    )
-
-    return res.json({ success: true, message: 'Support message sent to admin.' })
-  } catch (error) {
-    console.error('[Seller Support] Failed to process support request:', error)
-    return res.status(500).json({ message: 'Could not send support message at this time. Please try again later.' })
-  }
-})
-
-app.post('/api/public/newsletter/subscribe', async (req: Request, res: Response) => {
-  try {
-    const email = sanitizeField(req.body?.email, 255).toLowerCase()
-    const source = sanitizeField(req.body?.source, 50) || 'footer'
-
-    if (!email || !VALID_EMAIL_RE.test(email)) {
-      return res.status(400).json({ message: 'A valid email address is required.' })
+      ) VALUES (?, ?, ?, ?, 'admin', ?, ?, ?)`, [
+            sellerName,
+            sellerEmail,
+            auth.role,
+            auth.id,
+            `${supportTypeLabel}: ${subject}`,
+            null,
+            description,
+        ]);
+        await sendEmail(supportEmail, `[Seller Support] ${supportTypeLabel} - ${subject}`, emailBody, {
+            purpose: 'contact_form',
+            attachments: files.map((file: any) => ({
+                filename: file.originalname,
+                path: file.path,
+                contentType: file.mimetype,
+            })),
+        });
+        return res.json({ success: true, message: 'Support message sent to admin.' });
     }
-
-    await db.query(
-      `CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+    catch (error: any) {
+        console.error('[Seller Support] Failed to process support request:', error);
+        return res.status(500).json({ message: 'Could not send support message at this time. Please try again later.' });
+    }
+});
+app.post('/api/public/newsletter/subscribe', async (req: Request, res: Response) => {
+    try {
+        const email = sanitizeField(req.body?.email, 255).toLowerCase();
+        const source = sanitizeField(req.body?.source, 50) || 'footer';
+        if (!email || !VALID_EMAIL_RE.test(email)) {
+            return res.status(400).json({ message: 'A valid email address is required.' });
+        }
+        await db.query<any>(`CREATE TABLE IF NOT EXISTS newsletter_subscribers (
         id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         email VARCHAR(255) NOT NULL,
         is_active BOOLEAN DEFAULT TRUE,
@@ -14228,117 +15501,91 @@ app.post('/api/public/newsletter/subscribe', async (req: Request, res: Response)
         UNIQUE KEY uq_newsletter_email (email),
         INDEX idx_newsletter_active (is_active),
         INDEX idx_newsletter_subscribed_at (subscribed_at)
-      ) AUTO_INCREMENT = 100`,
-    )
-
-    await db.query(
-      `INSERT INTO newsletter_subscribers (email, is_active, source)
+      ) AUTO_INCREMENT = 100`);
+        await db.query<any>(`INSERT INTO newsletter_subscribers (email, is_active, source)
        VALUES (?, 1, ?)
        ON DUPLICATE KEY UPDATE
          is_active = 1,
          source = VALUES(source),
-         updated_at = CURRENT_TIMESTAMP`,
-      [email, source],
-    )
-
-    return res.json({
-      success: true,
-      message: 'Subscribed successfully. You will receive weekly deals.',
-    })
-  } catch (error) {
-    console.error('[Newsletter] Subscription failed:', error)
-    return res.status(500).json({ message: 'Could not subscribe right now. Please try again later.' })
-  }
-})
-
-app.post('/api/contact', async (req: Request, res: Response) => {
-  const ip = String(req.ip || 'unknown').trim()
-
-  if (!contactRateLimit(ip)) {
-    return res.status(429).json({
-      message: 'Too many messages. Please wait 15 minutes before sending again.',
-    })
-  }
-
-  const name    = sanitizeField(req.body.name,    100)
-  const email   = sanitizeField(req.body.email,   150)
-  const orderId = sanitizeField(req.body.orderId, 40)
-  const reason  = sanitizeField(req.body.reason,  80)
-  const message = sanitizeField(req.body.message, 2000)
-
-  // Validate required fields
-  if (!name || name.length < 2)
-    return res.status(400).json({ message: 'Name is required (at least 2 characters).' })
-
-  if (!email || !VALID_EMAIL_RE.test(email))
-    return res.status(400).json({ message: 'A valid email address is required.' })
-
-  if (orderId && !VALID_ORDER_RE.test(orderId))
-    return res.status(400).json({ message: 'Order ID contains invalid characters.' })
-
-  if (!reason || !ALLOWED_REASONS.includes(reason))
-    return res.status(400).json({ message: 'Please select a valid reason.' })
-
-  if (!message || message.length < 10)
-    return res.status(400).json({ message: 'Message is too short (at least 10 characters).' })
-
-  const contactFormEmail = await getContactFormEmail()
-  const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || ''
-
-  if (!supportEmail) {
-    console.error('[Contact] No contact_form email account configured in the database.')
-    return res.status(500).json({ message: 'Support email is not configured. Please try again later.' })
-  }
-
-  const orderLine = orderId ? `\nOrder ID:  ${orderId}` : ''
-
-  const emailBody = `
-<h2 style="font-family:sans-serif;color:#1e1b4b;">New Contact Form Submission</h2>
-<table style="font-family:sans-serif;font-size:14px;border-collapse:collapse;width:100%;max-width:600px;">
-  <tr><td style="padding:8px 12px;font-weight:600;color:#374151;width:150px;">Name</td><td style="padding:8px 12px;color:#111827;">${name}</td></tr>
-  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Email</td><td style="padding:8px 12px;color:#111827;">${email}</td></tr>
-  ${orderId ? `<tr><td style="padding:8px 12px;font-weight:600;color:#374151;">Order ID</td><td style="padding:8px 12px;color:#111827;">${orderId}</td></tr>` : ''}
-  <tr style="background:#f9fafb;"><td style="padding:8px 12px;font-weight:600;color:#374151;">Reason</td><td style="padding:8px 12px;color:#111827;">${reason}</td></tr>
-  <tr>
-    <td style="padding:8px 12px;font-weight:600;color:#374151;vertical-align:top;">Message</td>
-    <td style="padding:8px 12px;color:#111827;white-space:pre-wrap;">${message}</td>
-  </tr>
-</table>
-<p style="font-family:sans-serif;font-size:12px;color:#9ca3af;margin-top:24px;">Sent from the contact form on ShopHub.com</p>
-  `.trim()
-
-  try {
-    await ensureSupportMessagesTable()
-
-    const token = getAuthToken(req)
-    let senderUserId: number | null = null
-    let senderRole: 'guest' | 'buyer' | 'seller' | 'admin' = 'guest'
-
-    if (token) {
-      try {
-        const decoded = await verifyAuthToken(token)
-        if (!decoded) {
-          throw new Error('Invalid token')
-        }
-        senderUserId = decoded.id
-
-        const [userRows] = await db.query<RowDataPacket[]>(
-          'SELECT role FROM users WHERE id = ? LIMIT 1',
-          [decoded.id],
-        )
-
-        const dbRole = String(userRows[0]?.role || '').toLowerCase()
-        if (dbRole === 'buyer' || dbRole === 'seller' || dbRole === 'admin') {
-          senderRole = dbRole
-        }
-      } catch {
-        senderUserId = null
-        senderRole = 'guest'
-      }
+         updated_at = CURRENT_TIMESTAMP`, [email, source]);
+        return res.json({
+            success: true,
+            message: 'Subscribed successfully. You will receive weekly deals.',
+        });
     }
-
-    await db.query(
-      `INSERT INTO support_messages (
+    catch (error: any) {
+        console.error('[Newsletter] Subscription failed:', error);
+        return res.status(500).json({ message: 'Could not subscribe right now. Please try again later.' });
+    }
+});
+app.post('/api/contact', async (req: Request, res: Response) => {
+    const ip = String(req.ip || 'unknown').trim();
+    if (!contactRateLimit(ip)) {
+        return res.status(429).json({
+            message: 'Too many messages. Please wait 15 minutes before sending again.',
+        });
+    }
+    const name = sanitizeField(req.body.name, 100);
+    const email = sanitizeField(req.body.email, 150);
+    const orderId = sanitizeField(req.body.orderId, 40);
+    const reason = sanitizeField(req.body.reason, 80);
+    const message = sanitizeField(req.body.message, 2000);
+    // Validate required fields
+    if (!name || name.length < 2)
+        return res.status(400).json({ message: 'Name is required (at least 2 characters).' });
+    if (!email || !VALID_EMAIL_RE.test(email))
+        return res.status(400).json({ message: 'A valid email address is required.' });
+    if (orderId && !VALID_ORDER_RE.test(orderId))
+        return res.status(400).json({ message: 'Order ID contains invalid characters.' });
+    if (!reason || !ALLOWED_REASONS.includes(reason))
+        return res.status(400).json({ message: 'Please select a valid reason.' });
+    if (!message || message.length < 10)
+        return res.status(400).json({ message: 'Message is too short (at least 10 characters).' });
+    const contactFormEmail = await getContactFormEmail();
+    const supportEmail = contactFormEmail || config.EMAIL.address || config.SMTP.user || '';
+    if (!supportEmail) {
+        console.error('[Contact] No contact_form email account configured in the database.');
+        return res.status(500).json({ message: 'Support email is not configured. Please try again later.' });
+    }
+    const companyInfo = await getPlatformCompanyEmailInfo();
+    const contactRows = [
+        { label: 'Name', value: name },
+        { label: 'Email', value: email },
+        ...(orderId ? [{ label: 'Order ID', value: orderId }] : []),
+        { label: 'Reason', value: reason },
+        { label: 'Message', value: message, multiline: true },
+    ];
+    const emailBody = createSupportMessageEmailHtml({
+        company: companyInfo,
+        badgeLabel: 'Contact Form',
+        heading: 'New Contact Form Submission',
+        rows: contactRows,
+        footerNote: `Sent from the contact form on ${companyInfo.company_name || 'Barakah Mart'}`,
+    });
+    try {
+        await ensureSupportMessagesTable();
+        const token = getAuthToken(req);
+        let senderUserId = null;
+        let senderRole = 'guest';
+        if (token) {
+            try {
+                const decoded = await verifyAuthToken(token);
+                if (!decoded) {
+                    throw new Error('Invalid token');
+                }
+                senderUserId = decoded.id;
+                const [userRows] = await db.query<any>('SELECT role FROM users WHERE id = ? LIMIT 1', [decoded.id]);
+                const dbRole = String(userRows[0]?.role || '').toLowerCase();
+                if (dbRole === 'buyer' || dbRole === 'seller' || dbRole === 'admin') {
+                    senderRole = dbRole;
+                }
+            }
+            catch {
+                senderUserId = null;
+                senderRole = 'guest';
+            }
+        }
+        await db.query<any>(`INSERT INTO support_messages (
         sender_name,
         sender_email,
         sender_role,
@@ -14347,117 +15594,2317 @@ app.post('/api/contact', async (req: Request, res: Response) => {
         subject,
         order_id,
         message
-      ) VALUES (?, ?, ?, ?, 'admin', ?, ?, ?)`,
-      [
-        name,
-        email,
-        senderRole,
-        senderUserId,
-        reason,
-        orderId || null,
-        message,
-      ],
-    )
-
-    await sendEmail(
-      supportEmail,
-      `[Support] ${reason} – from ${name}`,
-      emailBody,
-      { purpose: 'contact_form' },
-    )
-    console.log('[Contact] Email forwarded successfully')
-    return res.json({ success: true, message: 'Your message has been sent. We will be in touch soon.' })
-  } catch (err: any) {
-    console.error('[Contact] Failed to send email:', err)
-    return res.status(500).json({ message: 'Could not send your message at this time. Please try again later.' })
-  }
-})
-
+      ) VALUES (?, ?, ?, ?, 'admin', ?, ?, ?)`, [
+            name,
+            email,
+            senderRole,
+            senderUserId,
+            reason,
+            orderId || null,
+            message,
+        ]);
+        await sendEmail(supportEmail, `[Support] ${reason} – from ${name}`, emailBody, { purpose: 'contact_form' });
+        console.log('[Contact] Email forwarded successfully');
+        return res.json({ success: true, message: 'Your message has been sent. We will be in touch soon.' });
+    }
+    catch (err: any) {
+        console.error('[Contact] Failed to send email:', err);
+        return res.status(500).json({ message: 'Could not send your message at this time. Please try again later.' });
+    }
+});
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
-  if (err instanceof multer.MulterError) {
-    const message = err.code === 'LIMIT_FILE_SIZE'
-      ? (err.field === 'digital_file' || err.field === 'variant_files'
-        ? 'Digital file is too large. Maximum allowed size is 50MB.'
-        : 'Uploaded file is too large.')
-      : err.message
-    return res.status(400).json({ message })
-  }
-
-  if (err) {
-    return res.status(400).json({ message: err.message || 'Request failed' })
-  }
-
-  next()
-})
-
-const DEFAULT_PORT = config.PORT
-
+    if (err instanceof multer.MulterError) {
+        const message = err.code === 'LIMIT_FILE_SIZE'
+            ? (err.field === 'digital_file' || err.field === 'variant_files'
+                ? 'Digital file is too large. Maximum allowed size is 50MB.'
+                : 'Uploaded file is too large.')
+            : err.message;
+        return res.status(400).json({ message });
+    }
+    if (err) {
+        return res.status(400).json({ message: err.message || 'Request failed' });
+    }
+    next();
+});
+const DEFAULT_PORT = config.PORT;
 const startServer = (port: number) => {
-  const server = app.listen(port, '0.0.0.0', () => {
-    setupWebSocket(server)
-    console.log(`Server running on http://0.0.0.0:${port}`)
-  })
-
-  server.on('error', (error: NodeJS.ErrnoException) => {
-    console.error('Failed to start server:', error)
-    process.exit(1)
-  })
-}
-
+    const server = app.listen(port, '0.0.0.0', () => {
+        setupWebSocket(server);
+        console.log(`Server running on http://0.0.0.0:${port}`);
+    });
+    server.on('error', (error) => {
+        console.error('Failed to start server:', error);
+        process.exit(1);
+    });
+};
+// ============================================================
+// SERVICES & BOOKINGS MODULE
+// ============================================================
+let serviceTablesInitialized = false;
+const ensureServiceTables = async () => {
+    if (serviceTablesInitialized)
+        return;
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS services (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      seller_id INT UNSIGNED NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      sku VARCHAR(120) NULL,
+      subtitle VARCHAR(255) NULL,
+      description TEXT NULL,
+      category VARCHAR(100) NOT NULL,
+      age_category VARCHAR(100) NULL,
+      gender VARCHAR(50) NULL,
+      tax_class VARCHAR(50) DEFAULT '0%',
+      status ENUM('active', 'inactive', 'out_of_stock') DEFAULT 'active',
+      approval_status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+      rejection_message TEXT NULL,
+      is_promoted BOOLEAN DEFAULT FALSE,
+      seo_meta TEXT NULL,
+      tags_json TEXT NULL,
+      main_image_url VARCHAR(500) NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE,
+      INDEX idx_services_seller (seller_id),
+      INDEX idx_services_category (category),
+      INDEX idx_services_status (status)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_images (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      service_id INT UNSIGNED NOT NULL,
+      image_url VARCHAR(500) NOT NULL,
+      is_main BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+      INDEX idx_service_images_service (service_id)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_variants (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      service_id INT UNSIGNED NOT NULL,
+      variant_name VARCHAR(100) NOT NULL,
+      variant_value VARCHAR(255) NOT NULL,
+      sku VARCHAR(100) NULL,
+      price DECIMAL(10,2) NOT NULL,
+      discount_price DECIMAL(10,2) DEFAULT NULL,
+      image_url VARCHAR(500) NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+      INDEX idx_service_variants_service (service_id)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_availability (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      service_id INT UNSIGNED NOT NULL,
+      availability_type ENUM('recurring', 'specific') NOT NULL,
+      day_of_week TINYINT NULL,
+      specific_date DATE NULL,
+      start_time VARCHAR(10) NOT NULL,
+      end_time VARCHAR(10) NOT NULL,
+      valid_from DATE NULL,
+      valid_until DATE NULL,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+      INDEX idx_service_availability_service (service_id),
+      INDEX idx_service_availability_type (availability_type)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_bookings (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      booking_code VARCHAR(40) UNIQUE NOT NULL,
+      booking_token VARCHAR(128) UNIQUE NOT NULL,
+      service_id INT UNSIGNED NOT NULL,
+      seller_id INT UNSIGNED NOT NULL,
+      variant_id INT UNSIGNED NULL,
+      variant_label VARCHAR(255) NULL,
+      price DECIMAL(10,2) NOT NULL DEFAULT 0,
+      buyer_name VARCHAR(255) NOT NULL,
+      buyer_email VARCHAR(255) NOT NULL,
+      buyer_phone VARCHAR(50) NULL,
+      buyer_notes TEXT NULL,
+      booking_date DATE NOT NULL,
+      start_time VARCHAR(10) NOT NULL,
+      end_time VARCHAR(10) NOT NULL,
+      status ENUM('PENDING', 'CONFIRMED', 'REJECTED', 'RESCHEDULE REQUESTED', 'CANCELLED', 'COMPLETED') NOT NULL DEFAULT 'PENDING',
+      previous_status ENUM('PENDING', 'CONFIRMED') NULL,
+      proposed_date DATE NULL,
+      proposed_start_time VARCHAR(10) NULL,
+      proposed_end_time VARCHAR(10) NULL,
+      reschedule_requested_by ENUM('buyer', 'seller') NULL,
+      reschedule_note TEXT NULL,
+      status_reason TEXT NULL,
+      cancelled_by ENUM('buyer', 'seller') NULL,
+      completed_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+      FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE,
+      INDEX idx_service_bookings_service_date (service_id, booking_date),
+      INDEX idx_service_bookings_seller (seller_id),
+      INDEX idx_service_bookings_status (status)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_reviews (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      service_id INT UNSIGNED NOT NULL,
+      booking_id INT UNSIGNED NOT NULL UNIQUE,
+      buyer_name VARCHAR(255) NOT NULL,
+      buyer_email VARCHAR(255) NOT NULL,
+      rating TINYINT UNSIGNED NOT NULL,
+      comment TEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+      FOREIGN KEY (booking_id) REFERENCES service_bookings(id) ON DELETE CASCADE,
+      INDEX idx_service_reviews_service (service_id)
+    ) AUTO_INCREMENT = 100
+  `);
+    await db.query<any>(`
+    CREATE TABLE IF NOT EXISTS service_booking_reminders (
+      id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      booking_id INT UNSIGNED NOT NULL,
+      recipient_type ENUM('buyer', 'seller') NOT NULL,
+      recipient_email VARCHAR(255) NOT NULL,
+      reminder_for_date DATE NOT NULL,
+      sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_booking_recipient_date (booking_id, recipient_type, reminder_for_date),
+      FOREIGN KEY (booking_id) REFERENCES service_bookings(id) ON DELETE CASCADE,
+      INDEX idx_reminder_date (reminder_for_date)
+    )
+  `);
+    try {
+        const [approvalCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'approval_status'`);
+        if (!approvalCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN approval_status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending' AFTER status`);
+        }
+        const [rejCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'rejection_message'`);
+        if (!rejCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN rejection_message TEXT NULL AFTER approval_status`);
+        }
+        const [promCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'is_promoted'`);
+        if (!promCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN is_promoted BOOLEAN DEFAULT FALSE AFTER rejection_message`);
+        }
+        const [citiesCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'available_cities_json'`);
+        if (!citiesCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN available_cities_json TEXT NULL AFTER tags_json`);
+        }
+        const [locTypeCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'service_location_type'`);
+        if (!locTypeCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN service_location_type VARCHAR(30) DEFAULT 'seller_premises' AFTER available_cities_json`);
+        }
+        const [premAddrCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'premises_address'`);
+        if (!premAddrCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN premises_address TEXT NULL AFTER service_location_type`);
+        }
+        const [useProfAddrCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'use_profile_address'`);
+        if (!useProfAddrCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN use_profile_address BOOLEAN DEFAULT FALSE AFTER premises_address`);
+        }
+        const [skuCol] = await db.query<any>(`SHOW COLUMNS FROM services LIKE 'sku'`);
+        if (!skuCol.length) {
+            await db.query<any>(`ALTER TABLE services ADD COLUMN sku VARCHAR(120) NULL AFTER name`);
+        }
+        const [missingSkuRows] = await db.query<any>(`SELECT id, seller_id, name FROM services WHERE sku IS NULL OR sku = ''`);
+        for (const sRow of missingSkuRows) {
+            const generatedSku = await generateServiceSku(Number(sRow.seller_id), String(sRow.name || 'SRV'));
+            await db.query<any>(`UPDATE services SET sku = ? WHERE id = ?`, [generatedSku, Number(sRow.id)]);
+        }
+        const [bookingCityCol] = await db.query<any>(`SHOW COLUMNS FROM service_bookings LIKE 'selected_city'`);
+        if (!bookingCityCol.length) {
+            await db.query<any>(`ALTER TABLE service_bookings ADD COLUMN selected_city VARCHAR(120) NULL AFTER variant_label`);
+        }
+        const [bookingSaleCol] = await db.query<any>(`SHOW COLUMNS FROM service_bookings LIKE 'sale_id'`);
+        if (!bookingSaleCol.length) {
+            await db.query<any>(`ALTER TABLE service_bookings ADD COLUMN sale_id INT UNSIGNED NULL AFTER seller_id`);
+        }
+        const [bookingAddrCol] = await db.query<any>(`SHOW COLUMNS FROM service_bookings LIKE 'buyer_address'`);
+        if (!bookingAddrCol.length) {
+            await db.query<any>(`ALTER TABLE service_bookings ADD COLUMN buyer_address VARCHAR(500) NULL AFTER buyer_phone`);
+        }
+        const [reschedTokCol] = await db.query<any>(`SHOW COLUMNS FROM service_bookings LIKE 'reschedule_token'`);
+        if (!reschedTokCol.length) {
+            await db.query<any>(`ALTER TABLE service_bookings ADD COLUMN reschedule_token VARCHAR(128) NULL AFTER booking_token`);
+        }
+        const [reschedUsedCol] = await db.query<any>(`SHOW COLUMNS FROM service_bookings LIKE 'reschedule_token_used_at'`);
+        if (!reschedUsedCol.length) {
+            await db.query<any>(`ALTER TABLE service_bookings ADD COLUMN reschedule_token_used_at DATETIME NULL AFTER reschedule_token`);
+        }
+        await db.query<any>(`UPDATE services SET main_image_url = REPLACE(main_image_url, '/uploads/', '/uploads/products/') WHERE main_image_url LIKE '/uploads/%' AND main_image_url NOT LIKE '/uploads/products/%'`);
+        await db.query<any>(`UPDATE service_images SET image_url = REPLACE(image_url, '/uploads/', '/uploads/products/') WHERE image_url LIKE '/uploads/%' AND image_url NOT LIKE '/uploads/products/%'`);
+        await db.query<any>(`UPDATE service_variants SET image_url = REPLACE(image_url, '/uploads/', '/uploads/products/') WHERE image_url LIKE '/uploads/%' AND image_url NOT LIKE '/uploads/products/%'`);
+    }
+    catch (alterErr: any) {
+        console.error('Unable to verify services approval columns:', alterErr);
+    }
+    serviceTablesInitialized = true;
+};
+const computeAvailableSlotsForService = async (serviceId: number, fromDateStr: string, toDateStr: string) => {
+    const [rules] = await db.query<any>(`SELECT id, availability_type, day_of_week, specific_date, start_time, end_time, valid_from, valid_until
+     FROM service_availability
+     WHERE service_id = ? AND is_active = 1`, [serviceId]);
+    if (!rules.length)
+        return [];
+    const [activeBookings] = await db.query<any>(`SELECT booking_date, start_time, end_time, status, proposed_date, proposed_start_time
+     FROM service_bookings
+     WHERE service_id = ?
+       AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULE REQUESTED')`, [serviceId]);
+    const reservedKeys = new Set();
+    for (const b of activeBookings) {
+        const bDate = formatIsoDate(b.booking_date);
+        if (bDate && b.start_time) {
+            reservedKeys.add(`${bDate}|${String(b.start_time).slice(0, 5)}`);
+        }
+        const pDate = formatIsoDate(b.proposed_date);
+        if (b.status === 'RESCHEDULE REQUESTED' && pDate && b.proposed_start_time) {
+            reservedKeys.add(`${pDate}|${String(b.proposed_start_time).slice(0, 5)}`);
+        }
+    }
+    const start = new Date(`${fromDateStr}T00:00:00Z`);
+    const end = new Date(`${toDateStr}T00:00:00Z`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+        return [];
+    }
+    // Cap window to 90 days max to avoid excessive iteration
+    const maxEnd = new Date(start.getTime() + 90 * 24 * 60 * 60 * 1000);
+    const effectiveEnd = end > maxEnd ? maxEnd : end;
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const slotsMap = new Map();
+    for (let d = new Date(start); d <= effectiveEnd; d.setUTCDate(d.getUTCDate() + 1)) {
+        const dateStr = d.toISOString().slice(0, 10);
+        if (dateStr < todayStr)
+            continue;
+        const dow = d.getUTCDay(); // 0 = Sunday .. 6 = Saturday
+        for (const rule of rules) {
+            const startTime = String(rule.start_time || '').slice(0, 5);
+            const endTime = String(rule.end_time || '').slice(0, 5);
+            if (!startTime || !endTime)
+                continue;
+            let matches = false;
+            if (rule.availability_type === 'specific') {
+                matches = formatIsoDate(rule.specific_date) === dateStr;
+            }
+            else if (rule.availability_type === 'recurring') {
+                if (Number(rule.day_of_week) === dow) {
+                    const vf = formatIsoDate(rule.valid_from);
+                    const vu = formatIsoDate(rule.valid_until);
+                    if ((!vf || dateStr >= vf) && (!vu || dateStr <= vu)) {
+                        matches = true;
+                    }
+                }
+            }
+            if (matches) {
+                const key = `${dateStr}|${startTime}`;
+                if (!slotsMap.has(key)) {
+                    slotsMap.set(key, {
+                        date: dateStr,
+                        start_time: startTime,
+                        end_time: endTime,
+                        availability_type: String(rule.availability_type),
+                        is_booked: reservedKeys.has(key),
+                    });
+                }
+            }
+        }
+    }
+    return Array.from(slotsMap.values()).sort((a: any, b: any) => {
+        if (a.date !== b.date)
+            return a.date.localeCompare(b.date);
+        return a.start_time.localeCompare(b.start_time);
+    });
+};
+const resolveSellerServiceContactInfo = async (sellerId: number, service?: any) => {
+    const [profRows] = await db.query<any>(`SELECT u.email AS seller_email,
+                COALESCE(NULLIF(TRIM(pr.display_name), ''), NULLIF(TRIM(pr.company_name), ''), u.email) AS seller_name,
+                pr.phone_extension, pr.phone, pr.company_address, pr.street, pr.zip, pr.city, pr.country
+         FROM users u
+         LEFT JOIN profiles pr ON pr.user_id = u.id
+           AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = u.id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
+         WHERE u.id = ?
+         LIMIT 1`, [sellerId]);
+    const pr = profRows[0] || {};
+    const sellerEmail = String(pr.seller_email || '').trim() || null;
+    const sellerName = String(pr.seller_name || '').trim() || null;
+    const sellerPhone = [pr.phone_extension, pr.phone]
+        .map((v: any) => String(v || '').trim())
+        .filter(Boolean)
+        .join(' ') || null;
+    const locType = String(service?.service_location_type || 'seller_premises').trim();
+    const serviceLocation = locType === 'buyer_place'
+        ? "Buyer's place"
+        : locType === 'both'
+            ? "Buyer's place or seller's premises"
+            : "Seller's premises";
+    const isAtPremises = locType === 'seller_premises' || locType === 'both';
+    const profileAddress = String(pr.company_address || [pr.street, pr.zip, pr.city, pr.country].filter(Boolean).join(', ')).trim() || null;
+    const premisesAddress = isAtPremises
+        ? String(service?.premises_address || '').trim() || profileAddress
+        : null;
+    return { sellerPhone, sellerEmail, sellerName, serviceLocation, premisesAddress };
+};
+const sendServiceBookingNotificationEmail = async (params: any) => {
+    try {
+        const to = String(params.to || '').trim();
+        if (!to)
+            return;
+        const companyInfo = await getPlatformCompanyEmailInfo();
+        const html = createServiceBookingEmailHtml({
+            company: companyInfo,
+            recipientName: params.recipientName,
+            heading: params.heading,
+            intro: params.intro,
+            statusBadge: params.statusBadge,
+            statusColor: params.statusColor,
+            bookingCode: params.bookingCode,
+            serviceName: params.serviceName,
+            variantLabel: params.variantLabel,
+            bookingDate: params.bookingDate,
+            bookingTime: params.bookingTime,
+            serviceLocation: params.serviceLocation,
+            premisesAddress: params.premisesAddress,
+            sellerName: params.sellerName,
+            sellerEmail: params.sellerEmail,
+            sellerPhone: params.sellerPhone,
+            proposedDate: params.proposedDate,
+            proposedTime: params.proposedTime,
+            note: params.note,
+            actionLabel: params.actionLabel,
+            actionUrl: params.actionUrl,
+        });
+        await sendEmail(to, params.subject, html, { purpose: params.purpose || 'customers' });
+    }
+    catch (err: any) {
+        console.error('Failed to send service booking email:', err);
+    }
+};
+const getClientBaseUrlForServices = () => {
+    const base = String(config.CLIENT_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    return base;
+};
+const hydrateServices = async (serviceRows: any[]) => {
+    if (!serviceRows.length)
+        return [];
+    const ids = serviceRows.map((s: any) => Number(s.id));
+    const [imageRows] = await db.query<any>(`SELECT id, service_id, image_url, is_main FROM service_images WHERE service_id IN (?) ORDER BY is_main DESC, id ASC`, [ids]);
+    const [variantRows] = await db.query<any>(`SELECT id, service_id, variant_name, variant_value, sku, price, discount_price, image_url FROM service_variants WHERE service_id IN (?) ORDER BY id ASC`, [ids]);
+    const [availRows] = await db.query<any>(`SELECT id, service_id, availability_type, day_of_week, specific_date, start_time, end_time, valid_from, valid_until, is_active FROM service_availability WHERE service_id IN (?) ORDER BY id ASC`, [ids]);
+    return serviceRows.map((s: any) => {
+        const sid = Number(s.id);
+        let tags = [];
+        if (s.tags_json) {
+            try {
+                const parsed = JSON.parse(String(s.tags_json));
+                if (Array.isArray(parsed))
+                    tags = parsed;
+            }
+            catch {
+                tags = [];
+            }
+        }
+        let available_cities: any[] = [];
+        if (s.available_cities_json) {
+            try {
+                const parsed = JSON.parse(String(s.available_cities_json));
+                if (Array.isArray(parsed))
+                    available_cities = parsed.map((c: any) => String(c)).filter(Boolean);
+            }
+            catch {
+                available_cities = [];
+            }
+        }
+        return {
+            ...s,
+            tags,
+            available_cities,
+            service_location_type: s.service_location_type || 'seller_premises',
+            premises_address: s.premises_address || null,
+            use_profile_address: Boolean(s.use_profile_address),
+            images: imageRows.filter((img: any) => Number(img.service_id) === sid),
+            variants: variantRows.filter((v: any) => Number(v.service_id) === sid),
+            availability: availRows
+                .filter((a: any) => Number(a.service_id) === sid)
+                .map((a: any) => ({
+                ...a,
+                specific_date: formatIsoDate(a.specific_date) || null,
+                valid_from: formatIsoDate(a.valid_from) || null,
+                valid_until: formatIsoDate(a.valid_until) || null,
+            })),
+        };
+    });
+};
+// Seller: List own services
+app.get('/api/services', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const [rows] = await db.query<any>(`SELECT * FROM services WHERE seller_id = ? ORDER BY created_at DESC, id DESC`, [auth.id]);
+        const services = await hydrateServices(rows);
+        res.json({ services });
+    }
+    catch (err: any) {
+        console.error('Error fetching seller services:', err);
+        res.status(500).json({ message: 'Failed to load services' });
+    }
+});
+// Seller: Get single service
+app.get('/api/services/:id', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT * FROM services WHERE id = ? AND seller_id = ? LIMIT 1`, [serviceId, auth.id]);
+        if (!rows.length) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        const [hydrated] = await hydrateServices(rows);
+        res.json({ service: hydrated });
+    }
+    catch (err: any) {
+        console.error('Error fetching service:', err);
+        res.status(500).json({ message: 'Failed to load service' });
+    }
+});
+// Seller: Create service
+app.post('/api/services', productUpload, async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const uploadedFiles = req.files as Record<string, Express.Multer.File[]> | undefined;
+        const imageFiles = uploadedFiles?.images || [];
+        const variantImageFiles = uploadedFiles?.variant_images || [];
+        const name = String(req.body.name || '').trim();
+        const subtitle = String(req.body.subtitle || '').trim() || null;
+        const description = String(req.body.description || '').trim() || null;
+        const category = String(req.body.category || '').trim();
+        const ageCategory = String(req.body.age_category || '').trim() || null;
+        const gender = String(req.body.gender || '').trim() || null;
+        const taxClass = String(req.body.tax_class || '0%').trim() || '0%';
+        const status = ['active', 'inactive', 'out_of_stock'].includes(String(req.body.status))
+            ? String(req.body.status)
+            : 'active';
+        const seoMeta = String(req.body.seo_meta || '').trim() || null;
+        const tags = normalizeServiceJsonField(req.body.tags);
+        const availableCities = normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
+        const rawLocType = String(req.body.service_location_type || 'seller_premises').trim();
+        const serviceLocationType = ['buyer_place', 'seller_premises', 'both'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const useProfileAddress = req.body.use_profile_address === true || req.body.use_profile_address === 'true' || req.body.use_profile_address === '1';
+        let premisesAddress = String(req.body.premises_address || '').trim() || null;
+        if ((serviceLocationType === 'seller_premises' || serviceLocationType === 'both') && useProfileAddress && !premisesAddress) {
+            const [profRows] = await db.query<any>(`SELECT company_address, street, zip, city, country FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, [auth.id]);
+            if (profRows.length) {
+                const pr = profRows[0];
+                premisesAddress = String(pr.company_address || [pr.street, pr.zip, pr.city, pr.country].filter(Boolean).join(', ')).trim() || null;
+            }
+        }
+        const variantsInput = normalizeServiceJsonField(req.body.variants);
+        const availabilityInput = normalizeServiceJsonField(req.body.availability);
+        const mainImageIndex = Math.max(0, Number(req.body.main_image_index ?? 0));
+        if (!name)
+            return res.status(400).json({ message: 'Service name is required' });
+        if (!category)
+            return res.status(400).json({ message: 'Service category is required' });
+        if (!imageFiles.length)
+            return res.status(400).json({ message: 'At least one service image is required' });
+        if (!variantsInput.length)
+            return res.status(400).json({ message: 'At least one service variant/pricing option is required' });
+        const imageUrls = imageFiles.map((f: any) => `/uploads/products/${f.filename}`);
+        const safeMainIdx = mainImageIndex < imageUrls.length ? mainImageIndex : 0;
+        const mainImageUrl = imageUrls[safeMainIdx] || imageUrls[0];
+        const serviceSku = String(req.body.sku || '').trim() || (await generateServiceSku(auth.id, name));
+        const [insertResult] = await db.query<any>(`INSERT INTO services (seller_id, name, sku, subtitle, description, category, age_category, gender, tax_class, status, approval_status, seo_meta, tags_json, available_cities_json, service_location_type, premises_address, use_profile_address, main_image_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`, [auth.id, name, serviceSku, subtitle, description, category, ageCategory, gender, taxClass, status, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl]);
+        const serviceId = insertResult.insertId;
+        for (let i = 0; i < imageUrls.length; i++) {
+            await db.query<any>(`INSERT INTO service_images (service_id, image_url, is_main) VALUES (?, ?, ?)`, [serviceId, imageUrls[i], i === safeMainIdx ? 1 : 0]);
+        }
+        let variantFileIdx = 0;
+        for (const v of variantsInput) {
+            let varImgUrl = typeof v.image_url === 'string' && v.image_url ? v.image_url : null;
+            if (v.has_new_image && variantImageFiles[variantFileIdx]) {
+                varImgUrl = `/uploads/products/${variantImageFiles[variantFileIdx].filename}`;
+                variantFileIdx++;
+            }
+            const priceVal = Number(v.price) || 0;
+            const discountVal = v.discount_price !== null && v.discount_price !== undefined && v.discount_price !== '' ? Number(v.discount_price) : null;
+            await db.query<any>(`INSERT INTO service_variants (service_id, variant_name, variant_value, sku, price, discount_price, image_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`, [
+                serviceId,
+                String(v.variant_name || 'Option').trim(),
+                String(v.variant_value || 'Standard').trim(),
+                v.sku ? String(v.sku).trim() : null,
+                priceVal,
+                discountVal,
+                varImgUrl,
+            ]);
+        }
+        for (const slot of availabilityInput) {
+            const type = slot.availability_type === 'specific' ? 'specific' : 'recurring';
+            const startTime = String(slot.start_time || '').slice(0, 5);
+            const endTime = String(slot.end_time || '').slice(0, 5);
+            if (!startTime || !endTime)
+                continue;
+            await db.query<any>(`INSERT INTO service_availability (service_id, availability_type, day_of_week, specific_date, start_time, end_time, valid_from, valid_until, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`, [
+                serviceId,
+                type,
+                type === 'recurring' ? Number(slot.day_of_week) : null,
+                type === 'specific' ? (slot.specific_date || null) : null,
+                startTime,
+                endTime,
+                slot.valid_from || null,
+                slot.valid_until || null,
+            ]);
+        }
+        const [createdRows] = await db.query<any>(`SELECT * FROM services WHERE id = ?`, [serviceId]);
+        const [service] = await hydrateServices(createdRows);
+        res.status(201).json({ message: 'Service registered successfully', service });
+    }
+    catch (err: any) {
+        console.error('Error creating service:', err);
+        res.status(500).json({ message: 'Failed to create service' });
+    }
+});
+// Seller: Update service
+app.put('/api/services/:id', productUpload, async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [existingRows] = await db.query<any>(`SELECT * FROM services WHERE id = ? AND seller_id = ? LIMIT 1`, [serviceId, auth.id]);
+        if (!existingRows.length) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        const uploadedFiles = req.files as Record<string, Express.Multer.File[]> | undefined;
+        const imageFiles = uploadedFiles?.images || [];
+        const variantImageFiles = uploadedFiles?.variant_images || [];
+        const name = String(req.body.name || '').trim();
+        const subtitle = String(req.body.subtitle || '').trim() || null;
+        const description = String(req.body.description || '').trim() || null;
+        const category = String(req.body.category || '').trim();
+        const ageCategory = String(req.body.age_category || '').trim() || null;
+        const gender = String(req.body.gender || '').trim() || null;
+        const taxClass = String(req.body.tax_class || '0%').trim() || '0%';
+        const status = ['active', 'inactive', 'out_of_stock'].includes(String(req.body.status))
+            ? String(req.body.status)
+            : 'active';
+        const seoMeta = String(req.body.seo_meta || '').trim() || null;
+        const tags = normalizeServiceJsonField(req.body.tags);
+        const availableCities = normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
+        const rawLocType = String(req.body.service_location_type || 'seller_premises').trim();
+        const serviceLocationType = ['buyer_place', 'seller_premises', 'both'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const useProfileAddress = req.body.use_profile_address === true || req.body.use_profile_address === 'true' || req.body.use_profile_address === '1';
+        let premisesAddress = String(req.body.premises_address || '').trim() || null;
+        if ((serviceLocationType === 'seller_premises' || serviceLocationType === 'both') && useProfileAddress && !premisesAddress) {
+            const [profRows] = await db.query<any>(`SELECT company_address, street, zip, city, country FROM profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, [auth.id]);
+            if (profRows.length) {
+                const pr = profRows[0];
+                premisesAddress = String(pr.company_address || [pr.street, pr.zip, pr.city, pr.country].filter(Boolean).join(', ')).trim() || null;
+            }
+        }
+        const variantsInput = normalizeServiceJsonField(req.body.variants);
+        const availabilityInput = normalizeServiceJsonField(req.body.availability);
+        const existingImagesInput = normalizeServiceJsonField(req.body.existing_images);
+        const mainImageIndex = Math.max(0, Number(req.body.main_image_index ?? 0));
+        if (!name)
+            return res.status(400).json({ message: 'Service name is required' });
+        if (!category)
+            return res.status(400).json({ message: 'Service category is required' });
+        const keptUrls = existingImagesInput
+            .map((img: any) => (typeof img === 'string' ? img : String(img?.image_url || '').trim()))
+            .filter(Boolean);
+        const newUrls = imageFiles.map((f: any) => `/uploads/products/${f.filename}`);
+        const allImages = [...keptUrls, ...newUrls];
+        if (!allImages.length) {
+            return res.status(400).json({ message: 'At least one service image is required' });
+        }
+        const safeMainIdx = mainImageIndex < allImages.length ? mainImageIndex : 0;
+        const mainImageUrl = allImages[safeMainIdx] || allImages[0];
+        await db.query<any>(`UPDATE services
+       SET name = ?, subtitle = ?, description = ?, category = ?, age_category = ?, gender = ?, tax_class = ?, status = ?, seo_meta = ?, tags_json = ?, available_cities_json = ?, service_location_type = ?, premises_address = ?, use_profile_address = ?, main_image_url = ?
+       WHERE id = ? AND seller_id = ?`, [name, subtitle, description, category, ageCategory, gender, taxClass, status, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl, serviceId, auth.id]);
+        await db.query<any>(`DELETE FROM service_images WHERE service_id = ?`, [serviceId]);
+        for (let i = 0; i < allImages.length; i++) {
+            await db.query<any>(`INSERT INTO service_images (service_id, image_url, is_main) VALUES (?, ?, ?)`, [serviceId, allImages[i], i === safeMainIdx ? 1 : 0]);
+        }
+        await db.query<any>(`DELETE FROM service_variants WHERE service_id = ?`, [serviceId]);
+        let variantFileIdx = 0;
+        for (const v of variantsInput) {
+            let varImgUrl = typeof v.image_url === 'string' && v.image_url ? v.image_url : null;
+            if (v.has_new_image && variantImageFiles[variantFileIdx]) {
+                varImgUrl = `/uploads/products/${variantImageFiles[variantFileIdx].filename}`;
+                variantFileIdx++;
+            }
+            const priceVal = Number(v.price) || 0;
+            const discountVal = v.discount_price !== null && v.discount_price !== undefined && v.discount_price !== '' ? Number(v.discount_price) : null;
+            await db.query<any>(`INSERT INTO service_variants (service_id, variant_name, variant_value, sku, price, discount_price, image_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`, [
+                serviceId,
+                String(v.variant_name || 'Option').trim(),
+                String(v.variant_value || 'Standard').trim(),
+                v.sku ? String(v.sku).trim() : null,
+                priceVal,
+                discountVal,
+                varImgUrl,
+            ]);
+        }
+        await db.query<any>(`DELETE FROM service_availability WHERE service_id = ?`, [serviceId]);
+        for (const slot of availabilityInput) {
+            const type = slot.availability_type === 'specific' ? 'specific' : 'recurring';
+            const startTime = String(slot.start_time || '').slice(0, 5);
+            const endTime = String(slot.end_time || '').slice(0, 5);
+            if (!startTime || !endTime)
+                continue;
+            await db.query<any>(`INSERT INTO service_availability (service_id, availability_type, day_of_week, specific_date, start_time, end_time, valid_from, valid_until, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`, [
+                serviceId,
+                type,
+                type === 'recurring' ? Number(slot.day_of_week) : null,
+                type === 'specific' ? (slot.specific_date || null) : null,
+                startTime,
+                endTime,
+                slot.valid_from || null,
+                slot.valid_until || null,
+            ]);
+        }
+        const [updatedRows] = await db.query<any>(`SELECT * FROM services WHERE id = ?`, [serviceId]);
+        const [service] = await hydrateServices(updatedRows);
+        res.json({ message: 'Service updated successfully', service });
+    }
+    catch (err: any) {
+        console.error('Error updating service:', err);
+        res.status(500).json({ message: 'Failed to update service' });
+    }
+});
+// Seller: Delete service
+app.delete('/api/services/:id', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [result] = await db.query<any>(`DELETE FROM services WHERE id = ? AND seller_id = ?`, [serviceId, auth.id]);
+        if (!result.affectedRows) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        res.json({ message: 'Service deleted successfully' });
+    }
+    catch (err: any) {
+        console.error('Error deleting service:', err);
+        res.status(500).json({ message: 'Failed to delete service' });
+    }
+});
+// Seller: Add availability slot(s) to an existing service
+app.post('/api/services/:id/availability', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [serviceRows] = await db.query<any>(`SELECT id FROM services WHERE id = ? AND seller_id = ? LIMIT 1`, [serviceId, auth.id]);
+        if (!serviceRows.length) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        const rawSlots = Array.isArray(req.body?.slots) ? req.body.slots : [req.body];
+        const inserted = [];
+        for (const a of rawSlots) {
+            const availType = a?.availability_type === 'specific' ? 'specific' : 'recurring';
+            const startTime = String(a?.start_time || '').slice(0, 5);
+            const endTime = String(a?.end_time || '').slice(0, 5);
+            if (!startTime || !endTime || endTime <= startTime) {
+                continue;
+            }
+            const dayOfWeek = availType === 'recurring' && a?.day_of_week != null ? Number(a.day_of_week) : null;
+            const specificDate = availType === 'specific' && a?.specific_date ? String(a.specific_date).slice(0, 10) : null;
+            const validFrom = a?.valid_from ? String(a.valid_from).slice(0, 10) : null;
+            const validUntil = a?.valid_until ? String(a.valid_until).slice(0, 10) : null;
+            if (availType === 'recurring' && (dayOfWeek == null || Number.isNaN(dayOfWeek))) {
+                continue;
+            }
+            if (availType === 'specific' && !specificDate) {
+                continue;
+            }
+            const [ins] = await db.query<any>(`INSERT INTO service_availability (service_id, availability_type, day_of_week, specific_date, start_time, end_time, valid_from, valid_until, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`, [serviceId, availType, dayOfWeek, specificDate, startTime, endTime, validFrom, validUntil]);
+            inserted.push({
+                id: ins.insertId,
+                service_id: serviceId,
+                availability_type: availType,
+                day_of_week: dayOfWeek,
+                specific_date: specificDate,
+                start_time: startTime,
+                end_time: endTime,
+                valid_from: validFrom,
+                valid_until: validUntil,
+                is_active: 1,
+            });
+        }
+        if (!inserted.length) {
+            return res.status(400).json({ message: 'No valid availability slots provided' });
+        }
+        res.status(201).json({ message: 'Availability added', slots: inserted });
+    }
+    catch (err: any) {
+        console.error('Error adding service availability:', err);
+        res.status(500).json({ message: 'Failed to add availability' });
+    }
+});
+// Seller: Delete an availability slot from an existing service
+app.delete('/api/services/:id/availability/:availId', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const availId = Number(req.params.availId);
+        const [serviceRows] = await db.query<any>(`SELECT id FROM services WHERE id = ? AND seller_id = ? LIMIT 1`, [serviceId, auth.id]);
+        if (!serviceRows.length) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        await db.query<any>(`DELETE FROM service_availability WHERE id = ? AND service_id = ?`, [availId, serviceId]);
+        res.json({ message: 'Availability slot removed' });
+    }
+    catch (err: any) {
+        console.error('Error removing service availability:', err);
+        res.status(500).json({ message: 'Failed to remove availability slot' });
+    }
+});
+app.put('/api/services/:id/promote', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [rows] = await db.query<any>('SELECT id, seller_id, is_promoted FROM services WHERE id = ?', [serviceId]);
+        if (!rows.length) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        if (Number(rows[0].seller_id) !== Number(auth.id)) {
+            return res.status(403).json({ message: 'You do not have permission to promote this service' });
+        }
+        const newStatus = !rows[0].is_promoted;
+        await db.query<any>('UPDATE services SET is_promoted = ? WHERE id = ?', [newStatus, serviceId]);
+        res.status(200).json({
+            message: newStatus ? 'Service promoted successfully' : 'Service promotion removed successfully',
+            is_promoted: newStatus,
+        });
+    }
+    catch (err: any) {
+        console.error('Error toggling service promotion:', err);
+        res.status(500).json({ message: 'Database error' });
+    }
+});
+// Seller: List bookings for seller's services
+app.get('/api/seller/service-bookings', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const [rows] = await db.query<any>(`SELECT sb.*,
+              s.name AS service_name,
+              s.category AS service_category,
+              s.main_image_url AS service_image,
+              s.service_location_type,
+              s.premises_address,
+              COALESCE(NULLIF(TRIM(sb.buyer_phone), ''), NULLIF(TRIM(c.phone), '')) AS buyer_phone,
+              COALESCE(
+                NULLIF(TRIM(sb.buyer_address), ''),
+                NULLIF(TRIM(CONCAT_WS(', ', NULLIF(c.shipping_street, ''), NULLIF(c.shipping_city, ''), NULLIF(c.shipping_state, ''), NULLIF(c.shipping_zip, ''), NULLIF(c.shipping_country, ''))), '')
+              ) AS buyer_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       LEFT JOIN sales sa ON sa.id = sb.sale_id
+       LEFT JOIN customers c ON c.id = sa.customer_id
+       WHERE sb.seller_id = ?
+       ORDER BY sb.created_at DESC, sb.id DESC`, [auth.id]);
+        const bookings = rows.map((r: any) => ({
+            ...r,
+            booking_date: formatIsoDate(r.booking_date),
+            proposed_date: formatIsoDate(r.proposed_date) || null,
+        }));
+        res.json({ bookings });
+    }
+    catch (err: any) {
+        console.error('Error loading seller service bookings:', err);
+        res.status(500).json({ message: 'Failed to load service bookings' });
+    }
+});
+// Seller: Accept booking (PENDING -> CONFIRMED)
+app.post('/api/seller/service-bookings/:id/accept', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const bookingId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, s.service_location_type, s.premises_address, s.use_profile_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.id = ? AND sb.seller_id = ? LIMIT 1`, [bookingId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (b.status !== 'PENDING') {
+            return res.status(400).json({ message: `Cannot accept booking in status ${b.status}` });
+        }
+        await db.query<any>(`UPDATE service_bookings SET status = 'CONFIRMED' WHERE id = ?`, [bookingId]);
+        const contactInfo = await resolveSellerServiceContactInfo(Number(b.seller_id), b);
+        const manageUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.buyer_email),
+            subject: `Booking Confirmed: ${b.service_name} (${b.booking_code})`,
+            recipientName: String(b.buyer_name),
+            heading: 'Your Service Booking is Confirmed!',
+            intro: 'The seller has accepted your booking request.',
+            statusBadge: 'CONFIRMED',
+            statusColor: '#059669',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            serviceLocation: contactInfo.serviceLocation,
+            premisesAddress: contactInfo.premisesAddress,
+            sellerName: contactInfo.sellerName,
+            sellerEmail: contactInfo.sellerEmail,
+            sellerPhone: contactInfo.sellerPhone,
+            actionLabel: 'View Booking',
+            actionUrl: manageUrl,
+            purpose: 'customers',
+        });
+        res.json({ message: 'Booking confirmed', status: 'CONFIRMED' });
+    }
+    catch (err: any) {
+        console.error('Error accepting booking:', err);
+        res.status(500).json({ message: 'Failed to accept booking' });
+    }
+});
+// Seller: Reject booking (PENDING -> REJECTED)
+app.post('/api/seller/service-bookings/:id/reject', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const bookingId = Number(req.params.id);
+        const reason = String(req.body.reason || '').trim() || null;
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.id = ? AND sb.seller_id = ? LIMIT 1`, [bookingId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (b.status !== 'PENDING') {
+            return res.status(400).json({ message: `Cannot reject booking in status ${b.status}` });
+        }
+        await db.query<any>(`UPDATE service_bookings SET status = 'REJECTED', status_reason = ? WHERE id = ?`, [reason, bookingId]);
+        const manageUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.buyer_email),
+            subject: `Booking Rejected: ${b.service_name} (${b.booking_code})`,
+            recipientName: String(b.buyer_name),
+            heading: 'Booking Request Rejected',
+            intro: 'Unfortunately, the seller could not accommodate your booking request.',
+            statusBadge: 'REJECTED',
+            statusColor: '#dc2626',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            note: reason,
+            actionLabel: 'View Details',
+            actionUrl: manageUrl,
+            purpose: 'customers',
+        });
+        res.json({ message: 'Booking rejected', status: 'REJECTED' });
+    }
+    catch (err: any) {
+        console.error('Error rejecting booking:', err);
+        res.status(500).json({ message: 'Failed to reject booking' });
+    }
+});
+// Seller: Propose reschedule (PENDING/CONFIRMED -> RESCHEDULE REQUESTED)
+app.post('/api/seller/service-bookings/:id/reschedule', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const bookingId = Number(req.params.id);
+        const proposedDate = String(req.body.proposed_date || '').trim();
+        const proposedStart = String(req.body.proposed_start_time || '').slice(0, 5);
+        const proposedEnd = String(req.body.proposed_end_time || '').slice(0, 5);
+        const note = String(req.body.note || '').trim() || null;
+        if (!proposedDate || !proposedStart || !proposedEnd) {
+            return res.status(400).json({ message: 'Proposed date, start time, and end time are required' });
+        }
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, s.service_location_type, s.premises_address, s.use_profile_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.id = ? AND sb.seller_id = ? LIMIT 1`, [bookingId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (!['PENDING', 'CONFIRMED'].includes(b.status)) {
+            return res.status(400).json({ message: `Cannot reschedule booking in status ${b.status}` });
+        }
+        const rescheduleToken = crypto.randomBytes(24).toString('hex');
+        await db.query<any>(`UPDATE service_bookings
+       SET previous_status = ?, status = 'RESCHEDULE REQUESTED', proposed_date = ?, proposed_start_time = ?, proposed_end_time = ?, reschedule_requested_by = 'seller', reschedule_note = ?, reschedule_token = ?, reschedule_token_used_at = NULL
+       WHERE id = ?`, [b.status, proposedDate, proposedStart, proposedEnd, note, rescheduleToken, bookingId]);
+        const contactInfo = await resolveSellerServiceContactInfo(Number(b.seller_id), b);
+        const manageUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}?rt=${rescheduleToken}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.buyer_email),
+            subject: `Reschedule Requested: ${b.service_name} (${b.booking_code})`,
+            recipientName: String(b.buyer_name),
+            heading: 'Seller Proposed a New Date & Time',
+            intro: 'The seller has proposed rescheduling your booking. Please review and accept or reject the new time.',
+            statusBadge: 'RESCHEDULE REQUESTED',
+            statusColor: '#d97706',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            serviceLocation: contactInfo.serviceLocation,
+            premisesAddress: contactInfo.premisesAddress,
+            sellerPhone: contactInfo.sellerPhone,
+            proposedDate,
+            proposedTime: `${proposedStart} - ${proposedEnd}`,
+            note,
+            actionLabel: 'Respond to Reschedule',
+            actionUrl: manageUrl,
+            purpose: 'customers',
+        });
+        res.json({ message: 'Reschedule proposal sent to buyer', status: 'RESCHEDULE REQUESTED' });
+    }
+    catch (err: any) {
+        console.error('Error requesting reschedule:', err);
+        res.status(500).json({ message: 'Failed to request reschedule' });
+    }
+});
+// Seller: Respond to buyer's reschedule proposal
+app.post('/api/seller/service-bookings/:id/reschedule-respond', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const bookingId = Number(req.params.id);
+        const action = req.body.action === 'accept' ? 'accept' : 'reject';
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, s.service_location_type, s.premises_address, s.use_profile_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.id = ? AND sb.seller_id = ? LIMIT 1`, [bookingId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (b.status !== 'RESCHEDULE REQUESTED' || b.reschedule_requested_by !== 'buyer') {
+            return res.status(400).json({ message: 'No buyer reschedule proposal pending' });
+        }
+        const contactInfo = await resolveSellerServiceContactInfo(Number(b.seller_id), b);
+        const manageUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}`;
+        if (action === 'accept') {
+            const newDate = formatIsoDate(b.proposed_date);
+            const newStart = String(b.proposed_start_time);
+            const newEnd = String(b.proposed_end_time);
+            await db.query<any>(`UPDATE service_bookings
+         SET booking_date = ?, start_time = ?, end_time = ?, status = 'CONFIRMED', previous_status = NULL, proposed_date = NULL, proposed_start_time = NULL, proposed_end_time = NULL, reschedule_requested_by = NULL, reschedule_note = NULL
+         WHERE id = ?`, [newDate, newStart, newEnd, bookingId]);
+            await sendServiceBookingNotificationEmail({
+                to: String(b.buyer_email),
+                subject: `Reschedule Accepted: ${b.service_name} (${b.booking_code})`,
+                recipientName: String(b.buyer_name),
+                heading: 'Your Reschedule Request Was Accepted',
+                intro: 'The seller has accepted your proposed date and time. Your booking is confirmed.',
+                statusBadge: 'CONFIRMED',
+                statusColor: '#059669',
+                bookingCode: String(b.booking_code),
+                serviceName: String(b.service_name),
+                variantLabel: b.variant_label ? String(b.variant_label) : null,
+                bookingDate: newDate,
+                bookingTime: `${newStart} - ${newEnd}`,
+                serviceLocation: contactInfo.serviceLocation,
+                premisesAddress: contactInfo.premisesAddress,
+                sellerName: contactInfo.sellerName,
+                sellerEmail: contactInfo.sellerEmail,
+                sellerPhone: contactInfo.sellerPhone,
+                actionLabel: 'View Booking',
+                actionUrl: manageUrl,
+                purpose: 'customers',
+            });
+            return res.json({ message: 'Reschedule accepted', status: 'CONFIRMED' });
+        }
+        else {
+            const restored = b.previous_status || 'CONFIRMED';
+            await db.query<any>(`UPDATE service_bookings
+         SET status = ?, previous_status = NULL, proposed_date = NULL, proposed_start_time = NULL, proposed_end_time = NULL, reschedule_requested_by = NULL, reschedule_note = NULL
+         WHERE id = ?`, [restored, bookingId]);
+            await sendServiceBookingNotificationEmail({
+                to: String(b.buyer_email),
+                subject: `Reschedule Declined: ${b.service_name} (${b.booking_code})`,
+                recipientName: String(b.buyer_name),
+                heading: 'Reschedule Request Declined',
+                intro: 'The seller could not accept the proposed time. Your original booking time remains active.',
+                statusBadge: restored,
+                statusColor: '#6b7280',
+                bookingCode: String(b.booking_code),
+                serviceName: String(b.service_name),
+                variantLabel: b.variant_label ? String(b.variant_label) : null,
+                bookingDate: formatIsoDate(b.booking_date),
+                bookingTime: `${b.start_time} - ${b.end_time}`,
+                actionLabel: 'View Booking',
+                actionUrl: manageUrl,
+                purpose: 'customers',
+            });
+            return res.json({ message: 'Reschedule rejected', status: restored });
+        }
+    }
+    catch (err: any) {
+        console.error('Error responding to reschedule:', err);
+        res.status(500).json({ message: 'Failed to respond to reschedule' });
+    }
+});
+// Seller: Cancel booking (disabled for sellers)
+app.post('/api/seller/service-bookings/:id/cancel', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    return res.status(403).json({ message: 'Sellers cannot cancel service bookings.' });
+});
+// Seller: Mark booking COMPLETED -> email buyer asking for review
+app.post('/api/seller/service-bookings/:id/complete', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const bookingId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.id = ? AND sb.seller_id = ? LIMIT 1`, [bookingId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (!['CONFIRMED', 'PENDING'].includes(b.status)) {
+            return res.status(400).json({ message: `Cannot complete booking in status ${b.status}` });
+        }
+        const schedDate = formatIsoDate(b.booking_date);
+        const schedTime = String(b.end_time || b.start_time || '').slice(0, 5);
+        if (!schedDate || !schedTime) {
+            return res.status(400).json({ message: 'Scheduled date and time are missing for this booking.' });
+        }
+        const scheduledEnd = new Date(`${schedDate}T${schedTime}:00`);
+        if (Number.isNaN(scheduledEnd.getTime()) || new Date() < scheduledEnd) {
+            return res.status(400).json({ message: 'You can mark this service as complete only after the scheduled date and time.' });
+        }
+        await db.query<any>(`UPDATE service_bookings SET status = 'COMPLETED', completed_at = NOW() WHERE id = ?`, [bookingId]);
+        if (b.sale_id) {
+            await db.query<any>(`UPDATE sales SET order_status = 'delivered' WHERE id = ?`, [Number(b.sale_id)]);
+        }
+        const reviewUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}?review=1`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.buyer_email),
+            subject: `Service Completed — Please Leave a Review (${b.service_name})`,
+            recipientName: String(b.buyer_name),
+            heading: 'Service Completed — How Was Your Experience?',
+            intro: 'Your service has been marked as completed by the seller. We would love to hear your feedback!',
+            statusBadge: 'COMPLETED',
+            statusColor: '#2563eb',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            actionLabel: 'Leave a Review',
+            actionUrl: reviewUrl,
+            purpose: 'customers',
+        });
+        res.json({ message: 'Booking marked as completed', status: 'COMPLETED' });
+    }
+    catch (err: any) {
+        console.error('Error completing booking:', err);
+        res.status(500).json({ message: 'Failed to complete booking' });
+    }
+});
+// Public: List active services
+app.get('/api/public/services', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const search = String(req.query.search || '').trim();
+        const category = String(req.query.category || '').trim();
+        const sellerId = req.query.seller ? Number(req.query.seller) : null;
+        const promotedOnly = String(req.query.promoted || '').toLowerCase() === 'true';
+        const limitRaw = Number(req.query.limit);
+        const offsetRaw = Number(req.query.offset);
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 1000) : 1000;
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : 0;
+        const where = [`s.status = 'active'`, `s.approval_status = 'approved'`];
+        const params = [];
+        if (promotedOnly) {
+            where.push(`s.is_promoted = TRUE`);
+        }
+        if (category) {
+            where.push(`s.category = ?`);
+            params.push(category);
+        }
+        if (sellerId) {
+            where.push(`s.seller_id = ?`);
+            params.push(sellerId);
+        }
+        if (search) {
+            where.push(`(s.name LIKE ? OR s.subtitle LIKE ? OR s.description LIKE ? OR s.seo_meta LIKE ? OR s.tags_json LIKE ?)`);
+            const like = `%${search}%`;
+            params.push(like, like, like, like, like);
+        }
+        const [countRows] = await db.query<any>(`SELECT COUNT(*) AS total FROM services s WHERE ${where.join(' AND ')}`, params);
+        const total = Number(countRows[0]?.total || 0);
+        const baseWhere = [`s.status = 'active'`, `s.approval_status = 'approved'`];
+        const baseParams = [];
+        if (sellerId) {
+            baseWhere.push(`s.seller_id = ?`);
+            baseParams.push(sellerId);
+        }
+        const [totalAllRows] = await db.query<any>(`SELECT COUNT(*) AS total FROM services s WHERE ${baseWhere.join(' AND ')}`, baseParams);
+        const totalAll = Number(totalAllRows[0]?.total || 0);
+        const [rows] = await db.query<any>(`SELECT s.*, MAX(p.display_name) AS seller_display_name, MAX(p.company_name) AS seller_company_name,
+              COALESCE(AVG(sr.rating), 0) AS avg_rating, COUNT(sr.id) AS review_count
+       FROM services s
+       LEFT JOIN profiles p ON p.user_id = s.seller_id
+       LEFT JOIN service_reviews sr ON sr.service_id = s.id
+       WHERE ${where.join(' AND ')}
+       GROUP BY s.id
+       ORDER BY s.is_promoted DESC, s.created_at DESC, s.id DESC
+       LIMIT ? OFFSET ?`, [...params, limit, offset]);
+        const services = await hydrateServices(rows);
+        res.json({ services, total, totalAll, limit, offset });
+    }
+    catch (err: any) {
+        console.error('Error listing public services:', err);
+        res.status(500).json({ message: 'Failed to load services' });
+    }
+});
+// Public: Get single service details + reviews
+app.get('/api/public/services/:id', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT s.*, p.display_name AS seller_display_name, p.company_name AS seller_company_name
+       FROM services s
+       LEFT JOIN profiles p ON p.user_id = s.seller_id
+       WHERE s.id = ? AND s.status = 'active' AND s.approval_status = 'approved' LIMIT 1`, [serviceId]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Service not found' });
+        const [service] = await hydrateServices(rows);
+        const [reviews] = await db.query<any>(`SELECT id, buyer_name, rating, comment, created_at FROM service_reviews WHERE service_id = ? ORDER BY created_at DESC`, [serviceId]);
+        res.json({ service, reviews });
+    }
+    catch (err: any) {
+        console.error('Error loading public service:', err);
+        res.status(500).json({ message: 'Failed to load service' });
+    }
+});
+// Public: Get available calendar slots for a service (booked slots excluded)
+app.get('/api/public/services/:id/available-slots', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const today = new Date().toISOString().slice(0, 10);
+        const defaultTo = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const fromDate = String(req.query.from || today).slice(0, 10);
+        const toDate = String(req.query.to || defaultTo).slice(0, 10);
+        const slots = await computeAvailableSlotsForService(serviceId, fromDate, toDate);
+        res.json({ slots });
+    }
+    catch (err: any) {
+        console.error('Error fetching available slots:', err);
+        res.status(500).json({ message: 'Failed to load available slots' });
+    }
+});
+// Public: Buyer requests a booking (PENDING) -> slot reserved & seller emailed
+app.post('/api/public/services/:id/bookings', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const buyerName = String(req.body.buyer_name || '').trim();
+        const buyerEmail = String(req.body.buyer_email || '').trim().toLowerCase();
+        const buyerPhone = String(req.body.buyer_phone || '').trim() || null;
+        const buyerAddress = String(req.body.buyer_address || '').trim() || null;
+        const buyerNotes = String(req.body.buyer_notes || '').trim() || null;
+        const bookingDate = String(req.body.booking_date || '').slice(0, 10);
+        const startTime = String(req.body.start_time || '').slice(0, 5);
+        const endTime = String(req.body.end_time || '').slice(0, 5);
+        const variantId = req.body.variant_id ? Number(req.body.variant_id) : null;
+        if (!buyerName || !buyerEmail || !bookingDate || !startTime || !endTime) {
+            return res.status(400).json({ message: 'Name, email, date, and time slot are required' });
+        }
+        const [serviceRows] = await db.query<any>(`SELECT s.*, u.email AS seller_email, COALESCE(p.display_name, p.company_name, u.email) AS seller_name
+       FROM services s
+       JOIN users u ON u.id = s.seller_id
+       LEFT JOIN profiles p ON p.user_id = s.seller_id
+       WHERE s.id = ? AND s.status = 'active' AND s.approval_status = 'approved' LIMIT 1`, [serviceId]);
+        if (!serviceRows.length) {
+            return res.status(404).json({ message: 'Service not found or inactive' });
+        }
+        const service = serviceRows[0];
+        // Verify slot is available and not already booked
+        const availableSlots = await computeAvailableSlotsForService(serviceId, bookingDate, bookingDate);
+        const matchedSlot = availableSlots.find((sl: any) => sl.date === bookingDate && sl.start_time === startTime && !sl.is_booked);
+        if (!matchedSlot) {
+            return res.status(409).json({ message: 'Selected time slot is no longer available' });
+        }
+        let variantLabel = null;
+        let price = 0;
+        if (variantId) {
+            const [varRows] = await db.query<any>(`SELECT * FROM service_variants WHERE id = ? AND service_id = ? LIMIT 1`, [variantId, serviceId]);
+            if (varRows.length) {
+                const v = varRows[0];
+                variantLabel = `${v.variant_name}: ${v.variant_value}`;
+                price = Number(v.discount_price ?? v.price ?? 0);
+            }
+        }
+        const bookingCode = `SRV-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+        const bookingToken = crypto.randomBytes(24).toString('hex');
+        const [insertResult] = await db.query<any>(`INSERT INTO service_bookings (
+        booking_code, booking_token, service_id, seller_id, variant_id, variant_label, price,
+        buyer_name, buyer_email, buyer_phone, buyer_address, buyer_notes, booking_date, start_time, end_time, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`, [
+            bookingCode,
+            bookingToken,
+            serviceId,
+            service.seller_id,
+            variantId,
+            variantLabel,
+            price,
+            buyerName,
+            buyerEmail,
+            buyerPhone,
+            buyerAddress,
+            buyerNotes,
+            bookingDate,
+            startTime,
+            matchedSlot.end_time || endTime,
+        ]);
+        const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${insertResult.insertId}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(service.seller_email),
+            subject: `New Service Booking Request: ${service.name} (${bookingCode})`,
+            recipientName: String(service.seller_name),
+            heading: 'New Service Booking Request',
+            intro: `${buyerName} (${buyerEmail}) has requested a booking for your service. Please accept or reject it in your dashboard.`,
+            statusBadge: 'PENDING',
+            statusColor: '#7c3aed',
+            bookingCode,
+            serviceName: String(service.name),
+            variantLabel,
+            bookingDate,
+            bookingTime: `${startTime} - ${matchedSlot.end_time || endTime}`,
+            note: buyerNotes,
+            actionLabel: 'Open Booking in Dashboard',
+            actionUrl: sellerUrl,
+            purpose: 'sellers',
+        });
+        res.status(201).json({
+            message: 'Booking request submitted successfully',
+            booking: {
+                id: insertResult.insertId,
+                booking_code: bookingCode,
+                booking_token: bookingToken,
+                status: 'PENDING',
+                booking_date: bookingDate,
+                start_time: startTime,
+                end_time: matchedSlot.end_time || endTime,
+            },
+        });
+    }
+    catch (err: any) {
+        console.error('Error creating service booking:', err);
+        res.status(500).json({ message: 'Failed to submit booking request' });
+    }
+});
+// Public: Buyer views booking by token
+app.get('/api/public/service-bookings/:token', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const token = String(req.params.token || '').trim();
+        const rt = String(req.query.rt || '').trim();
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, s.subtitle AS service_subtitle, s.category AS service_category, s.main_image_url AS service_image, s.service_location_type, s.premises_address, s.use_profile_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       WHERE sb.booking_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (rt && (!b.reschedule_token || String(b.reschedule_token) !== rt || Boolean(b.reschedule_token_used_at))) {
+            return res.status(410).json({
+                message: 'This reschedule link has already been used and has expired.',
+                expired: true,
+            });
+        }
+        const contactInfo = await resolveSellerServiceContactInfo(Number(b.seller_id), b);
+        const [reviewRows] = await db.query<any>(`SELECT id, rating, comment, created_at FROM service_reviews WHERE booking_id = ? LIMIT 1`, [b.id]);
+        res.json({
+            booking: {
+                ...b,
+                booking_date: formatIsoDate(b.booking_date),
+                proposed_date: formatIsoDate(b.proposed_date) || null,
+                premises_address: contactInfo.premisesAddress,
+                seller_phone: contactInfo.sellerPhone,
+            },
+            review: reviewRows[0] || null,
+        });
+    }
+    catch (err: any) {
+        console.error('Error loading buyer booking:', err);
+        res.status(500).json({ message: 'Failed to load booking' });
+    }
+});
+// Public: Buyer proposes reschedule
+app.post('/api/public/service-bookings/:token/reschedule', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const token = String(req.params.token || '').trim();
+        const proposedDate = String(req.body.proposed_date || '').slice(0, 10);
+        const proposedStart = String(req.body.proposed_start_time || '').slice(0, 5);
+        const proposedEnd = String(req.body.proposed_end_time || '').slice(0, 5);
+        const note = String(req.body.note || '').trim() || null;
+        if (!proposedDate || !proposedStart || !proposedEnd) {
+            return res.status(400).json({ message: 'Proposed date and time are required' });
+        }
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, u.email AS seller_email, COALESCE(p.display_name, p.company_name, u.email) AS seller_name
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       JOIN users u ON u.id = sb.seller_id
+       LEFT JOIN profiles p ON p.user_id = sb.seller_id
+       WHERE sb.booking_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (!['PENDING', 'CONFIRMED'].includes(b.status)) {
+            return res.status(400).json({ message: `Cannot reschedule booking in status ${b.status}` });
+        }
+        await db.query<any>(`UPDATE service_bookings
+       SET previous_status = ?, status = 'RESCHEDULE REQUESTED', proposed_date = ?, proposed_start_time = ?, proposed_end_time = ?, reschedule_requested_by = 'buyer', reschedule_note = ?
+       WHERE id = ?`, [b.status, proposedDate, proposedStart, proposedEnd, note, b.id]);
+        const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${b.id}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.seller_email),
+            subject: `Reschedule Requested by Buyer: ${b.service_name} (${b.booking_code})`,
+            recipientName: String(b.seller_name),
+            heading: 'Buyer Requested a Reschedule',
+            intro: `${b.buyer_name} has proposed a new date and time for this booking.`,
+            statusBadge: 'RESCHEDULE REQUESTED',
+            statusColor: '#d97706',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            proposedDate,
+            proposedTime: `${proposedStart} - ${proposedEnd}`,
+            note,
+            actionLabel: 'Review Reschedule in Dashboard',
+            actionUrl: sellerUrl,
+            purpose: 'sellers',
+        });
+        res.json({ message: 'Reschedule request sent to seller', status: 'RESCHEDULE REQUESTED' });
+    }
+    catch (err: any) {
+        console.error('Error requesting buyer reschedule:', err);
+        res.status(500).json({ message: 'Failed to request reschedule' });
+    }
+});
+// Public: Buyer responds to seller's reschedule proposal
+app.post('/api/public/service-bookings/:token/reschedule-respond', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const token = String(req.params.token || '').trim();
+        const rt = String(req.body?.rt || req.query.rt || '').trim();
+        const action = req.body.action === 'accept' ? 'accept' : 'reject';
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, u.email AS seller_email, COALESCE(p.display_name, p.company_name, u.email) AS seller_name
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       JOIN users u ON u.id = sb.seller_id
+       LEFT JOIN profiles p ON p.user_id = sb.seller_id
+       WHERE sb.booking_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (rt && (!b.reschedule_token || String(b.reschedule_token) !== rt || Boolean(b.reschedule_token_used_at))) {
+            return res.status(410).json({
+                message: 'This reschedule link has already been used and has expired.',
+                expired: true,
+            });
+        }
+        if (b.status !== 'RESCHEDULE REQUESTED' || b.reschedule_requested_by !== 'seller') {
+            return res.status(400).json({ message: 'No seller reschedule proposal pending' });
+        }
+        const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${b.id}`;
+        if (action === 'accept') {
+            const newDate = formatIsoDate(b.proposed_date);
+            const newStart = String(b.proposed_start_time);
+            const newEnd = String(b.proposed_end_time);
+            await db.query<any>(`UPDATE service_bookings
+         SET booking_date = ?, start_time = ?, end_time = ?, status = 'CONFIRMED', previous_status = NULL, proposed_date = NULL, proposed_start_time = NULL, proposed_end_time = NULL, reschedule_requested_by = NULL, reschedule_note = NULL, reschedule_token_used_at = COALESCE(reschedule_token_used_at, NOW())
+         WHERE id = ?`, [newDate, newStart, newEnd, b.id]);
+            await sendServiceBookingNotificationEmail({
+                to: String(b.seller_email),
+                subject: `Reschedule Accepted by Buyer: ${b.service_name} (${b.booking_code})`,
+                recipientName: String(b.seller_name),
+                heading: 'Buyer Accepted Your Reschedule Proposal',
+                intro: `${b.buyer_name} accepted the proposed date and time. The booking is confirmed.`,
+                statusBadge: 'CONFIRMED',
+                statusColor: '#059669',
+                bookingCode: String(b.booking_code),
+                serviceName: String(b.service_name),
+                variantLabel: b.variant_label ? String(b.variant_label) : null,
+                bookingDate: newDate,
+                bookingTime: `${newStart} - ${newEnd}`,
+                actionLabel: 'View Booking',
+                actionUrl: sellerUrl,
+                purpose: 'sellers',
+            });
+            return res.json({ message: 'Reschedule accepted', status: 'CONFIRMED' });
+        }
+        else {
+            const restored = b.previous_status || 'CONFIRMED';
+            await db.query<any>(`UPDATE service_bookings
+         SET status = ?, previous_status = NULL, proposed_date = NULL, proposed_start_time = NULL, proposed_end_time = NULL, reschedule_requested_by = NULL, reschedule_note = NULL, reschedule_token_used_at = COALESCE(reschedule_token_used_at, NOW())
+         WHERE id = ?`, [restored, b.id]);
+            await sendServiceBookingNotificationEmail({
+                to: String(b.seller_email),
+                subject: `Reschedule Declined by Buyer: ${b.service_name} (${b.booking_code})`,
+                recipientName: String(b.seller_name),
+                heading: 'Buyer Declined Reschedule Proposal',
+                intro: `${b.buyer_name} declined the proposed time. The original schedule remains active.`,
+                statusBadge: restored,
+                statusColor: '#6b7280',
+                bookingCode: String(b.booking_code),
+                serviceName: String(b.service_name),
+                variantLabel: b.variant_label ? String(b.variant_label) : null,
+                bookingDate: formatIsoDate(b.booking_date),
+                bookingTime: `${b.start_time} - ${b.end_time}`,
+                actionLabel: 'View Booking',
+                actionUrl: sellerUrl,
+                purpose: 'sellers',
+            });
+            return res.json({ message: 'Reschedule declined', status: restored });
+        }
+    }
+    catch (err: any) {
+        console.error('Error responding to seller reschedule:', err);
+        res.status(500).json({ message: 'Failed to respond to reschedule' });
+    }
+});
+// Public: Buyer cancels booking -> slot released, seller emailed
+app.post('/api/public/service-bookings/:token/cancel', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const token = String(req.params.token || '').trim();
+        const rt = String(req.body?.rt || req.query.rt || '').trim();
+        const reason = String(req.body.reason || '').trim() || null;
+        const [rows] = await db.query<any>(`SELECT sb.*, s.name AS service_name, u.email AS seller_email, COALESCE(p.display_name, p.company_name, u.email) AS seller_name
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       JOIN users u ON u.id = sb.seller_id
+       LEFT JOIN profiles p ON p.user_id = sb.seller_id
+       WHERE sb.booking_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (rt && (!b.reschedule_token || String(b.reschedule_token) !== rt || Boolean(b.reschedule_token_used_at))) {
+            return res.status(410).json({
+                message: 'This reschedule link has already been used and has expired.',
+                expired: true,
+            });
+        }
+        if (['CANCELLED', 'REJECTED', 'COMPLETED'].includes(b.status)) {
+            return res.status(400).json({ message: `Booking is already ${b.status}` });
+        }
+        await db.query<any>(`UPDATE service_bookings SET status = 'CANCELLED', cancelled_by = 'buyer', status_reason = ?, reschedule_token_used_at = COALESCE(reschedule_token_used_at, NOW()) WHERE id = ?`, [reason, b.id]);
+        const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${b.id}`;
+        await sendServiceBookingNotificationEmail({
+            to: String(b.seller_email),
+            subject: `Booking Cancelled by Buyer: ${b.service_name} (${b.booking_code})`,
+            recipientName: String(b.seller_name),
+            heading: 'Booking Cancelled by Buyer',
+            intro: `${b.buyer_name} has cancelled this booking. The time slot is now available again.`,
+            statusBadge: 'CANCELLED',
+            statusColor: '#dc2626',
+            bookingCode: String(b.booking_code),
+            serviceName: String(b.service_name),
+            variantLabel: b.variant_label ? String(b.variant_label) : null,
+            bookingDate: formatIsoDate(b.booking_date),
+            bookingTime: `${b.start_time} - ${b.end_time}`,
+            note: reason,
+            actionLabel: 'View in Dashboard',
+            actionUrl: sellerUrl,
+            purpose: 'sellers',
+        });
+        res.json({ message: 'Booking cancelled', status: 'CANCELLED' });
+    }
+    catch (err: any) {
+        console.error('Error cancelling buyer booking:', err);
+        res.status(500).json({ message: 'Failed to cancel booking' });
+    }
+});
+// Public: Buyer submits review after COMPLETED
+app.post('/api/public/service-bookings/:token/review', async (req: Request, res: Response) => {
+    try {
+        await ensureServiceTables();
+        const token = String(req.params.token || '').trim();
+        const rating = Math.min(5, Math.max(1, Number(req.body.rating || 5)));
+        const comment = String(req.body.comment || '').trim() || null;
+        const [rows] = await db.query<any>(`SELECT * FROM service_bookings WHERE booking_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Booking not found' });
+        const b = rows[0];
+        if (b.status !== 'COMPLETED') {
+            return res.status(400).json({ message: 'Reviews can only be submitted after the service is completed' });
+        }
+        await db.query<any>(`INSERT INTO service_reviews (service_id, booking_id, buyer_name, buyer_email, rating, comment)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE rating = VALUES(rating), comment = VALUES(comment)`, [b.service_id, b.id, b.buyer_name, b.buyer_email, rating, comment]);
+        res.status(201).json({ message: 'Thank you for your review!' });
+    }
+    catch (err: any) {
+        console.error('Error submitting service review:', err);
+        res.status(500).json({ message: 'Failed to submit review' });
+    }
+});
+// Admin: List all services
+app.get('/api/admin/services', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const [rows] = await db.query<any>(`SELECT s.*, u.email AS seller_email,
+              COALESCE(p.display_name, p.company_name, p.first_name, SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name
+       FROM services s
+       LEFT JOIN users u ON u.id = s.seller_id
+       LEFT JOIN profiles p ON p.user_id = s.seller_id
+       ORDER BY s.created_at DESC, s.id DESC`);
+        const services = await hydrateServices(rows);
+        res.json({ services });
+    }
+    catch (err: any) {
+        console.error('Error loading admin services:', err);
+        res.status(500).json({ message: 'Failed to load services' });
+    }
+});
+// Admin: Approve service
+app.post('/api/admin/services/:id/approve', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [result] = await db.query<any>(`UPDATE services SET approval_status = 'approved', rejection_message = NULL WHERE id = ?`, [serviceId]);
+        if (!result.affectedRows) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        res.json({ message: 'Service approved successfully', approval_status: 'approved' });
+    }
+    catch (err: any) {
+        console.error('Error approving service:', err);
+        res.status(500).json({ message: 'Failed to approve service' });
+    }
+});
+// Admin: Reject service
+app.post('/api/admin/services/:id/reject', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const message = String(req.body?.message || '').trim() || null;
+        const [result] = await db.query<any>(`UPDATE services SET approval_status = 'rejected', rejection_message = ? WHERE id = ?`, [message, serviceId]);
+        if (!result.affectedRows) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        res.json({ message: 'Service rejected', approval_status: 'rejected' });
+    }
+    catch (err: any) {
+        console.error('Error rejecting service:', err);
+        res.status(500).json({ message: 'Failed to reject service' });
+    }
+});
+// Admin: Delete service
+app.delete('/api/admin/services/:id', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const serviceId = Number(req.params.id);
+        const [result] = await db.query<any>(`DELETE FROM services WHERE id = ?`, [serviceId]);
+        if (!result.affectedRows) {
+            return res.status(404).json({ message: 'Service not found' });
+        }
+        res.json({ message: 'Service deleted successfully' });
+    }
+    catch (err: any) {
+        console.error('Error deleting service:', err);
+        res.status(500).json({ message: 'Failed to delete service' });
+    }
+});
+// Admin: List all service bookings across all sellers
+app.get('/api/admin/service-bookings', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureServiceTables();
+        const [rows] = await db.query<any>(`SELECT sb.*,
+              s.name AS service_name,
+              s.category AS service_category,
+              s.service_location_type,
+              s.premises_address,
+              u.email AS seller_email,
+              COALESCE(p.display_name, p.company_name, p.first_name, SUBSTRING_INDEX(u.email, '@', 1)) AS seller_name,
+              COALESCE(NULLIF(TRIM(sb.buyer_phone), ''), NULLIF(TRIM(c.phone), '')) AS buyer_phone,
+              COALESCE(
+                NULLIF(TRIM(sb.buyer_address), ''),
+                NULLIF(TRIM(CONCAT_WS(', ', NULLIF(c.shipping_street, ''), NULLIF(c.shipping_city, ''), NULLIF(c.shipping_state, ''), NULLIF(c.shipping_zip, ''), NULLIF(c.shipping_country, ''))), '')
+              ) AS buyer_address
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       LEFT JOIN users u ON u.id = sb.seller_id
+       LEFT JOIN profiles p ON p.user_id = sb.seller_id
+         AND p.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = sb.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
+       LEFT JOIN sales sa ON sa.id = sb.sale_id
+       LEFT JOIN customers c ON c.id = sa.customer_id
+       ORDER BY sb.created_at DESC, sb.id DESC`);
+        const bookings = rows.map((r: any) => ({
+            ...r,
+            booking_date: formatIsoDate(r.booking_date),
+            proposed_date: formatIsoDate(r.proposed_date) || null,
+        }));
+        res.json({ bookings });
+    }
+    catch (err: any) {
+        console.error('Error loading admin service bookings:', err);
+        res.status(500).json({ message: 'Failed to load service bookings' });
+    }
+});
+// ============================================================================
+// DISPUTE MANAGEMENT MODULE
+// ============================================================================
+const escapeHtmlForDispute = (value: unknown) => {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+};
+const sendDisputeEmailSafe = async (to: string, subject: string, heading: string, bodyHtml: string, actionLabel?: string, actionUrl?: string, purpose: "customers" | "sellers" | "contact_form" = "customers") => {
+    if (!to)
+        return;
+    try {
+        const companyInfo = await getPlatformCompanyEmailInfo();
+        const html = createDisputeNotificationEmailHtml({
+            company: companyInfo,
+            heading,
+            bodyHtml,
+            actionLabel,
+            actionUrl,
+        });
+        await sendEmail(to, subject, html, { purpose });
+    }
+    catch (err: any) {
+        console.error('Failed to send dispute notification email:', err);
+    }
+};
+// Public: Lookup order/booking items by Order ID, Group Order ID, or Booking Code for Contact Us dispute flow
+app.get('/api/public/disputes/lookup-order', async (req: Request, res: Response) => {
+    try {
+        await Promise.all([ensureServiceTables(), ensureDisputeTables()]);
+        const rawOrderRef = sanitizeDisputeInput(req.query.orderId, 60);
+        if (!rawOrderRef || !/^[A-Za-z0-9\-_]+$/.test(rawOrderRef)) {
+            return res.status(400).json({ message: 'Valid Order ID is required' });
+        }
+        const orders = await lookupOrdersForDisputeQuery(rawOrderRef);
+        if (!orders.length) {
+            return res.status(404).json({ message: 'No order found matching that Order ID.' });
+        }
+        return res.json({ orders });
+    }
+    catch (err: any) {
+        console.error('Lookup order for dispute error:', err);
+        return res.status(500).json({ message: 'Failed to look up order' });
+    }
+});
+// Public: Buyer opens a dispute from Contact Us page
+app.post('/api/public/disputes', disputeUpload, async (req: Request, res: Response) => {
+    try {
+        await Promise.all([ensureServiceTables(), ensureDisputeTables()]);
+        const saleId = Number(req.body.sale_id);
+        const buyerName = sanitizeDisputeInput(req.body.buyer_name, 120);
+        const buyerEmail = sanitizeDisputeInput(req.body.buyer_email, 160).toLowerCase();
+        const reason = sanitizeDisputeInput(req.body.reason, 200);
+        const requestedSolution = sanitizeDisputeInput(req.body.requested_solution, 200);
+        const description = sanitizeDisputeInput(req.body.description, 2500);
+        const rawDefectDate = String(req.body.defect_discovered_date || '').trim().slice(0, 10);
+        const defectDiscoveredDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDefectDate) ? rawDefectDate : null;
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(buyerEmail)) {
+            return res.status(400).json({ message: 'Please provide a valid email address.' });
+        }
+        let selectedItemIds: number[] = [];
+        try {
+            const parsed = typeof req.body.selected_item_ids === 'string'
+                ? JSON.parse(req.body.selected_item_ids)
+                : req.body.selected_item_ids;
+            if (Array.isArray(parsed)) {
+                selectedItemIds = parsed.map((v: any) => Number(v)).filter((n: any) => Number.isFinite(n) && n > 0);
+            }
+        }
+        catch {
+            selectedItemIds = [];
+        }
+        if (!Number.isFinite(saleId) || saleId <= 0) {
+            return res.status(400).json({ message: 'Please select a valid order.' });
+        }
+        if (!selectedItemIds.length) {
+            return res.status(400).json({ message: 'Please select at least one item under dispute.' });
+        }
+        if (!buyerName || !buyerEmail || !reason || !requestedSolution || !description) {
+            return res.status(400).json({ message: 'Name, email, reason, requested solution, and description are required.' });
+        }
+        const [saleRows] = await db.query<any>(`SELECT
+        s.id AS sale_id, s.order_id, s.group_order_id, s.seller_id, s.order_date, s.grand_total, s.payment_intent_id,
+        u.email AS seller_email,
+        COALESCE(NULLIF(TRIM(sp.display_name), ''), NULLIF(TRIM(sp.company_name), ''), NULLIF(TRIM(CONCAT_WS(' ', sp.first_name, sp.last_name)), ''), 'Seller') AS seller_name
+       FROM sales s
+       LEFT JOIN users u ON u.id = s.seller_id
+       LEFT JOIN profiles sp ON sp.id = (
+         SELECT p2.id FROM profiles p2 WHERE p2.user_id = s.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1
+       )
+       WHERE s.id = ? LIMIT 1`, [saleId]);
+        if (!saleRows.length) {
+            return res.status(404).json({ message: 'Order not found.' });
+        }
+        const sale = saleRows[0];
+        const [selectedRows] = await db.query<any>(`SELECT
+        si.id AS sale_item_id, si.product_id, si.product_name, si.quantity, si.unit_price, si.tax_amount,
+        CASE WHEN si.product_type = 'item' AND si.product_id IS NULL THEN 'Service' ELSE 'Product' END AS item_kind,
+        sb.booking_date
+       FROM sale_items si
+       JOIN sales s2 ON s2.id = si.sale_id
+       LEFT JOIN service_bookings sb ON sb.id = (
+         SELECT sb2.id FROM service_bookings sb2 WHERE sb2.sale_id = si.sale_id ORDER BY sb2.id ASC LIMIT 1
+       )
+       WHERE si.id IN (?) AND s2.seller_id = ?`, [selectedItemIds, Number(sale.seller_id)]);
+        if (!selectedRows.length) {
+            return res.status(400).json({ message: 'Selected items were not found in this order.' });
+        }
+        const orderType = selectedRows.some((r: any) => r.item_kind === 'Service') ? 'Service' : 'Product';
+        const itemSummary = selectedRows.map((r: any) => `${r.product_name} × ${r.quantity}`).join(', ');
+        const disputeAmount = roundToTwo(selectedRows.reduce((sum: any, r: any) => sum + (Number(r.unit_price || 0) * Number(r.quantity || 1)) + Number(r.tax_amount || 0), 0));
+        const serviceDate = selectedRows.find((r: any) => r.booking_date)?.booking_date
+            ? formatIsoDate(selectedRows.find((r: any) => r.booking_date).booking_date)
+            : null;
+        const year = new Date().getFullYear();
+        const [countRows] = await db.query<any>(`SELECT COUNT(*) AS cnt FROM disputes`);
+        const seqNum = Number(countRows[0]?.cnt || 0) + 1;
+        const caseNumber = `DSP-${year}-${String(seqNum).padStart(4, '0')}-${crypto.randomBytes(1).toString('hex').toUpperCase()}`;
+        const buyerToken = crypto.randomBytes(24).toString('hex');
+        const legalBasis = buildLegalBasisForDispute(orderType, reason);
+        const responseDeadline = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+        const [insertRes] = await db.query<any>(`INSERT INTO disputes (
+        case_number, buyer_token, sale_id, order_id, group_order_id, order_type, seller_id,
+        buyer_name, buyer_email, seller_name, item_summary, selected_items_json, amount,
+        reason, requested_solution, description, status, payment_status, legal_basis,
+        purchase_date, defect_discovered_date, service_date, response_deadline
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Awaiting seller', 'Paid', ?, ?, ?, ?, ?)`, [
+            caseNumber,
+            buyerToken,
+            saleId,
+            String(sale.order_id),
+            sale.group_order_id || null,
+            orderType,
+            Number(sale.seller_id),
+            buyerName,
+            buyerEmail,
+            String(sale.seller_name || 'Seller'),
+            itemSummary,
+            JSON.stringify(selectedRows),
+            disputeAmount,
+            reason,
+            requestedSolution,
+            description,
+            legalBasis,
+            sale.order_date || new Date(),
+            defectDiscoveredDate,
+            serviceDate,
+            responseDeadline,
+        ]);
+        const disputeId = insertRes.insertId;
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [disputeId, buyerName, description]);
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart Admin', 'System', ?)`, [disputeId, `Dispute ${caseNumber} opened. Seller response requested within 5 days.`]);
+        const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+        for (const file of uploadedFiles) {
+            const fileUrl = `/uploads/${DISPUTE_UPLOAD_SUBDIR}/${file.filename}`;
+            await db.query<any>(`INSERT INTO dispute_evidence (dispute_id, uploaded_by_role, uploaded_by_name, file_name, file_url) VALUES (?, 'Buyer', ?, ?, ?)`, [disputeId, buyerName, sanitizeDisputeFileName(file.originalname), fileUrl]);
+        }
+        const clientBase = getClientBaseUrlForServices();
+        const buyerDisputeUrl = `${clientBase}/dispute/${buyerToken}`;
+        const sellerDisputeUrl = `${clientBase}/disputes`;
+        if (sale.seller_email) {
+            await sendDisputeEmailSafe(String(sale.seller_email), `New Dispute Opened: ${caseNumber} (Order ${sale.order_id})`, `New Dispute ${caseNumber}`, `<p>A buyer (<strong>${escapeHtmlForDispute(buyerName)}</strong>) has opened a dispute for order <strong>${escapeHtmlForDispute(sale.order_id)}</strong>.</p>
+         <p><strong>Item(s):</strong> ${escapeHtmlForDispute(itemSummary)}<br/>
+         <strong>Reason:</strong> ${escapeHtmlForDispute(reason)}<br/>
+         <strong>Requested Solution:</strong> ${escapeHtmlForDispute(requestedSolution)}</p>
+         <p>Please review the complaint, upload evidence, and respond in your Seller Disputes workspace.</p>`, 'Open Seller Disputes', sellerDisputeUrl, 'sellers');
+        }
+        await sendDisputeEmailSafe(buyerEmail, `Dispute Registered: ${caseNumber} (Order ${sale.order_id})`, `Your Dispute ${caseNumber} is Open`, `<p>Hello ${escapeHtmlForDispute(buyerName)},</p>
+       <p>We have registered your dispute for order <strong>${escapeHtmlForDispute(sale.order_id)}</strong> (${escapeHtmlForDispute(itemSummary)}) and notified the seller.</p>
+       <p><strong>Requested Solution:</strong> ${escapeHtmlForDispute(requestedSolution)}</p>
+       <p>You can track updates, review the seller's response, and accept or reject any proposed solution using your private case link below.</p>`, 'View Your Dispute Case', buyerDisputeUrl, 'customers');
+        const created = await loadSingleDisputeById(disputeId);
+        return res.status(201).json({
+            dispute: created,
+            case_number: caseNumber,
+            buyer_token: buyerToken,
+            buyer_url: buyerDisputeUrl,
+        });
+    }
+    catch (err: any) {
+        console.error('Create dispute error:', err);
+        return res.status(500).json({ message: 'Failed to open dispute' });
+    }
+});
+// Public: Buyer views their dispute case by token
+app.get('/api/public/disputes/case/:token', async (req: Request, res: Response) => {
+    try {
+        await ensureDisputeTables();
+        const token = String(req.params.token || '').trim();
+        if (!token)
+            return res.status(400).json({ message: 'Dispute token is required' });
+        const list = await loadDisputesWithChildren('WHERE buyer_token = ?', [token]);
+        if (!list.length)
+            return res.status(404).json({ message: 'Dispute case not found' });
+        return res.json({ dispute: list[0] });
+    }
+    catch (err: any) {
+        console.error('Fetch buyer dispute error:', err);
+        return res.status(500).json({ message: 'Failed to load dispute case' });
+    }
+});
+// Public: Buyer responds to seller's solution (accept / reject with reason / reply / upload evidence)
+app.post('/api/public/disputes/case/:token/respond', disputeUpload, async (req: Request, res: Response) => {
+    try {
+        await ensureDisputeTables();
+        const token = sanitizeDisputeInput(req.params.token, 80);
+        const action = sanitizeDisputeInput(req.body.action || 'message', 30).toLowerCase();
+        const messageText = sanitizeDisputeInput(req.body.message, 2500);
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE buyer_token = ? LIMIT 1`, [token]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute case not found' });
+        const dispute = rows[0];
+        const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+        for (const file of uploadedFiles) {
+            const fileUrl = `/uploads/${DISPUTE_UPLOAD_SUBDIR}/${file.filename}`;
+            await db.query<any>(`INSERT INTO dispute_evidence (dispute_id, uploaded_by_role, uploaded_by_name, file_name, file_url) VALUES (?, 'Buyer', ?, ?, ?)`, [dispute.id, dispute.buyer_name, sanitizeDisputeFileName(file.originalname), fileUrl]);
+        }
+        if (action === 'accept') {
+            await db.query<any>(`UPDATE disputes SET status = 'Resolved', resolution_summary = COALESCE(NULLIF(resolution_summary, ''), 'Buyer accepted the proposed solution.') WHERE id = ?`, [dispute.id]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [dispute.id, dispute.buyer_name, messageText || 'Buyer accepted the proposed solution.']);
+        }
+        else if (action === 'reject') {
+            if (!messageText) {
+                return res.status(400).json({ message: 'Please explain why you are rejecting the proposed solution.' });
+            }
+            await db.query<any>(`UPDATE disputes SET status = 'Admin review' WHERE id = ?`, [dispute.id]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [dispute.id, dispute.buyer_name, `Rejected seller proposal: ${messageText}`]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart Admin', 'System', 'Buyer rejected the proposal. Case escalated to Admin review.')`, [dispute.id]);
+        }
+        else if (messageText) {
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [dispute.id, dispute.buyer_name, messageText]);
+        }
+        const updated = await loadSingleDisputeById(Number(dispute.id));
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Buyer dispute response error:', err);
+        return res.status(500).json({ message: 'Failed to submit response' });
+    }
+});
+// Seller: List disputes for logged-in seller
+app.get('/api/seller/disputes', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        const disputes = await loadDisputesWithChildren('WHERE seller_id = ?', [auth.id]);
+        return res.json({ disputes });
+    }
+    catch (err: any) {
+        console.error('Seller disputes list error:', err);
+        return res.status(500).json({ message: 'Failed to load seller disputes' });
+    }
+});
+// Seller: Add message to dispute
+app.post('/api/seller/disputes/:id/message', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const messageText = sanitizeDisputeInput(req.body.message, 2500);
+        if (!messageText)
+            return res.status(400).json({ message: 'Message text is required' });
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE id = ? AND seller_id = ? LIMIT 1`, [disputeId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const dispute = rows[0];
+        if (['Resolved', 'Closed'].includes(String(dispute.status))) {
+            return res.status(403).json({ message: 'This dispute is resolved. No further information can be added.' });
+        }
+        const sellerDisplayName = await resolveSellerDisputeDisplayName(auth.id);
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, messageText]);
+        await db.query<any>(`UPDATE disputes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [disputeId]);
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Seller dispute message error:', err);
+        return res.status(500).json({ message: 'Failed to send message' });
+    }
+});
+// Seller: Upload evidence
+app.post('/api/seller/disputes/:id/evidence', disputeUpload, async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE id = ? AND seller_id = ? LIMIT 1`, [disputeId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const dispute = rows[0];
+        if (['Resolved', 'Closed'].includes(String(dispute.status))) {
+            return res.status(403).json({ message: 'This dispute is resolved. No further evidence can be uploaded.' });
+        }
+        const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+        if (!uploadedFiles.length)
+            return res.status(400).json({ message: 'No evidence files uploaded' });
+        const sellerDisplayName = await resolveSellerDisputeDisplayName(auth.id);
+        for (const file of uploadedFiles) {
+            const fileUrl = `/uploads/${DISPUTE_UPLOAD_SUBDIR}/${file.filename}`;
+            await db.query<any>(`INSERT INTO dispute_evidence (dispute_id, uploaded_by_role, uploaded_by_name, file_name, file_url) VALUES (?, 'Seller', ?, ?, ?)`, [disputeId, sellerDisplayName, sanitizeDisputeFileName(file.originalname), fileUrl]);
+        }
+        await db.query<any>(`UPDATE disputes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [disputeId]);
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Seller dispute evidence error:', err);
+        return res.status(500).json({ message: 'Failed to upload evidence' });
+    }
+});
+// Seller: Accept buyer request, propose a remedy, reject, or escalate to Admin review
+app.post('/api/seller/disputes/:id/action', async (req: Request, res: Response) => {
+    const auth = await requireAuth(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const action = sanitizeDisputeInput(req.body.action, 30).toLowerCase();
+        const proposalText = sanitizeDisputeInput(req.body.proposal || req.body.message, 2500);
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE id = ? AND seller_id = ? LIMIT 1`, [disputeId, auth.id]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const dispute = rows[0];
+        if (['Resolved', 'Closed'].includes(String(dispute.status))) {
+            return res.status(403).json({ message: 'This dispute is resolved. No further actions can be taken.' });
+        }
+        const sellerDisplayName = await resolveSellerDisputeDisplayName(auth.id);
+        const clientBase = getClientBaseUrlForServices();
+        const buyerDisputeUrl = `${clientBase}/dispute/${dispute.buyer_token}`;
+        if (action === 'accept') {
+            const summary = `Seller accepted the buyer's requested solution (${dispute.requested_solution}). Awaiting buyer confirmation.`;
+            await db.query<any>(`UPDATE disputes SET status = 'Awaiting buyer', resolution_summary = ? WHERE id = ?`, [summary, disputeId]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, proposalText || 'We accept your requested solution. Please confirm in your dispute case link.']);
+            await sendDisputeEmailSafe(dispute.buyer_email, `Seller Responded to Dispute ${dispute.case_number}`, `Seller Accepted Your Request (${dispute.case_number})`, `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has accepted your requested solution (<strong>${escapeHtmlForDispute(dispute.requested_solution)}</strong>) for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>.</p>
+         <p>Please review and confirm or reply via your case link.</p>`, 'Review & Confirm', buyerDisputeUrl, 'customers');
+        }
+        else if (action === 'propose') {
+            if (!proposalText)
+                return res.status(400).json({ message: 'Please describe your proposed solution.' });
+            const summary = `Seller proposed remedy: ${proposalText}`;
+            await db.query<any>(`UPDATE disputes SET status = 'Awaiting buyer', resolution_summary = ? WHERE id = ?`, [summary, disputeId]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, summary]);
+            await sendDisputeEmailSafe(dispute.buyer_email, `Proposed Solution for Dispute ${dispute.case_number}`, `Seller Proposed a Solution (${dispute.case_number})`, `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has proposed a solution for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>:</p>
+         <blockquote style="background:#f8fafc;padding:12px;border-left:4px solid #315fce;">${escapeHtmlForDispute(proposalText)}</blockquote>
+         <p>Please accept the solution or reject it with an explanation using your case link below.</p>`, 'Accept or Reject Solution', buyerDisputeUrl, 'customers');
+        }
+        else {
+            await db.query<any>(`UPDATE disputes SET status = 'Admin review' WHERE id = ?`, [disputeId]);
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, proposalText || 'Seller requested marketplace admin review.']);
+        }
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Seller dispute action error:', err);
+        return res.status(500).json({ message: 'Failed to update dispute' });
+    }
+});
+// Admin: List all disputes
+app.get('/api/admin/disputes', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        const disputes = await loadDisputesWithChildren('', []);
+        return res.json({ disputes });
+    }
+    catch (err: any) {
+        console.error('Admin disputes list error:', err);
+        return res.status(500).json({ message: 'Failed to load disputes' });
+    }
+});
+// Admin: Add message
+app.post('/api/admin/disputes/:id/message', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const messageText = sanitizeDisputeInput(req.body.message, 2500);
+        if (!messageText)
+            return res.status(400).json({ message: 'Message text is required' });
+        const [rows] = await db.query<any>(`SELECT id FROM disputes WHERE id = ? LIMIT 1`, [disputeId]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart support', 'Admin', ?)`, [disputeId, messageText]);
+        await db.query<any>(`UPDATE disputes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [disputeId]);
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Admin dispute message error:', err);
+        return res.status(500).json({ message: 'Failed to send admin message' });
+    }
+});
+// Admin: Upload evidence
+app.post('/api/admin/disputes/:id/evidence', disputeUpload, async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const [rows] = await db.query<any>(`SELECT id FROM disputes WHERE id = ? LIMIT 1`, [disputeId]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const uploadedFiles = (req.files as Express.Multer.File[]) || [];
+        if (!uploadedFiles.length)
+            return res.status(400).json({ message: 'No evidence files uploaded' });
+        for (const file of uploadedFiles) {
+            const fileUrl = `/uploads/${DISPUTE_UPLOAD_SUBDIR}/${file.filename}`;
+            await db.query<any>(`INSERT INTO dispute_evidence (dispute_id, uploaded_by_role, uploaded_by_name, file_name, file_url) VALUES (?, 'Admin', 'BarakahMart support', ?, ?)`, [disputeId, sanitizeDisputeFileName(file.originalname), fileUrl]);
+        }
+        await db.query<any>(`UPDATE disputes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [disputeId]);
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Admin dispute evidence error:', err);
+        return res.status(500).json({ message: 'Failed to upload evidence' });
+    }
+});
+// Admin: Update status, deadline, or request evidence
+app.patch('/api/admin/disputes/:id/status', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const status = req.body.status ? String(req.body.status) : null;
+        const paymentStatus = req.body.payment_status ? String(req.body.payment_status) : null;
+        const rawDeadline = String(req.body.response_deadline || '').trim().slice(0, 10);
+        const responseDeadline = /^\d{4}-\d{2}-\d{2}$/.test(rawDeadline) ? rawDeadline : null;
+        const systemNote = sanitizeDisputeInput(req.body.note, 2000);
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE id = ? LIMIT 1`, [disputeId]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const updates = [];
+        const params = [];
+        if (status && ['Awaiting seller', 'Awaiting buyer', 'Admin review', 'Resolved', 'Closed'].includes(status)) {
+            updates.push('status = ?');
+            params.push(status);
+        }
+        if (paymentStatus && ['Paid', 'Refund pending', 'Partially refunded', 'Refunded', 'Not captured'].includes(paymentStatus)) {
+            updates.push('payment_status = ?');
+            params.push(paymentStatus);
+        }
+        if (req.body.response_deadline !== undefined) {
+            updates.push('response_deadline = ?');
+            params.push(responseDeadline || null);
+        }
+        if (updates.length) {
+            params.push(disputeId);
+            await db.query<any>(`UPDATE disputes SET ${updates.join(', ')} WHERE id = ?`, params);
+        }
+        if (systemNote) {
+            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart support', 'Admin', ?)`, [disputeId, systemNote]);
+        }
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Admin update dispute status error:', err);
+        return res.status(500).json({ message: 'Failed to update dispute' });
+    }
+});
+// Admin: Record decision & responsible party
+app.post('/api/admin/disputes/:id/resolve', async (req: Request, res: Response) => {
+    const auth = await requireAdmin(req, res);
+    if (!auth)
+        return;
+    try {
+        await ensureDisputeTables();
+        const disputeId = Number(req.params.id);
+        const resolutionType = sanitizeDisputeInput(req.body.resolution_type, 150);
+        const resolutionResponsible = sanitizeDisputeInput(req.body.resolution_responsible || 'Seller', 150);
+        const rawRefundAmount = req.body.refund_amount != null ? Number(req.body.refund_amount) : null;
+        const refundAmount = rawRefundAmount != null && Number.isFinite(rawRefundAmount) && rawRefundAmount >= 0 ? rawRefundAmount : null;
+        const resolutionNote = sanitizeDisputeInput(req.body.resolution_note, 2500);
+        const paymentStatus = req.body.payment_status ? sanitizeDisputeInput(req.body.payment_status, 50) : null;
+        if (!resolutionType || !resolutionNote) {
+            return res.status(400).json({ message: 'Outcome and decision rationale are required.' });
+        }
+        const [rows] = await db.query<any>(`SELECT * FROM disputes WHERE id = ? LIMIT 1`, [disputeId]);
+        if (!rows.length)
+            return res.status(404).json({ message: 'Dispute not found' });
+        const dispute = rows[0];
+        const resolvedPaymentStatus = paymentStatus && ['Paid', 'Refund pending', 'Partially refunded', 'Refunded', 'Not captured'].includes(paymentStatus)
+            ? paymentStatus
+            : resolutionType === 'Buyer refund'
+                ? 'Refund pending'
+                : resolutionType === 'Partial refund'
+                    ? 'Partially refunded'
+                    : dispute.payment_status;
+        const summary = `${resolutionType} (Responsible: ${resolutionResponsible})${refundAmount && refundAmount > 0 ? ` — ${refundAmount} SEK` : ''}: ${resolutionNote}`;
+        await db.query<any>(`UPDATE disputes
+       SET status = 'Resolved',
+           payment_status = ?,
+           resolution_type = ?,
+           resolution_responsible = ?,
+           refund_amount = ?,
+           resolution_note = ?,
+           resolution_summary = ?,
+           admin_note = ?
+       WHERE id = ?`, [
+            resolvedPaymentStatus,
+            resolutionType,
+            resolutionResponsible,
+            refundAmount,
+            resolutionNote,
+            summary,
+            resolutionNote,
+            disputeId,
+        ]);
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart support', 'Admin', ?)`, [disputeId, `Admin decision recorded: ${summary}`]);
+        const clientBase = getClientBaseUrlForServices();
+        await sendDisputeEmailSafe(dispute.buyer_email, `Dispute Decision Recorded: ${dispute.case_number}`, `Decision Recorded for Dispute ${dispute.case_number}`, `<p>Our platform team has recorded a decision for your dispute on order <strong>${dispute.order_id}</strong>:</p>
+       <p><strong>Outcome:</strong> ${resolutionType}<br/>
+       <strong>Responsible Party:</strong> ${resolutionResponsible}<br/>
+       <strong>Rationale:</strong> ${resolutionNote}</p>`, 'View Full Case History', `${clientBase}/dispute/${dispute.buyer_token}`, 'customers');
+        const updated = await loadSingleDisputeById(disputeId);
+        return res.json({ dispute: updated });
+    }
+    catch (err: any) {
+        console.error('Admin resolve dispute error:', err);
+        return res.status(500).json({ message: 'Failed to record dispute decision' });
+    }
+});
 const bootstrapAndStartServer = async () => {
-  try {
-    await ensureBaseSchemaInitialized()
-    await ensureDefaultAdminUser()
-    await ensureProfilesShippingColumns()
-    await ensureProductsShippingColumns()
-    await ensureCustomizationColumns()
-  } catch (error) {
-    console.error('Failed to initialize base database schema. Server startup aborted.', error)
-    process.exit(1)
-  }
-
-  try {
-    const settings = await getRuntimeSettings()
-    applyRuntimeSettings(settings)
-  } catch (error) {
-    console.error('Failed to preload runtime settings. Starting with environment defaults.', error)
-  }
-
-  setEmailAccountResolver(async (purpose) => {
     try {
-      await ensureEmailAccountPurposesColumn()
-      const [rows] = await db.query<RowDataPacket[]>(
-        `SELECT email_address, encrypted_password FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE(?)) AND is_active = 1 LIMIT 1`,
-        [purpose],
-      )
-      if (!rows || !rows.length) return null
-      return {
-        email_address: String(rows[0].email_address),
-        plain_password: decryptSmtpPassword(String(rows[0].encrypted_password)),
-      }
-    } catch {
-      return null
+        await ensureBaseSchemaInitialized();
+        await ensureDefaultAdminUser();
+        await ensureProfilesShippingColumns();
+        await ensureProductsShippingColumns();
+        await ensureCustomizationColumns();
     }
-  })
-
-  setSmtpSettingsResolver(async () => {
-    try {
-      const settings = await getRuntimeSettings()
-      const host = String(settings.smtp_host || '').trim()
-      const port = Number(settings.smtp_port) || 0
-      const secure = resolveSmtpSecure(settings.smtp_secure, port)
-      if (!host || !port) return null
-      return { host, port, secure }
-    } catch {
-      return null
+    catch (error: any) {
+        console.error('Failed to initialize base database schema. Server startup aborted.', error);
+        process.exit(1);
     }
-  })
-
-  setSmtpDefaultCredentialsResolver(async () => {
     try {
-      await ensureEmailAccountPurposesColumn()
-      const [rows] = await db.query<RowDataPacket[]>(
-        `SELECT email_address, encrypted_password
+        const settings = await getRuntimeSettings();
+        applyRuntimeSettings(settings);
+    }
+    catch (error: any) {
+        console.error('Failed to preload runtime settings. Starting with environment defaults.', error);
+    }
+    setEmailAccountResolver(async (purpose: any) => {
+        try {
+            await ensureEmailAccountPurposesColumn();
+            const [rows] = await db.query<any>(`SELECT email_address, encrypted_password FROM email_accounts WHERE JSON_CONTAINS(purposes, JSON_QUOTE(?)) AND is_active = 1 LIMIT 1`, [purpose]);
+            if (!rows || !rows.length)
+                return null;
+            return {
+                email_address: String(rows[0].email_address),
+                plain_password: decryptSmtpPassword(String(rows[0].encrypted_password)),
+            };
+        }
+        catch {
+            return null;
+        }
+    });
+    setSmtpSettingsResolver(async () => {
+        try {
+            const settings = await getRuntimeSettings();
+            const host = String(settings.smtp_host || '').trim();
+            const port = Number(settings.smtp_port) || 0;
+            const secure = resolveSmtpSecure(settings.smtp_secure, port);
+            if (!host || !port)
+                return null;
+            return { host, port, secure };
+        }
+        catch {
+            return null;
+        }
+    });
+    setSmtpDefaultCredentialsResolver(async () => {
+        try {
+            await ensureEmailAccountPurposesColumn();
+            const [rows] = await db.query<any>(`SELECT email_address, encrypted_password
          FROM email_accounts
          WHERE is_active = 1
          ORDER BY
@@ -14468,31 +17915,210 @@ const bootstrapAndStartServer = async () => {
              WHEN JSON_CONTAINS(purposes, JSON_QUOTE('newsletters')) THEN 4
              ELSE 5
            END,
-           id ASC`,
-      )
-
-      for (const row of rows) {
-        const user = String(row.email_address || '').trim()
-        const encryptedPassword = String(row.encrypted_password || '').trim()
-        if (!user || !encryptedPassword) continue
-
-        try {
-          const pass = decryptSmtpPassword(encryptedPassword)
-          if (pass) {
-            return { user, pass }
-          }
-        } catch {
-          // Skip invalid account rows and continue with the next active account.
+           id ASC`);
+            for (const row of rows) {
+                const user = String(row.email_address || '').trim();
+                const encryptedPassword = String(row.encrypted_password || '').trim();
+                if (!user || !encryptedPassword)
+                    continue;
+                try {
+                    const pass = decryptSmtpPassword(encryptedPassword);
+                    if (pass) {
+                        return { user, pass };
+                    }
+                }
+                catch {
+                    // Skip invalid account rows and continue with the next active account.
+                }
+            }
+            return null;
         }
-      }
-
-      return null
-    } catch {
-      return null
-    }
-  })
-
-  startServer(DEFAULT_PORT)
-}
-
-bootstrapAndStartServer()
+        catch {
+            return null;
+        }
+    });
+    let serviceReminderRunInFlight = false;
+    const parseReminderTimeMinutes = (raw: string) => {
+        const match = String(raw || '18:00').trim().match(/^(\d{1,2}):(\d{2})$/);
+        if (!match)
+            return 18 * 60;
+        const h = Math.min(23, Math.max(0, Number(match[1])));
+        const m = Math.min(59, Math.max(0, Number(match[2])));
+        return h * 60 + m;
+    };
+    const runNextDayServiceReminders = async () => {
+        if (serviceReminderRunInFlight)
+            return;
+        serviceReminderRunInFlight = true;
+        try {
+            await ensureServiceTables();
+            const tomorrow = new Date();
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const tomorrowStr = formatIsoDate(tomorrow);
+            const [rows] = await db.query<any>(`SELECT sb.*,
+              s.name AS service_name,
+              s.service_location_type,
+              s.premises_address,
+              s.use_profile_address,
+              u.email AS seller_email,
+              COALESCE(NULLIF(TRIM(pr.display_name), ''), NULLIF(TRIM(pr.company_name), ''), u.email) AS seller_name,
+              pr.phone_extension AS seller_phone_ext,
+              pr.phone AS seller_phone_num,
+              pr.company_address AS seller_company_address,
+              pr.street AS seller_street,
+              pr.zip AS seller_zip,
+              pr.city AS seller_city,
+              pr.country AS seller_country
+       FROM service_bookings sb
+       JOIN services s ON s.id = sb.service_id
+       JOIN users u ON u.id = sb.seller_id
+       LEFT JOIN profiles pr ON pr.user_id = sb.seller_id
+         AND pr.id = (SELECT p2.id FROM profiles p2 WHERE p2.user_id = sb.seller_id ORDER BY p2.created_at DESC, p2.id DESC LIMIT 1)
+       WHERE sb.booking_date = ?
+         AND sb.status IN ('CONFIRMED', 'PENDING', 'RESCHEDULE REQUESTED')
+       ORDER BY sb.start_time ASC, sb.id ASC`, [tomorrowStr]);
+            if (!rows.length)
+                return;
+            const [sentRows] = await db.query<any>(`SELECT booking_id, recipient_type
+       FROM service_booking_reminders
+       WHERE reminder_for_date = ?`, [tomorrowStr]);
+            const sentSet = new Set((sentRows || []).map((r: any) => `${Number(r.booking_id)}|${String(r.recipient_type)}`));
+            const buyerGroups = new Map();
+            const sellerGroups = new Map();
+            for (const row of rows) {
+                const bookingId = Number(row.id);
+                const locType = String(row.service_location_type || 'seller_premises').trim();
+                const serviceLocation = locType === 'buyer_place'
+                    ? "Buyer's place"
+                    : locType === 'both'
+                        ? "Buyer's place or seller's premises"
+                        : "Seller's premises";
+                const isAtPremises = locType === 'seller_premises' || locType === 'both';
+                const profileAddr = String(row.seller_company_address ||
+                    [row.seller_street, row.seller_zip, row.seller_city, row.seller_country]
+                        .filter(Boolean)
+                        .join(', ')).trim() || null;
+                const premisesAddress = isAtPremises
+                    ? String(row.premises_address || '').trim() || profileAddr
+                    : null;
+                const sellerPhone = [row.seller_phone_ext, row.seller_phone_num]
+                    .map((v: any) => String(v || '').trim())
+                    .filter(Boolean)
+                    .join(' ') || null;
+                const buyerEmail = String(row.buyer_email || '').trim().toLowerCase();
+                if (buyerEmail && !sentSet.has(`${bookingId}|buyer`)) {
+                    const existing = buyerGroups.get(buyerEmail) || {
+                        recipientName: String(row.buyer_name || 'Customer'),
+                        bookings: [],
+                    };
+                    existing.bookings.push({
+                        raw: row,
+                        item: {
+                            bookingCode: String(row.booking_code),
+                            serviceName: String(row.service_name),
+                            variantLabel: row.variant_label ? String(row.variant_label) : null,
+                            bookingDate: formatIsoDate(row.booking_date),
+                            bookingTime: `${String(row.start_time).slice(0, 5)} - ${String(row.end_time).slice(0, 5)}`,
+                            status: String(row.status),
+                            serviceLocation,
+                            premisesAddress,
+                            sellerName: row.seller_name ? String(row.seller_name) : null,
+                            sellerEmail: row.seller_email ? String(row.seller_email) : null,
+                            sellerPhone,
+                        },
+                    });
+                    buyerGroups.set(buyerEmail, existing);
+                }
+                const sellerEmail = String(row.seller_email || '').trim().toLowerCase();
+                if (sellerEmail && !sentSet.has(`${bookingId}|seller`)) {
+                    const existing = sellerGroups.get(sellerEmail) || {
+                        recipientName: String(row.seller_name || 'Seller'),
+                        bookings: [],
+                    };
+                    existing.bookings.push({
+                        raw: row,
+                        item: {
+                            bookingCode: String(row.booking_code),
+                            serviceName: String(row.service_name),
+                            variantLabel: row.variant_label ? String(row.variant_label) : null,
+                            bookingDate: formatIsoDate(row.booking_date),
+                            bookingTime: `${String(row.start_time).slice(0, 5)} - ${String(row.end_time).slice(0, 5)}`,
+                            status: String(row.status),
+                            customerName: row.buyer_name ? String(row.buyer_name) : null,
+                        },
+                    });
+                    sellerGroups.set(sellerEmail, existing);
+                }
+            }
+            if (!buyerGroups.size && !sellerGroups.size)
+                return;
+            const companyInfo = await getPlatformCompanyEmailInfo();
+            const clientBase = getClientBaseUrlForServices();
+            for (const [buyerEmail, group] of buyerGroups.entries()) {
+                try {
+                    const firstToken = group.bookings[0]?.raw?.booking_token;
+                    const actionUrl = firstToken ? `${clientBase}/service-booking/${firstToken}` : `${clientBase}/shop-now`;
+                    const html = createServiceReminderDigestEmailHtml({
+                        company: companyInfo,
+                        role: 'buyer',
+                        recipientName: group.recipientName,
+                        targetDate: tomorrowStr,
+                        bookings: group.bookings.map((b: any) => b.item),
+                        actionLabel: 'View Booking Details',
+                        actionUrl,
+                    });
+                    await sendEmail(buyerEmail, `Reminder: Your Service Appointment(s) Tomorrow (${tomorrowStr})`, html, { purpose: 'customers' });
+                    for (const b of group.bookings) {
+                        await db.query<any>(`INSERT IGNORE INTO service_booking_reminders (booking_id, recipient_type, recipient_email, reminder_for_date)
+             VALUES (?, 'buyer', ?, ?)`, [Number(b.raw.id), buyerEmail, tomorrowStr]);
+                    }
+                }
+                catch (err: any) {
+                    console.error(`Failed sending buyer reminder digest to ${buyerEmail}:`, err);
+                }
+            }
+            for (const [sellerEmail, group] of sellerGroups.entries()) {
+                try {
+                    const html = createServiceReminderDigestEmailHtml({
+                        company: companyInfo,
+                        role: 'seller',
+                        recipientName: group.recipientName,
+                        targetDate: tomorrowStr,
+                        bookings: group.bookings.map((b: any) => b.item),
+                        actionLabel: 'Log in to Seller Portal',
+                        actionUrl: `${clientBase}/orders?tab=bookings`,
+                    });
+                    await sendEmail(sellerEmail, `Reminder: ${group.bookings.length} Service Appointment(s) Tomorrow (${tomorrowStr})`, html, { purpose: 'sellers' });
+                    for (const b of group.bookings) {
+                        await db.query<any>(`INSERT IGNORE INTO service_booking_reminders (booking_id, recipient_type, recipient_email, reminder_for_date)
+             VALUES (?, 'seller', ?, ?)`, [Number(b.raw.id), sellerEmail, tomorrowStr]);
+                    }
+                }
+                catch (err: any) {
+                    console.error(`Failed sending seller reminder digest to ${sellerEmail}:`, err);
+                }
+            }
+        }
+        catch (err: any) {
+            console.error('Service reminder scheduler error:', err);
+        }
+        finally {
+            serviceReminderRunInFlight = false;
+        }
+    };
+    const startServiceReminderScheduler = () => {
+        const targetMinutes = parseReminderTimeMinutes(process.env.SERVICE_REMINDER_TIME || '18:00');
+        const checkAndRun = () => {
+            const now = new Date();
+            const currentMinutes = now.getHours() * 60 + now.getMinutes();
+            if (currentMinutes >= targetMinutes) {
+                void runNextDayServiceReminders();
+            }
+        };
+        checkAndRun();
+        setInterval(checkAndRun, 60 * 1000);
+    };
+    startServiceReminderScheduler();
+    startServer(DEFAULT_PORT);
+};
+bootstrapAndStartServer();

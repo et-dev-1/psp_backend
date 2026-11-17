@@ -378,3 +378,125 @@ CREATE TABLE IF NOT EXISTS newsletter_subscribers (
   INDEX idx_newsletter_subscribed_at (subscribed_at)
 ) AUTO_INCREMENT = 100;
 
+-- Services Table
+CREATE TABLE IF NOT EXISTS services (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  seller_id INT UNSIGNED NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  subtitle VARCHAR(255) NULL,
+  description TEXT NULL,
+  category VARCHAR(100) NOT NULL,
+  age_category VARCHAR(100) NULL,
+  gender VARCHAR(50) NULL,
+  tax_class VARCHAR(50) DEFAULT '0%',
+  status ENUM('active', 'inactive', 'out_of_stock') DEFAULT 'active',
+  approval_status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+  rejection_message TEXT NULL,
+  is_promoted BOOLEAN DEFAULT FALSE,
+  seo_meta TEXT NULL,
+  tags_json TEXT NULL,
+  main_image_url VARCHAR(500) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_services_seller (seller_id),
+  INDEX idx_services_category (category),
+  INDEX idx_services_status (status)
+) AUTO_INCREMENT = 100;
+
+-- Service Images Table
+CREATE TABLE IF NOT EXISTS service_images (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  service_id INT UNSIGNED NOT NULL,
+  image_url VARCHAR(500) NOT NULL,
+  is_main BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  INDEX idx_service_images_service (service_id)
+) AUTO_INCREMENT = 100;
+
+-- Service Variants Table (No weight or dimensions)
+CREATE TABLE IF NOT EXISTS service_variants (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  service_id INT UNSIGNED NOT NULL,
+  variant_name VARCHAR(100) NOT NULL,
+  variant_value VARCHAR(255) NOT NULL,
+  sku VARCHAR(100) NULL,
+  price DECIMAL(10,2) NOT NULL,
+  discount_price DECIMAL(10,2) DEFAULT NULL,
+  image_url VARCHAR(500) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  INDEX idx_service_variants_service (service_id)
+) AUTO_INCREMENT = 100;
+
+-- Service Availability Table (Recurring and Specific time slots)
+CREATE TABLE IF NOT EXISTS service_availability (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  service_id INT UNSIGNED NOT NULL,
+  availability_type ENUM('recurring', 'specific') NOT NULL,
+  day_of_week TINYINT NULL,
+  specific_date DATE NULL,
+  start_time VARCHAR(10) NOT NULL,
+  end_time VARCHAR(10) NOT NULL,
+  valid_from DATE NULL,
+  valid_until DATE NULL,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  INDEX idx_service_availability_service (service_id),
+  INDEX idx_service_availability_type (availability_type)
+) AUTO_INCREMENT = 100;
+
+-- Service Bookings Table
+CREATE TABLE IF NOT EXISTS service_bookings (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  booking_code VARCHAR(40) UNIQUE NOT NULL,
+  booking_token VARCHAR(128) UNIQUE NOT NULL,
+  service_id INT UNSIGNED NOT NULL,
+  seller_id INT UNSIGNED NOT NULL,
+  variant_id INT UNSIGNED NULL,
+  variant_label VARCHAR(255) NULL,
+  price DECIMAL(10,2) NOT NULL DEFAULT 0,
+  buyer_name VARCHAR(255) NOT NULL,
+  buyer_email VARCHAR(255) NOT NULL,
+  buyer_phone VARCHAR(50) NULL,
+  buyer_notes TEXT NULL,
+  booking_date DATE NOT NULL,
+  start_time VARCHAR(10) NOT NULL,
+  end_time VARCHAR(10) NOT NULL,
+  status ENUM('PENDING', 'CONFIRMED', 'REJECTED', 'RESCHEDULE REQUESTED', 'CANCELLED', 'COMPLETED') NOT NULL DEFAULT 'PENDING',
+  previous_status ENUM('PENDING', 'CONFIRMED') NULL,
+  proposed_date DATE NULL,
+  proposed_start_time VARCHAR(10) NULL,
+  proposed_end_time VARCHAR(10) NULL,
+  reschedule_requested_by ENUM('buyer', 'seller') NULL,
+  reschedule_note TEXT NULL,
+  status_reason TEXT NULL,
+  cancelled_by ENUM('buyer', 'seller') NULL,
+  completed_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_service_bookings_service_date (service_id, booking_date),
+  INDEX idx_service_bookings_seller (seller_id),
+  INDEX idx_service_bookings_status (status)
+) AUTO_INCREMENT = 100;
+
+-- Service Reviews Table
+CREATE TABLE IF NOT EXISTS service_reviews (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  service_id INT UNSIGNED NOT NULL,
+  booking_id INT UNSIGNED NOT NULL UNIQUE,
+  buyer_name VARCHAR(255) NOT NULL,
+  buyer_email VARCHAR(255) NOT NULL,
+  rating TINYINT UNSIGNED NOT NULL,
+  comment TEXT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  FOREIGN KEY (booking_id) REFERENCES service_bookings(id) ON DELETE CASCADE,
+  INDEX idx_service_reviews_service (service_id)
+) AUTO_INCREMENT = 100;
+

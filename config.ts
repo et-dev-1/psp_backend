@@ -75,10 +75,7 @@ export const POSTNORD = {
   debugLogs: toBool(process.env.POSTNORD_DEBUG_LOGS, NODE_ENV !== 'production'),
 }
 
-export const DEFAULT_PLATFORM_COMMISSION_PERCENT = Number(process.env.DEFAULT_PLATFORM_COMMISSION_PERCENT || '1')
-export const DEFAULT_PLATFORM_COMMISSION_FIXED = Number(process.env.DEFAULT_PLATFORM_COMMISSION_FIXED || '0')
 export const VAT_SHIPPING_RATE = Number(process.env.VAT_SHIPPING_RATE || '0.25')
-export const PROMOTION_COMMISSION_PERCENT = toNumber(process.env.PROMOTION_COMMISSION_PERCENT, 5)
 // Swish requires certificates and is usually disabled unless explicitly configured.
 export const SWISH_ENABLED = toBool(process.env.SWISH_ENABLED, false)
 export const SWISH_TEST_MODE = toBool(process.env.SWISH_TEST_MODE, true)

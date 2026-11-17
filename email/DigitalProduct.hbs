@@ -4,15 +4,16 @@
     <meta charset="utf-8" />
     <title>Your Digital Products</title>
   </head>
-  <body style="margin:0; padding:0; background-color:#f3f4f6; font-family:Arial, Helvetica, sans-serif; color:#111827;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f3f4f6; padding:24px 12px;">
+  <body style="margin:0; padding:0; background-color:#f1f5f9; font-family:Arial, Helvetica, sans-serif; color:#0f172a;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f1f5f9; padding:24px 12px;">
       <tr>
         <td align="center">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:760px; background-color:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e5e7eb;">
-
-            <!-- Header -->
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:760px; background-color:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e2e8f0;">
             <tr>
-              <td style="padding:28px 32px; background:linear-gradient(135deg, #111827 0%, #374151 100%); color:#ffffff;">
+              <td style="height:4px; background:linear-gradient(90deg, #9333ea 0%, #ea580c 100%); font-size:0; line-height:0;">&nbsp;</td>
+            </tr>
+            <tr>
+              <td style="padding:28px 32px; background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color:#ffffff;">
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
                   <tr>
                     <td>
@@ -27,16 +28,16 @@
                           </td>
                           <td style="vertical-align:middle;">
                             <p style="margin:0; font-size:18px; line-height:24px; font-weight:700; color:#ffffff;">{{company_name}}</p>
-                            <p style="margin:4px 0 0 0; font-size:12px; line-height:18px; color:#cbd5e1;">{{company_address}} | Org {{organization_number}}</p>
+                            <p style="margin:4px 0 0 0; font-size:12px; line-height:18px; color:#cbd5e1;">{{company_address}}</p>
                           </td>
                         </tr>
                       </table>
-                      <h1 style="margin:0; font-size:28px; line-height:34px; font-weight:700;">Your Digital Products</h1>
+                      <h1 style="margin:0; font-size:26px; line-height:32px; font-weight:700; letter-spacing:-0.2px;">Your Digital Products</h1>
                     </td>
                     <td align="right" style="vertical-align:top;">
-                      <div style="display:inline-block; padding:10px 14px; border-radius:12px; background-color:rgba(255,255,255,0.12); text-align:left;">
-                        <p style="margin:0; font-size:12px; color:#e5e7eb;">Order Date</p>
-                        <p style="margin:4px 0 0 0; font-size:14px; font-weight:600; color:#ffffff;">{{order_date}}</p>
+                      <div style="display:inline-block; padding:10px 14px; border-radius:12px; background-color:rgba(255,255,255,0.12); text-align:left; white-space:nowrap;">
+                        <p style="margin:0; font-size:11px; color:#cbd5e1;">Order Date</p>
+                        <p style="margin:4px 0 0 0; font-size:13px; font-weight:600; color:#ffffff;">{{order_date}}</p>
                       </div>
                     </td>
                   </tr>
@@ -44,50 +45,45 @@
               </td>
             </tr>
 
-            <!-- Greeting -->
             <tr>
               <td style="padding:28px 32px 8px 32px;">
-                <p style="margin:0; font-size:16px;">Hello <strong>{{customer_name}}</strong>,</p>
-                <p style="margin:10px 0 0 0; font-size:14px; line-height:22px; color:#4b5563;">
-                  Thank you for your purchase! Your digital product(s) for order <strong>{{order_id}}</strong> are ready for download.
-                  Each link can be used a maximum of <strong>3 times</strong> and expires after <strong>30 days</strong>.
+                <p style="margin:0; font-size:16px; font-weight:600; color:#0f172a;">Hello <strong>{{customer_name}}</strong>,</p>
+                <p style="margin:10px 0 0 0; font-size:14px; line-height:22px; color:#475569;">
+                  Thank you for your purchase. Your digital product(s) for order <strong>{{order_id}}</strong> are ready. Click the download button(s) below to access your files. Each download button can be used up to <strong>3 times</strong> within <strong>30 days</strong>.
                 </p>
               </td>
             </tr>
 
-            <!-- Downloads table -->
             <tr>
               <td style="padding:20px 32px 8px 32px;">
-                <h2 style="margin:0 0 14px 0; font-size:18px; line-height:24px; color:#111827;">Download Links</h2>
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:separate; border-spacing:0; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden;">
-                  <thead>
-                    <tr style="background-color:#111827; color:#ffffff;">
-                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Product</th>
-                      <th align="left" style="padding:14px 16px; font-size:13px; font-weight:700;">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {{product_rows}}
-                  </tbody>
-                </table>
+                <h2 style="margin:0 0 12px 0; font-size:16px; line-height:22px; font-weight:700; color:#0f172a;">Digital Downloads</h2>
+                <div style="border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; background-color:#ffffff;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse; width:100%;">
+                    <thead>
+                      <tr style="background-color:#1e293b; color:#f8fafc;">
+                        <th align="left" style="padding:12px 16px; font-size:11px; font-weight:700; letter-spacing:0.6px; text-transform:uppercase; border-bottom:1px solid #334155;">Product</th>
+                        <th align="left" style="padding:12px 16px; font-size:11px; font-weight:700; letter-spacing:0.6px; text-transform:uppercase; border-bottom:1px solid #334155;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {{product_rows}}
+                    </tbody>
+                  </table>
+                </div>
               </td>
             </tr>
 
-            <!-- Notice -->
             <tr>
-              <td style="padding:20px 32px 8px 32px;">
+              <td style="padding:20px 32px 24px 32px;">
                 <div style="border-radius:12px; border:1px solid #fde68a; background-color:#fffbeb; padding:16px;">
                   <p style="margin:0; font-size:13px; line-height:20px; color:#92400e;">
-                    <strong>Important:</strong> Each download link may be used a maximum of 3 times.
-                    If you encounter any issues downloading your file(s), please contact us at
-                    <span style="color:#d97706;">{{company_email}}</span>.
+                    <strong>Important:</strong> Each download button may be used a maximum of 3 times. If you encounter any issues downloading your file(s), please contact us at <strong>{{company_email}}</strong>.
                   </p>
                 </div>
               </td>
             </tr>
 
             {{email_footer}}
-
           </table>
         </td>
       </tr>

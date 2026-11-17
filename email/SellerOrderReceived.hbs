@@ -1,93 +1,120 @@
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>New Order Received</title>
-  </head>
-  <body style="margin:0; padding:0; background-color:#f3f4f6; font-family:Arial, Helvetica, sans-serif; color:#111827;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f3f4f6; padding:24px 12px;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:760px; background-color:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e5e7eb;">
-            <tr>
-              <td style="padding:28px 32px; background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color:#ffffff;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td>
-                      <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:14px;">
-                        <tr>
-                          <td style="vertical-align:middle; padding-right:14px;">
-                            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
-                              <tr>
-                                <td style="width:44px;height:44px;border-radius:10px;text-align:center;vertical-align:middle;">{{email_header_logo}}</td>
-                              </tr>
-                            </table>
-                          </td>
-                          <td style="vertical-align:middle;">
-                            <p style="margin:0; font-size:18px; line-height:24px; font-weight:700; color:#ffffff;">{{company_name}}</p>
-                            <p style="margin:4px 0 0 0; font-size:12px; line-height:18px; color:#cbd5e1;">{{company_address}} | Org {{organization_number}}</p>
-                          </td>
-                        </tr>
-                      </table>
-                      <h1 style="margin:0; font-size:28px; line-height:34px; font-weight:700;">New Order Received</h1>
-                    </td>
-                    <td align="right" style="vertical-align:top;">
-                      <div style="display:inline-block; padding:10px 14px; border-radius:12px; background-color:rgba(255,255,255,0.12); text-align:left;">
-                        <p style="margin:0; font-size:12px; color:#dbeafe;">Order Date</p>
-                        <p style="margin:4px 0 0 0; font-size:14px; font-weight:600; color:#ffffff;">{{order_date}}</p>
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
 
-            <tr>
-              <td style="padding:28px 32px 8px 32px;">
-                <p style="margin:0; font-size:16px;">Hello <strong>{{seller_name}}</strong>,</p>
-                <p style="margin:10px 0 0 0; font-size:14px; line-height:22px; color:#4b5563;">
-                  You have received a new order from <strong>{{customer_name}}</strong>.
+<head>
+  <meta charset="utf-8" />
+  <title>New Order Received</title>
+</head>
+
+<body style="margin:0; padding:0; background-color:#f1f5f9; font-family:Arial, Helvetica, sans-serif; color:#0f172a;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+    style="background-color:#f1f5f9; padding:24px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+          style="max-width:760px; background-color:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #e2e8f0;">
+          <tr>
+            <td
+              style="height:4px; background:linear-gradient(90deg, #9333ea 0%, #ea580c 100%); font-size:0; line-height:0;">
+              &nbsp;</td>
+          </tr>
+          <tr>
+            <td style="padding:28px 32px; background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color:#ffffff;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td>
+                    <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:14px;">
+                      <tr>
+                        <td style="vertical-align:middle; padding-right:14px;">
+                          <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                            <tr>
+                              <td
+                                style="width:44px;height:44px;border-radius:10px;text-align:center;vertical-align:middle;">
+                                {{email_header_logo}}</td>
+                            </tr>
+                          </table>
+                        </td>
+                        <td style="vertical-align:middle;">
+                          <p style="margin:0; font-size:18px; line-height:24px; font-weight:700; color:#ffffff;">
+                            {{company_name}}</p>
+                          <p style="margin:4px 0 0 0; font-size:12px; line-height:18px; color:#cbd5e1;">
+                            {{company_address}}</p>
+                        </td>
+                      </tr>
+                    </table>
+                    <h1 style="margin:0; font-size:26px; line-height:32px; font-weight:700; letter-spacing:-0.2px;">New
+                      Order Received</h1>
+                  </td>
+                  <td align="right" style="vertical-align:top;">
+                    <div
+                      style="display:inline-block; padding:10px 14px; border-radius:12px; background-color:rgba(255,255,255,0.12); text-align:left; white-space:nowrap;">
+                      <p style="margin:0; font-size:11px; color:#cbd5e1;">Order Date</p>
+                      <p style="margin:4px 0 0 0; font-size:13px; font-weight:600; color:#ffffff;">{{order_date}}</p>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:28px 32px 8px 32px;">
+              <p style="margin:0; font-size:16px; font-weight:600; color:#0f172a;">Hello
+                <strong>{{seller_name}}</strong>,</p>
+              <p style="margin:10px 0 0 0; font-size:14px; line-height:22px; color:#475569;">
+                You have received a new order from <strong>{{customer_name}}</strong>.
+              </p>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:16px 32px 8px 32px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td width="50%" style="padding-right:8px; vertical-align:top;">
+                    <div
+                      style="border:1px solid #e2e8f0; border-radius:12px; padding:18px; background-color:#f8fafc; height:100%;">
+                      <p
+                        style="margin:0 0 12px 0; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.6px;">
+                        Order Details</p>
+                      <p style="margin:0 0 8px 0; font-size:13px; color:#0f172a;"><strong>Order ID:</strong>
+                        {{order_id}}</p>
+                      <p style="margin:0 0 8px 0; font-size:13px; color:#0f172a;"><strong>Group Order ID:</strong>
+                        {{group_order_id}}</p>
+                      <p style="margin:0; font-size:13px; color:#0f172a;"><strong>Items:</strong> {{total_items}}</p>
+                    </div>
+                  </td>
+                  <td width="50%" style="padding-left:8px; vertical-align:top;">
+                    <div
+                      style="border:1px solid #e2e8f0; border-radius:12px; padding:18px; background-color:#f8fafc; height:100%;">
+                      <p
+                        style="margin:0 0 12px 0; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.6px;">
+                        Order Total (SEK)</p>
+                      <p style="margin:0; font-size:16px; font-weight:700; color:#047857;"><strong>Total
+                          Amount:</strong> {{total_amount}}</p>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:20px 32px 28px 32px;">
+              <div style="border-radius:12px; border:1px solid #bfdbfe; background-color:#eff6ff; padding:16px;">
+                <p style="margin:0; font-size:13px; line-height:20px; color:#1e40af;">
+                  This order is now available in your seller dashboard. Please review the order details and prepare
+                  fulfillment as needed.
                 </p>
-              </td>
-            </tr>
+              </div>
+            </td>
+          </tr>
 
-            <tr>
-              <td style="padding:16px 32px 8px 32px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td width="50%" style="padding-right:8px; vertical-align:top;">
-                      <div style="border:1px solid #e5e7eb; border-radius:14px; padding:18px; background-color:#f9fafb; height:100%;">
-                        <p style="margin:0 0 12px 0; font-size:13px; font-weight:700; color:#111827; text-transform:uppercase; letter-spacing:0.4px;">Order Details</p>
-                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Order ID:</strong> {{order_id}}</p>
-                        <p style="margin:0 0 8px 0; font-size:14px;"><strong>Group Order ID:</strong> {{group_order_id}}</p>
-                        <p style="margin:0; font-size:14px;"><strong>Items:</strong> {{total_items}}</p>
-                      </div>
-                    </td>
-                    <td width="50%" style="padding-left:8px; vertical-align:top;">
-                      <div style="border:1px solid #e5e7eb; border-radius:14px; padding:18px; background-color:#f9fafb; height:100%;">
-                        <p style="margin:0 0 12px 0; font-size:13px; font-weight:700; color:#111827; text-transform:uppercase; letter-spacing:0.4px;">Order Total (SEK)</p>
-                        <p style="margin:0; font-size:16px; color:#047857;"><strong>Total Amount:</strong> {{total_amount}}</p>
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
+          {{email_footer}}
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
 
-            <tr>
-              <td style="padding:20px 32px 8px 32px;">
-                <div style="border-radius:12px; border:1px solid #bfdbfe; background-color:#eff6ff; padding:16px;">
-                  <p style="margin:0; font-size:13px; line-height:20px; color:#1d4ed8;">
-                    A new order is ready in your seller dashboard. Please review the order details and prepare fulfillment if needed.
-                  </p>
-                </div>
-              </td>
-            </tr>
-
-            {{email_footer}}
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
 </html>

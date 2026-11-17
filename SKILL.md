@@ -26,6 +26,9 @@ Use this skill for backend work in this repository:
 
 ## Key Files
 - Server routes and core logic: `server.ts`
+- Constants and shared variables: `constants/variables.ts`
+- Database queries and schema-ensure helpers: `db/queries.ts`
+- Reusable pure utility/helper functions: `utils/helpers.ts`
 - Runtime config parsing: `config.ts`
 - DB pool/types: `db.ts`, `db.d.ts`
 - Schema source of truth: `schema.sql`
@@ -34,6 +37,13 @@ Use this skill for backend work in this repository:
 - Shipment integration: `shipment/shipment.ts`
 - Swish integration: `swish/SwishApi.ts`
 - Container build/runtime: `Dockerfile`
+
+## Code Organization & Modularity Rules
+To keep `server.ts` maintainable and avoid bloating route handlers:
+1. **Variables & Constants (`constants/variables.ts`)**: Place all shared constants, setting keys, upload subdirs, regexes, and static lookup maps in `constants/variables.ts`.
+2. **Database Queries (`db/queries.ts`)**: Place reusable SQL queries, `ensure*Table` / schema helpers, and data-access functions in `db/queries.ts` using `queryRows`, `queryOne`, and `executeQuery` instead of writing large inline SQL blocks directly in `server.ts`.
+3. **Reusable Functions (`utils/helpers.ts`)**: Place pure, reusable helpers (formatting, rounding, tax/commission math, ID generation, sanitization, escaping, date helpers) in `utils/helpers.ts`.
+4. **Emails (`email/email.ts` & `email/*.hbs`)**: Never construct inline HTML emails in `server.ts`. Use `email/*.hbs` templates (with the consistent header and `EmailFooter.hbs` without organization number) and builder functions in `email/email.ts`.
 
 ## Local Development
 1. Install deps:
@@ -81,7 +91,7 @@ Common optional/runtime env:
 - Rate limits: `SIGNIN_MAX_ATTEMPTS`, `SIGNIN_RATE_LIMIT_WINDOW_MINUTES`, `SIGNUP_MAX_ATTEMPTS`, `SIGNUP_RATE_LIMIT_WINDOW_MINUTES`
 - PostNord: `POSTNORD_*`, `POSTNORD_TRACKING_BASE_URL`
 - Swish: `SWISH_*`
-- Platform defaults: `DEFAULT_PLATFORM_COMMISSION_PERCENT`, `DEFAULT_PLATFORM_COMMISSION_FIXED`, `PROMOTION_COMMISSION_PERCENT`, `VAT_SHIPPING_RATE`
+- Platform defaults: `VAT_SHIPPING_RATE` (commission rates are configured in Admin Settings)
 
 Important behavior:
 - SMTP sender credentials are DB-driven (app settings + email accounts), not primarily static env.

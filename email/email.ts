@@ -182,6 +182,24 @@ const getProductStatusTemplate = (): string => {
   return productStatusTemplateCache
 }
 
+const commissionUpdateTemplatePath = resolveTemplatePath('CommissionUpdateNotice.hbs')
+let commissionUpdateTemplateCache: string | null = null
+
+const getCommissionUpdateTemplate = (): string => {
+  if (commissionUpdateTemplateCache) return commissionUpdateTemplateCache
+  commissionUpdateTemplateCache = fs.readFileSync(commissionUpdateTemplatePath, 'utf8')
+  return commissionUpdateTemplateCache
+}
+
+const notificationEmailTemplatePath = resolveTemplatePath('NotificationEmail.hbs')
+let notificationEmailTemplateCache: string | null = null
+
+const getNotificationEmailTemplate = (): string => {
+  if (notificationEmailTemplateCache) return notificationEmailTemplateCache
+  notificationEmailTemplateCache = fs.readFileSync(notificationEmailTemplatePath, 'utf8')
+  return notificationEmailTemplateCache
+}
+
 const renderTemplate = (template: string, values: Record<string, string>): string => {
   return template.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_, key) => values[key] ?? '')
 }
@@ -343,7 +361,7 @@ export const createDigitalProductEmailHtml = (input: CreateDigitalProductEmailHt
       company_email: String(input.company.company_email || ''),
       company_address: String(input.company.company_address || ''),
       organization_number: String(input.company.organization_number || ''),
-      introText: 'If you have any questions about this order, please contact:',
+      introText: '',
     }),
   })
 }
@@ -426,16 +444,17 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
       }
 
       const qty = Number(item.quantity || 0)
-      const unitPrice = Number(item.unit_price || 0).toFixed(2)
-      const hasPrivateSellerVatMarker = !isShipment && Boolean(item.is_private_seller) && Number(item.tax_amount || 0) === 0
-      const lineTax = `${Number(item.tax_amount || 0).toFixed(2)}${hasPrivateSellerVatMarker ? '*' : ''}`
-      const lineTotal = (Number(item.total_price || 0) + Number(item.tax_amount || 0)).toFixed(2)
+      const lineTaxAmount = Number(item.tax_amount || 0)
+      const unitPriceWithTax = qty > 0
+        ? (Number(item.unit_price || 0) + lineTaxAmount / qty)
+        : Number(item.unit_price || 0)
+      const unitPrice = unitPriceWithTax.toFixed(2)
+      const lineTotal = (Number(item.total_price || 0) + lineTaxAmount).toFixed(2)
 
       return `<tr style="background-color:${rowBg};">
           <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${item.product_name}</td>
           <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${isShipment ? '' : qty}</td>
           <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${isShipment ? '' : unitPrice}</td>
-          <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${lineTax}</td>
           <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${lineTotal}</td>
         </tr>`
     })
@@ -449,18 +468,16 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
   const computedTax = normalizedItems.reduce((sum, item) => sum + Number(item.tax_amount || 0), 0)
   const summaryTax = Number.isFinite(Number(input.tax_amount)) ? Number(input.tax_amount) : computedTax
 
-  const totalTax = normalizedItems.reduce((sum, item) => sum + Number(item.tax_amount || 0), 0)
   const totalLineTotal = normalizedItems.reduce((sum, item) => sum + Number(item.total_price || 0) + Number(item.tax_amount || 0), 0)
   const totalsFooterRow = `<tr style="background-color:#f1f5f9;">
       <td colspan="3" align="right" style="padding:12px 16px; font-size:13px; font-weight:700; color:#111827; border-top:2px solid #d1d5db;">Totals</td>
-      <td align="left" style="padding:12px 16px; font-size:13px; font-weight:700; color:#111827; border-top:2px solid #d1d5db;">SEK ${totalTax.toFixed(2)}</td>
       <td align="left" style="padding:12px 16px; font-size:13px; font-weight:700; color:#111827; border-top:2px solid #d1d5db;">SEK ${totalLineTotal.toFixed(2)}</td>
     </tr>`
 
   const template = getInvoiceTemplate()
 
   return renderTemplate(template, {
-        email_header_logo: EMAIL_HEADER_LOGO_HTML,
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
     company_logo_url: String(input.company.company_logo_url || '').trim(),
     company_name: String(input.company.company_name || '').trim(),
     company_email: String(input.company.company_email || '').trim(),
@@ -476,17 +493,17 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
     tax_amount: Number(summaryTax || 0).toFixed(2),
     commission_amount: Number(input.commission_amount || 0).toFixed(2),
     net_amount: Number(input.net_amount || 0).toFixed(2),
-    items_rows: itemsHtml || '<tr><td colspan="5">No items available.</td></tr>',
+    items_rows: itemsHtml || '<tr><td colspan="4">No items available.</td></tr>',
     totals_footer_row: totalsFooterRow,
     private_seller_vat_note: hasPrivateSellerVatZeroItems
-      ? '* Item(s) marked with * have 0% VAT because the seller is a private seller.'
+      ? ''
       : '',
     email_footer: createEmailFooterHtml({
       company_name: String(input.company.company_name || ''),
       company_email: String(input.company.company_email || ''),
       company_address: String(input.company.company_address || ''),
       organization_number: String(input.company.organization_number || ''),
-      introText: 'If you have any questions about this order, please contact:',
+      introText: '',
     }),
   })
 }
@@ -619,7 +636,7 @@ export const createSellerOrderReceivedEmailHtml = (input: CreateSellerOrderRecei
       company_email: String(input.company.company_email || ''),
       company_address: String(input.company.company_address || ''),
       organization_number: String(input.company.organization_number || ''),
-      introText: 'If you have any questions about this order, please contact:',
+      introText: '',
     }),
   })
 }
@@ -681,7 +698,7 @@ export const sendEmail = async (
           const textBody = looksLikeHtml ? stripHtml(htmlBody) : body
 
           const transporter = nodemailer.createTransport({
-            
+
             host: smtpHost,
             port: smtpPort,
             secure: smtpSecure,
@@ -970,21 +987,21 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
 
   const copy = language === 'sv'
     ? {
-        title: 'Be kunden om omdöme',
-        intro: 'Den här beställningen är levererad. Dela länken nedan med kunden så att de kan lämna ett betyg och en kommentar.',
-        button: 'Öppna omdömessida',
-        helper: 'Om knappen inte fungerar kan du kopiera och dela länken manuellt:',
-        orderLineLabel: 'Produkt',
-        customerLineLabel: 'Kund',
-      }
+      title: 'Be kunden om omdöme',
+      intro: 'Den här beställningen är levererad. Dela länken nedan med kunden så att de kan lämna ett betyg och en kommentar.',
+      button: 'Öppna omdömessida',
+      helper: 'Om knappen inte fungerar kan du kopiera och dela länken manuellt:',
+      orderLineLabel: 'Produkt',
+      customerLineLabel: 'Kund',
+    }
     : {
-        title: 'Request a customer review',
-        intro: 'This order has been delivered. Share the link below with your customer so they can leave a rating and a comment.',
-        button: 'Open review page',
-        helper: 'If the button does not work, copy and share this link manually:',
-        orderLineLabel: 'Product',
-        customerLineLabel: 'Customer',
-      }
+      title: 'Request a customer review',
+      intro: 'This order has been delivered. Share the link below with your customer so they can leave a rating and a comment.',
+      button: 'Open review page',
+      helper: 'If the button does not work, copy and share this link manually:',
+      orderLineLabel: 'Product',
+      customerLineLabel: 'Customer',
+    }
 
   const footer = createEmailFooterHtml({
     company_name: input.company.company_name,
@@ -999,11 +1016,7 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
   const productName = String(input.product_name || '').trim()
   const companyName = String(input.company.company_name || '').trim()
   const companyAddress = String(input.company.company_address || '').trim()
-  const companyOrgNumber = String(input.company.organization_number || '').trim()
-  const companyMeta = [
-    companyAddress,
-    companyOrgNumber ? `Org ${companyOrgNumber}` : '',
-  ].filter(Boolean).join(' • ')
+  const companyMeta = companyAddress
 
   return `
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-family:Arial,Helvetica,sans-serif;background:#f3f4f6;padding:24px 0;">
@@ -1011,7 +1024,7 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
         <td align="center">
           <table role="presentation" width="640" cellspacing="0" cellpadding="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e5e7eb;">
             <tr>
-              <td style="padding:24px 28px;background:#111827;color:#ffffff;">
+              <td style="padding:28px 32px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#ffffff;">
                 <table role="presentation" cellspacing="0" cellpadding="0" style="margin-bottom:12px;">
                   <tr>
                     <td style="width:36px;height:36px;padding-right:10px;vertical-align:middle;">
@@ -1056,6 +1069,436 @@ export const createDeliveryReviewRequestEmailHtml = (input: DeliveryReviewReques
       </tr>
     </table>
   `
+}
+
+export type ServiceBookingEmailInput = {
+  company: EmailCompanyInfo
+  recipientName: string
+  heading: string
+  intro: string
+  statusBadge: string
+  statusColor?: string
+  bookingCode: string
+  serviceName: string
+  variantLabel?: string | null
+  bookingDate: string
+  bookingTime: string
+  serviceLocation?: string | null
+  premisesAddress?: string | null
+  sellerName?: string | null
+  sellerEmail?: string | null
+  sellerPhone?: string | null
+  proposedDate?: string | null
+  proposedTime?: string | null
+  note?: string | null
+  actionLabel: string
+  actionUrl: string
+}
+
+export const createServiceBookingEmailHtml = (input: ServiceBookingEmailInput): string => {
+  const esc = (val: unknown): string =>
+    String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+
+  const badgeColor = input.statusColor || '#7c3aed'
+  const actionUrl = String(input.actionUrl || '').trim() || '#'
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name || 'Barakah Mart',
+    company_email: input.company.company_email || '',
+    company_address: input.company.company_address || '',
+    organization_number: input.company.organization_number || '',
+  })
+
+  return `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f5f7fb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;width:100%;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+            <tr>
+              <td style="padding:28px 32px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#ffffff;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="width:52px;vertical-align:middle;">${EMAIL_HEADER_LOGO_HTML}</td>
+                    <td style="vertical-align:middle;padding-left:10px;">
+                      <div style="font-size:18px;font-weight:700;color:#ffffff;">${esc(input.company.company_name || 'Barakah Mart')}</div>
+                      <div style="font-size:12px;color:#cbd5e1;">${esc(input.company.company_address || 'Service Booking Notification')}</div>
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block;background:${esc(badgeColor)};color:#ffffff;font-size:11px;font-weight:700;padding:5px 10px;border-radius:999px;letter-spacing:0.4px;">${esc(input.statusBadge)}</span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px 28px 12px 28px;">
+                <h2 style="margin:0 0 10px 0;font-size:20px;color:#111827;">${esc(input.heading)}</h2>
+                <p style="margin:0 0 14px 0;font-size:14px;line-height:1.6;color:#374151;">Hi ${esc(input.recipientName || 'there')},</p>
+                <p style="margin:0 0 18px 0;font-size:14px;line-height:1.6;color:#374151;">${esc(input.intro)}</p>
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;font-size:13px;color:#374151;">
+                  <tr><td style="padding:4px 0;"><strong>Booking Code:</strong> ${esc(input.bookingCode)}</td></tr>
+                  <tr><td style="padding:4px 0;"><strong>Service:</strong> ${esc(input.serviceName)}</td></tr>
+                  ${input.variantLabel ? `<tr><td style="padding:4px 0;"><strong>Option:</strong> ${esc(input.variantLabel)}</td></tr>` : ''}
+                  <tr><td style="padding:4px 0;"><strong>Scheduled Date:</strong> ${esc(input.bookingDate)}</td></tr>
+                  <tr><td style="padding:4px 0;"><strong>Scheduled Time:</strong> ${esc(input.bookingTime)}</td></tr>
+                  ${input.serviceLocation ? `<tr><td style="padding:4px 0;"><strong>Service Location:</strong> ${esc(input.serviceLocation)}</td></tr>` : ''}
+                  ${input.premisesAddress ? `<tr><td style="padding:4px 0;color:#6d28d9;"><strong>Seller Premises Address:</strong> ${esc(input.premisesAddress)}</td></tr>` : ''}
+                  ${input.sellerName ? `<tr><td style="padding:4px 0;"><strong>Seller:</strong> ${esc(input.sellerName)}</td></tr>` : ''}
+                  ${input.sellerEmail ? `<tr><td style="padding:4px 0;"><strong>Seller Email:</strong> ${esc(input.sellerEmail)}</td></tr>` : ''}
+                  ${input.sellerPhone ? `<tr><td style="padding:4px 0;"><strong>Seller Phone:</strong> ${esc(input.sellerPhone)}</td></tr>` : ''}
+                  ${input.proposedDate ? `<tr><td style="padding:4px 0;color:#b45309;"><strong>Proposed New Date:</strong> ${esc(input.proposedDate)}</td></tr>` : ''}
+                  ${input.proposedTime ? `<tr><td style="padding:4px 0;color:#b45309;"><strong>Proposed New Time:</strong> ${esc(input.proposedTime)}</td></tr>` : ''}
+                  ${input.note ? `<tr><td style="padding:4px 0;"><strong>Note:</strong> ${esc(input.note)}</td></tr>` : ''}
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px 28px 10px 28px;">
+                <a href="${esc(actionUrl)}" style="display:inline-block;background:#7c3aed;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:14px;font-weight:700;">${esc(input.actionLabel)}</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 28px 28px 28px;">${footer}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  `
+}
+
+export type ServiceReminderBookingItem = {
+  bookingCode: string
+  serviceName: string
+  variantLabel?: string | null
+  bookingDate: string
+  bookingTime: string
+  status: string
+  customerName?: string | null
+  serviceLocation?: string | null
+  premisesAddress?: string | null
+  sellerName?: string | null
+  sellerEmail?: string | null
+  sellerPhone?: string | null
+}
+
+export type ServiceReminderDigestInput = {
+  company: EmailCompanyInfo
+  role: 'buyer' | 'seller'
+  recipientName: string
+  targetDate: string
+  bookings: ServiceReminderBookingItem[]
+  actionLabel: string
+  actionUrl: string
+}
+
+export const createServiceReminderDigestEmailHtml = (input: ServiceReminderDigestInput): string => {
+  const esc = (val: unknown): string =>
+    String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+
+  const actionUrl = String(input.actionUrl || '').trim() || '#'
+  const footer = createEmailFooterHtml({
+    company_name: input.company.company_name || 'Barakah Mart',
+    company_email: input.company.company_email || '',
+    company_address: input.company.company_address || '',
+    organization_number: input.company.organization_number || '',
+  })
+
+  const intro =
+    input.role === 'buyer'
+      ? `This is a reminder for your upcoming service appointment(s) scheduled for ${esc(input.targetDate)}.`
+      : `You have ${input.bookings.length} upcoming service appointment(s) scheduled for ${esc(input.targetDate)}. Please log in to your Seller Portal to check full details.`
+
+  const itemsHtml = input.bookings
+    .map((b) => {
+      if (input.role === 'seller') {
+        return `
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;font-size:13px;color:#374151;">
+            <tr><td style="padding:3px 0;"><strong>Booking Code:</strong> ${esc(b.bookingCode)} &nbsp;|&nbsp; <strong>Status:</strong> ${esc(b.status)}</td></tr>
+            <tr><td style="padding:3px 0;"><strong>Service:</strong> ${esc(b.serviceName)}${b.variantLabel ? ` (${esc(b.variantLabel)})` : ''}</td></tr>
+            <tr><td style="padding:3px 0;"><strong>Date &amp; Time:</strong> ${esc(b.bookingDate)} · ${esc(b.bookingTime)}</td></tr>
+            ${b.customerName ? `<tr><td style="padding:3px 0;"><strong>Customer:</strong> ${esc(b.customerName)}</td></tr>` : ''}
+          </table>
+        `
+      }
+      return `
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-bottom:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;font-size:13px;color:#374151;">
+          <tr><td style="padding:3px 0;"><strong>Booking Code:</strong> ${esc(b.bookingCode)} &nbsp;|&nbsp; <strong>Status:</strong> ${esc(b.status)}</td></tr>
+          <tr><td style="padding:3px 0;"><strong>Service:</strong> ${esc(b.serviceName)}${b.variantLabel ? ` (${esc(b.variantLabel)})` : ''}</td></tr>
+          <tr><td style="padding:3px 0;"><strong>Date &amp; Time:</strong> ${esc(b.bookingDate)} · ${esc(b.bookingTime)}</td></tr>
+          ${b.serviceLocation ? `<tr><td style="padding:3px 0;"><strong>Service Location:</strong> ${esc(b.serviceLocation)}</td></tr>` : ''}
+          ${b.premisesAddress ? `<tr><td style="padding:3px 0;color:#6d28d9;"><strong>Seller Premises Address:</strong> ${esc(b.premisesAddress)}</td></tr>` : ''}
+          ${b.sellerName ? `<tr><td style="padding:3px 0;"><strong>Seller:</strong> ${esc(b.sellerName)}</td></tr>` : ''}
+          ${b.sellerEmail ? `<tr><td style="padding:3px 0;"><strong>Seller Email:</strong> ${esc(b.sellerEmail)}</td></tr>` : ''}
+          ${b.sellerPhone ? `<tr><td style="padding:3px 0;"><strong>Seller Phone:</strong> ${esc(b.sellerPhone)}</td></tr>` : ''}
+        </table>
+      `
+    })
+    .join('')
+
+  return `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f5f7fb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;width:100%;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+            <tr>
+              <td style="padding:28px 32px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#ffffff;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="width:52px;vertical-align:middle;">${EMAIL_HEADER_LOGO_HTML}</td>
+                    <td style="vertical-align:middle;padding-left:10px;">
+                      <div style="font-size:18px;font-weight:700;color:#ffffff;">${esc(input.company.company_name || 'Barakah Mart')}</div>
+                      <div style="font-size:12px;color:#cbd5e1;">${esc(input.company.company_address || 'Upcoming Service Reminder')}</div>
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block;background:#7c3aed;color:#ffffff;font-size:11px;font-weight:700;padding:5px 10px;border-radius:999px;letter-spacing:0.4px;">REMINDER</span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px 28px 12px 28px;">
+                <h2 style="margin:0 0 10px 0;font-size:20px;color:#111827;">Upcoming Service Appointments (${esc(input.targetDate)})</h2>
+                <p style="margin:0 0 14px 0;font-size:14px;line-height:1.6;color:#374151;">Hi ${esc(input.recipientName || 'there')},</p>
+                <p style="margin:0 0 18px 0;font-size:14px;line-height:1.6;color:#374151;">${intro}</p>
+                ${itemsHtml}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:10px 28px 20px 28px;">
+                <a href="${esc(actionUrl)}" style="display:inline-block;background:#7c3aed;color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:10px;font-size:14px;font-weight:700;">${esc(input.actionLabel)}</a>
+              </td>
+            </tr>
+            ${footer}
+          </table>
+        </td>
+      </tr>
+    </table>
+  `
+}
+
+const escHtml = (val: unknown): string =>
+  String(val ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
+export const createNotificationEmailHtml = (input: {
+  company: EmailCompanyInfo
+  badgeLabel: string
+  badgeBg?: string
+  badgeText?: string
+  heading: string
+  bodyHtml: string
+  footerIntroText?: string
+}): string => {
+  const footerHtml = createEmailFooterHtml({
+    company_name: String(input.company.company_name || 'Barakah Mart').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: '',
+    introText: input.footerIntroText || 'Questions? Please contact platform support.',
+  })
+
+  return renderTemplate(getNotificationEmailTemplate(), {
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
+    company_name: escHtml(input.company.company_name || 'Barakah Mart'),
+    company_address: escHtml(input.company.company_address || ''),
+    badge_label: escHtml(input.badgeLabel),
+    badge_bg: input.badgeBg || '#315fce',
+    badge_text: input.badgeText || '#ffffff',
+    heading: escHtml(input.heading),
+    body_html: input.bodyHtml,
+    email_footer: footerHtml,
+  })
+}
+
+export const createCommissionUpdateNoticeEmailHtml = (input: {
+  company: EmailCompanyInfo
+  changeRowsHtml: string
+  changesNote: string
+}): string => {
+  const footerHtml = createEmailFooterHtml({
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: '',
+    introText: 'Questions? Please contact platform support.',
+  })
+
+  return renderTemplate(getCommissionUpdateTemplate(), {
+    company_logo_url: String(input.company.company_logo_url || '').trim(),
+    email_header_logo: EMAIL_HEADER_LOGO_HTML,
+    company_name: String(input.company.company_name || '').trim(),
+    company_email: String(input.company.company_email || '').trim(),
+    company_address: String(input.company.company_address || '').trim(),
+    organization_number: '',
+    change_rows: input.changeRowsHtml,
+    changes_note: input.changesNote,
+    email_footer: footerHtml,
+  })
+}
+
+export const createAdminNewSellerEmailHtml = (input: {
+  company: EmailCompanyInfo
+  sellerId: number
+  sellerEmail: string
+}): string => {
+  const bodyHtml = `
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:22px;color:#334155;">A new seller has registered on ${escHtml(input.company.company_name || 'the platform')}.</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;font-size:13px;color:#1e293b;">
+      <tr><td style="padding:4px 0;"><strong>Seller Email:</strong> ${escHtml(input.sellerEmail)}</td></tr>
+      <tr><td style="padding:4px 0;"><strong>Seller ID:</strong> ${escHtml(input.sellerId)}</td></tr>
+    </table>
+  `
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: 'New Seller',
+    badgeBg: '#7c3aed',
+    heading: 'New Seller Registered',
+    bodyHtml,
+  })
+}
+
+export const createAdminNewProductEmailHtml = (input: {
+  company: EmailCompanyInfo
+  productId: number
+  productName: string
+  sellerEmail: string
+  sellerId: number
+  approvalStatus: string
+}): string => {
+  const bodyHtml = `
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:22px;color:#334155;">A new product has been submitted by seller <strong>${escHtml(input.sellerEmail)}</strong> (ID: ${escHtml(input.sellerId)}).</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;font-size:13px;color:#1e293b;">
+      <tr><td style="padding:4px 0;"><strong>Product Name:</strong> ${escHtml(input.productName)}</td></tr>
+      <tr><td style="padding:4px 0;"><strong>Product ID:</strong> ${escHtml(input.productId)}</td></tr>
+      <tr><td style="padding:4px 0;"><strong>Approval Status:</strong> ${escHtml(input.approvalStatus)}</td></tr>
+    </table>
+  `
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: 'Product Review',
+    badgeBg: '#0284c7',
+    heading: 'New Product Added',
+    bodyHtml,
+  })
+}
+
+export const createEmailConnectionTestHtml = (input: {
+  company: EmailCompanyInfo
+  platformName: string
+  recipientEmail: string
+  smtpUser: string
+}): string => {
+  const bodyHtml = `
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:22px;color:#334155;">
+      This is a test message from <strong>${escHtml(input.platformName)}</strong>.<br/>
+      Your email server is correctly configured and able to send emails.
+    </p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;font-size:13px;color:#475569;">
+      <tr><td style="padding:4px 0;"><strong>Sent to:</strong> ${escHtml(input.recipientEmail)}</td></tr>
+      <tr><td style="padding:4px 0;"><strong>Sender:</strong> ${escHtml(input.smtpUser)}</td></tr>
+    </table>
+  `
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: 'SMTP Test',
+    badgeBg: '#059669',
+    heading: 'Email Connection is Working',
+    bodyHtml,
+  })
+}
+
+export const createCustomMessageEmailHtml = (input: {
+  company: EmailCompanyInfo
+  heading: string
+  bodyText: string
+  badgeLabel?: string
+}): string => {
+  const bodyHtml = `
+    <div style="font-size:14px;line-height:22px;color:#334155;white-space:pre-wrap;">${escHtml(input.bodyText)}</div>
+  `
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: input.badgeLabel || 'Platform Message',
+    badgeBg: '#315fce',
+    heading: input.heading,
+    bodyHtml,
+  })
+}
+
+export const createSupportMessageEmailHtml = (input: {
+  company: EmailCompanyInfo
+  badgeLabel: string
+  heading: string
+  rows: Array<{ label: string; value: string; multiline?: boolean }>
+  attachments?: string[]
+  footerNote?: string
+}): string => {
+  const rowsHtml = input.rows
+    .map((r, idx) => {
+      const bg = idx % 2 === 1 ? '#f8fafc' : '#ffffff'
+      const style = r.multiline ? 'white-space:pre-wrap;' : ''
+      return `<tr style="background:${bg};"><td style="padding:9px 12px;font-weight:600;color:#334155;width:160px;vertical-align:top;border-bottom:1px solid #e2e8f0;">${escHtml(r.label)}</td><td style="padding:9px 12px;color:#0f172a;border-bottom:1px solid #e2e8f0;${style}">${escHtml(r.value)}</td></tr>`
+    })
+    .join('')
+
+  const attachmentsRow = input.attachments
+    ? `<tr style="background:#f8fafc;"><td style="padding:9px 12px;font-weight:600;color:#334155;vertical-align:top;">Attachments</td><td style="padding:9px 12px;color:#0f172a;">${input.attachments.length
+      ? `<ul style="margin:0;padding-left:18px;">${input.attachments.map((a) => `<li>${escHtml(a)}</li>`).join('')}</ul>`
+      : 'No attachments.'
+    }</td></tr>`
+    : ''
+
+  const bodyHtml = `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;font-size:13px;">
+      ${rowsHtml}
+      ${attachmentsRow}
+    </table>
+    ${input.footerNote ? `<p style="margin:14px 0 0 0;font-size:12px;color:#64748b;">${escHtml(input.footerNote)}</p>` : ''}
+  `
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: input.badgeLabel,
+    badgeBg: '#4f46e5',
+    heading: input.heading,
+    bodyHtml,
+  })
+}
+
+export const createDisputeNotificationEmailHtml = (input: {
+  company: EmailCompanyInfo
+  heading: string
+  bodyHtml: string
+  actionLabel?: string
+  actionUrl?: string
+}): string => {
+  const cta =
+    input.actionLabel && input.actionUrl
+      ? `<p style="margin:20px 0;"><a href="${escHtml(input.actionUrl)}" style="display:inline-block;background:#315fce;color:#ffffff;padding:11px 20px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;">${escHtml(input.actionLabel)}</a></p>`
+      : ''
+
+  const arnNote = ``
+  return createNotificationEmailHtml({
+    company: input.company,
+    badgeLabel: 'Dispute',
+    badgeBg: '#ea580c',
+    heading: input.heading,
+    bodyHtml: `<div style="font-size:14px;line-height:22px;color:#334155;">${input.bodyHtml}</div>${cta}${arnNote}`,
+  })
 }
 
 export default sendEmail
