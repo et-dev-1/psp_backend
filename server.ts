@@ -13159,9 +13159,11 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
             const serviceLocationLabel =
               item.service_location_type === 'buyer_place'
                 ? "Buyer's place"
-                : item.service_location_type === 'both'
-                  ? "Buyer's place or seller's premises"
-                  : "Seller's premises"
+                : item.service_location_type === 'online'
+                  ? 'Online'
+                  : item.service_location_type === 'both'
+                    ? "Buyer's place or seller's premises"
+                    : "Seller's premises"
 
             if (item.seller_email) {
               const sellerUrl = `${getClientBaseUrlForServices()}/orders?tab=bookings&bookingId=${bookingResult.insertId}`
@@ -15940,9 +15942,11 @@ const resolveSellerServiceContactInfo = async (sellerId: number, service?: any) 
     const locType = String(service?.service_location_type || 'seller_premises').trim();
     const serviceLocation = locType === 'buyer_place'
         ? "Buyer's place"
-        : locType === 'both'
-            ? "Buyer's place or seller's premises"
-            : "Seller's premises";
+        : locType === 'online'
+            ? 'Online'
+            : locType === 'both'
+                ? "Buyer's place or seller's premises"
+                : "Seller's premises";
     const isAtPremises = locType === 'seller_premises' || locType === 'both';
     const profileAddress = String(pr.company_address || [pr.street, pr.zip, pr.city, pr.country].filter(Boolean).join(', ')).trim() || null;
     const premisesAddress = isAtPremises
@@ -16098,9 +16102,11 @@ app.post('/api/services', productUpload, async (req: Request, res: Response) => 
             : 'active';
         const seoMeta = String(req.body.seo_meta || '').trim() || null;
         const tags = normalizeServiceJsonField(req.body.tags);
-        const availableCities = normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
         const rawLocType = String(req.body.service_location_type || 'seller_premises').trim();
-        const serviceLocationType = ['buyer_place', 'seller_premises', 'both'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const serviceLocationType = ['buyer_place', 'seller_premises', 'both', 'online'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const availableCities = serviceLocationType === 'online'
+            ? []
+            : normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
         const useProfileAddress = req.body.use_profile_address === true || req.body.use_profile_address === 'true' || req.body.use_profile_address === '1';
         let premisesAddress = String(req.body.premises_address || '').trim() || null;
         if ((serviceLocationType === 'seller_premises' || serviceLocationType === 'both') && useProfileAddress && !premisesAddress) {
@@ -16205,9 +16211,11 @@ app.put('/api/services/:id', productUpload, async (req: Request, res: Response) 
             : 'active';
         const seoMeta = String(req.body.seo_meta || '').trim() || null;
         const tags = normalizeServiceJsonField(req.body.tags);
-        const availableCities = normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
         const rawLocType = String(req.body.service_location_type || 'seller_premises').trim();
-        const serviceLocationType = ['buyer_place', 'seller_premises', 'both'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const serviceLocationType = ['buyer_place', 'seller_premises', 'both', 'online'].includes(rawLocType) ? rawLocType : 'seller_premises';
+        const availableCities = serviceLocationType === 'online'
+            ? []
+            : normalizeServiceJsonField(req.body.available_cities).map((c: any) => String(c).trim()).filter(Boolean);
         const useProfileAddress = req.body.use_profile_address === true || req.body.use_profile_address === 'true' || req.body.use_profile_address === '1';
         let premisesAddress = String(req.body.premises_address || '').trim() || null;
         if ((serviceLocationType === 'seller_premises' || serviceLocationType === 'both') && useProfileAddress && !premisesAddress) {
@@ -16629,11 +16637,41 @@ app.post('/api/seller/service-bookings/:id/reschedule-respond', async (req: Requ
         const manageUrl = `${getClientBaseUrlForServices()}/service-booking/${b.booking_token}`;
         if (action === 'accept') {
             const newDate = formatIsoDate(b.proposed_date);
-            const newStart = String(b.proposed_start_time);
-            const newEnd = String(b.proposed_end_time);
+            const newStart = String(b.proposed_start_time).slice(0, 5);
+            const newEnd = String(b.proposed_end_time || b.proposed_start_time).slice(0, 5);
+            const [conflicts] = await db.query<any>(
+              `SELECT id FROM service_bookings
+               WHERE service_id = ? AND booking_date = ? AND LEFT(start_time, 5) = ? AND id <> ?
+                 AND status NOT IN ('CANCELLED', 'REJECTED')
+               LIMIT 1`,
+              [Number(b.service_id), newDate, newStart, bookingId],
+            );
+            if (conflicts.length > 0) {
+                return res.status(409).json({ message: 'The requested time slot is no longer available.' });
+            }
             await db.query<any>(`UPDATE service_bookings
          SET booking_date = ?, start_time = ?, end_time = ?, status = 'CONFIRMED', previous_status = NULL, proposed_date = NULL, proposed_start_time = NULL, proposed_end_time = NULL, reschedule_requested_by = NULL, reschedule_note = NULL
          WHERE id = ?`, [newDate, newStart, newEnd, bookingId]);
+            await ensureDisputeTables();
+            const [openDisputes] = await db.query<any>(
+              `SELECT id, seller_id FROM disputes
+               WHERE service_booking_id = ? AND status NOT IN ('Resolved', 'Closed')`,
+              [bookingId],
+            );
+            if (openDisputes.length > 0) {
+                const sellerDisplayName = await resolveSellerDisputeDisplayName(auth.id);
+                const summary = `Seller confirmed service reschedule to ${newDate} (${newStart} - ${newEnd}).`;
+                for (const d of openDisputes) {
+                    await db.query<any>(
+                      `UPDATE disputes SET status = 'Closed', resolution_type = 'Rescheduled', resolution_summary = ? WHERE id = ?`,
+                      [summary, Number(d.id)],
+                    );
+                    await db.query<any>(
+                      `INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`,
+                      [Number(d.id), sellerDisplayName, summary],
+                    );
+                }
+            }
             await sendServiceBookingNotificationEmail({
                 to: String(b.buyer_email),
                 subject: `Reschedule Accepted: ${b.service_name} (${b.booking_code})`,
@@ -17374,8 +17412,17 @@ app.post('/api/public/disputes', disputeUpload, async (req: Request, res: Respon
         const description = sanitizeDisputeInput(req.body.description, 2500);
         const rawDefectDate = String(req.body.defect_discovered_date || '').trim().slice(0, 10);
         const defectDiscoveredDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDefectDate) ? rawDefectDate : null;
+        const rawServiceBookingId = Number(req.body.service_booking_id);
+        const serviceBookingId = Number.isFinite(rawServiceBookingId) && rawServiceBookingId > 0 ? rawServiceBookingId : null;
+        const rawReqDate = String(req.body.requested_booking_date || '').trim().slice(0, 10);
+        const requestedBookingDate = /^\d{4}-\d{2}-\d{2}$/.test(rawReqDate) ? rawReqDate : null;
+        const requestedStartTime = sanitizeDisputeInput(req.body.requested_start_time, 10).slice(0, 5) || null;
+        const requestedEndTime = sanitizeDisputeInput(req.body.requested_end_time, 10).slice(0, 5) || null;
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(buyerEmail)) {
             return res.status(400).json({ message: 'Please provide a valid email address.' });
+        }
+        if (requestedSolution === 'Reschedule service' && (!requestedBookingDate || !requestedStartTime)) {
+            return res.status(400).json({ message: 'Please select a new date and time slot for rescheduling.' });
         }
         let selectedItemIds: number[] = [];
         try {
@@ -17442,8 +17489,9 @@ app.post('/api/public/disputes', disputeUpload, async (req: Request, res: Respon
         case_number, buyer_token, sale_id, order_id, group_order_id, order_type, seller_id,
         buyer_name, buyer_email, seller_name, item_summary, selected_items_json, amount,
         reason, requested_solution, description, status, payment_status, legal_basis,
-        purchase_date, defect_discovered_date, service_date, response_deadline
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Awaiting seller', 'Paid', ?, ?, ?, ?, ?)`, [
+        purchase_date, defect_discovered_date, service_date, service_booking_id,
+        requested_booking_date, requested_start_time, requested_end_time, response_deadline
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Awaiting seller', 'Paid', ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             caseNumber,
             buyerToken,
             saleId,
@@ -17464,10 +17512,30 @@ app.post('/api/public/disputes', disputeUpload, async (req: Request, res: Respon
             sale.order_date || new Date(),
             defectDiscoveredDate,
             serviceDate,
+            serviceBookingId,
+            requestedBookingDate,
+            requestedStartTime,
+            requestedEndTime,
             responseDeadline,
         ]);
         const disputeId = insertRes.insertId;
-        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [disputeId, buyerName, description]);
+        if (serviceBookingId && requestedSolution === 'Reschedule service' && requestedBookingDate && requestedStartTime) {
+            await db.query<any>(
+              `UPDATE service_bookings
+               SET status = 'RESCHEDULE REQUESTED',
+                   proposed_date = ?,
+                   proposed_start_time = ?,
+                   proposed_end_time = ?,
+                   reschedule_requested_by = 'buyer',
+                   reschedule_note = ?
+               WHERE id = ? AND sale_id = ?`,
+              [requestedBookingDate, requestedStartTime, requestedEndTime || requestedStartTime, description, serviceBookingId, saleId],
+            );
+        }
+        const rescheduleSuffix = requestedSolution === 'Reschedule service' && requestedBookingDate && requestedStartTime
+            ? ` (Requested new slot: ${requestedBookingDate} ${requestedStartTime}${requestedEndTime ? `-${requestedEndTime}` : ''})`
+            : '';
+        await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Buyer', ?)`, [disputeId, buyerName, `${description}${rescheduleSuffix}`]);
         await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, 'BarakahMart Admin', 'System', ?)`, [disputeId, `Dispute ${caseNumber} opened. Seller response requested within 5 days.`]);
         const uploadedFiles = (req.files as Express.Multer.File[]) || [];
         for (const file of uploadedFiles) {
@@ -17485,9 +17553,9 @@ app.post('/api/public/disputes', disputeUpload, async (req: Request, res: Respon
          <p>Please review the complaint, upload evidence, and respond in your Seller Disputes workspace.</p>`, 'Open Seller Disputes', sellerDisputeUrl, 'sellers');
         }
         await sendDisputeEmailSafe(buyerEmail, `Dispute Registered: ${caseNumber} (Order ${sale.order_id})`, `Your Dispute ${caseNumber} is Open`, `<p>Hello ${escapeHtmlForDispute(buyerName)},</p>
-       <p>We have registered your dispute for order <strong>${escapeHtmlForDispute(sale.order_id)}</strong> (${escapeHtmlForDispute(itemSummary)}) and notified the seller.</p>
-       <p><strong>Requested Solution:</strong> ${escapeHtmlForDispute(requestedSolution)}</p>
-       <p>You can track updates, review the seller's response, and accept or reject any proposed solution using your private case link below.</p>`, 'View Your Dispute Case', buyerDisputeUrl, 'customers');
+        <p>We have registered your dispute for order <strong>${escapeHtmlForDispute(sale.order_id)}</strong> (${escapeHtmlForDispute(itemSummary)}) and notified the seller.</p>
+        <p><strong>Requested Solution:</strong> ${escapeHtmlForDispute(requestedSolution)}</p>
+        <p>You can track updates, review the seller's response, and view your dispute using your private link: <a href="${escapeHtmlForDispute(buyerDisputeUrl)}">${escapeHtmlForDispute(buyerDisputeUrl)}</a></p>`, 'View Your Dispute Case', buyerDisputeUrl, 'customers');
         const created = await loadSingleDisputeById(disputeId);
         return res.status(201).json({
             dispute: created,
@@ -17653,11 +17721,99 @@ app.post('/api/seller/disputes/:id/action', async (req: Request, res: Response) 
         const clientBase = getClientBaseUrlForServices();
         const buyerDisputeUrl = `${clientBase}/dispute/${dispute.buyer_token}`;
         if (action === 'accept') {
-            const summary = `Seller accepted the buyer's requested solution (${dispute.requested_solution}). Awaiting buyer confirmation.`;
-            await db.query<any>(`UPDATE disputes SET status = 'Awaiting buyer', resolution_summary = ? WHERE id = ?`, [summary, disputeId]);
-            await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, proposalText || 'We accept your requested solution. Please confirm in your dispute case link.']);
-            await sendDisputeEmailSafe(dispute.buyer_email, `Seller Responded to Dispute ${dispute.case_number}`, `Seller Accepted Your Request (${dispute.case_number})`, `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has accepted your requested solution (<strong>${escapeHtmlForDispute(dispute.requested_solution)}</strong>) for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>.</p>
-         <p>Please review and confirm or reply via your case link.</p>`, 'Review & Confirm', buyerDisputeUrl, 'customers');
+            if (
+              dispute.requested_solution === 'Reschedule service' &&
+              dispute.service_booking_id &&
+              dispute.requested_booking_date &&
+              dispute.requested_start_time
+            ) {
+                const newDate = formatIsoDate(dispute.requested_booking_date);
+                const newStart = String(dispute.requested_start_time).slice(0, 5);
+                const newEnd = String(dispute.requested_end_time || dispute.requested_start_time).slice(0, 5);
+                const [bookingRows] = await db.query<any>(
+                  `SELECT id, service_id FROM service_bookings WHERE id = ? AND seller_id = ? LIMIT 1`,
+                  [Number(dispute.service_booking_id), auth.id],
+                );
+                if (!bookingRows.length) {
+                    return res.status(404).json({ message: 'Service booking not found for this dispute.' });
+                }
+                const [conflicts] = await db.query<any>(
+                  `SELECT id FROM service_bookings
+                   WHERE service_id = ? AND booking_date = ? AND LEFT(start_time, 5) = ? AND id <> ?
+                     AND status NOT IN ('CANCELLED', 'REJECTED')
+                   LIMIT 1`,
+                  [Number(bookingRows[0].service_id), newDate, newStart, Number(dispute.service_booking_id)],
+                );
+                if (conflicts.length > 0) {
+                    return res.status(409).json({ message: 'The requested time slot is no longer available.' });
+                }
+                await db.query<any>(
+                  `UPDATE service_bookings
+                   SET booking_date = ?,
+                       start_time = ?,
+                       end_time = ?,
+                       status = 'CONFIRMED',
+                       proposed_date = NULL,
+                       proposed_start_time = NULL,
+                       proposed_end_time = NULL,
+                       reschedule_requested_by = NULL,
+                       reschedule_note = NULL
+                   WHERE id = ? AND seller_id = ?`,
+                  [newDate, newStart, newEnd, Number(dispute.service_booking_id), auth.id],
+                );
+                const summary = `Seller confirmed service reschedule to ${newDate} (${newStart} - ${newEnd}).`;
+                await db.query<any>(
+                  `UPDATE disputes SET status = 'Closed', resolution_type = 'Rescheduled', resolution_summary = ? WHERE id = ?`,
+                  [summary, disputeId],
+                );
+                await db.query<any>(
+                  `INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`,
+                  [disputeId, sellerDisplayName, proposalText || summary],
+                );
+                await sendDisputeEmailSafe(
+                  dispute.buyer_email,
+                  `Service Reschedule Confirmed: ${dispute.case_number} (Order ${dispute.order_id})`,
+                  `Service Reschedule Confirmed (${dispute.case_number})`,
+                  `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has confirmed your reschedule request for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>.</p>
+                   <p><strong>New Appointment:</strong> ${escapeHtmlForDispute(newDate)} (${escapeHtmlForDispute(newStart)} - ${escapeHtmlForDispute(newEnd)})</p>
+                   <p>Dispute case link: <a href="${escapeHtmlForDispute(buyerDisputeUrl)}">${escapeHtmlForDispute(buyerDisputeUrl)}</a></p>`,
+                  'View Dispute Details',
+                  buyerDisputeUrl,
+                  'customers',
+                );
+            } else if (dispute.requested_solution === 'Cancel service appointment' && dispute.service_booking_id) {
+                await db.query<any>(
+                  `UPDATE service_bookings
+                   SET status = 'CANCELLED',
+                       status_reason = ?
+                   WHERE id = ? AND seller_id = ?`,
+                  [String(dispute.description || 'Cancelled by buyer request'), Number(dispute.service_booking_id), auth.id],
+                );
+                const summary = 'Seller confirmed service appointment cancellation.';
+                await db.query<any>(
+                  `UPDATE disputes SET status = 'Closed', resolution_type = 'Cancelled', resolution_summary = ? WHERE id = ?`,
+                  [summary, disputeId],
+                );
+                await db.query<any>(
+                  `INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`,
+                  [disputeId, sellerDisplayName, proposalText || summary],
+                );
+                await sendDisputeEmailSafe(
+                  dispute.buyer_email,
+                  `Service Appointment Cancelled: ${dispute.case_number} (Order ${dispute.order_id})`,
+                  `Service Appointment Cancelled (${dispute.case_number})`,
+                  `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has confirmed your service appointment cancellation request for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>.</p>`,
+                  'View Dispute Details',
+                  buyerDisputeUrl,
+                  'customers',
+                );
+            } else {
+                const summary = `Seller accepted the buyer's requested solution (${dispute.requested_solution}). Awaiting buyer confirmation.`;
+                await db.query<any>(`UPDATE disputes SET status = 'Awaiting buyer', resolution_summary = ? WHERE id = ?`, [summary, disputeId]);
+                await db.query<any>(`INSERT INTO dispute_messages (dispute_id, author_name, author_role, message_text) VALUES (?, ?, 'Seller', ?)`, [disputeId, sellerDisplayName, proposalText || 'We accept your requested solution. Please confirm in your dispute case link.']);
+                await sendDisputeEmailSafe(dispute.buyer_email, `Seller Responded to Dispute ${dispute.case_number}`, `Seller Accepted Your Request (${dispute.case_number})`, `<p><strong>${escapeHtmlForDispute(sellerDisplayName)}</strong> has accepted your requested solution (<strong>${escapeHtmlForDispute(dispute.requested_solution)}</strong>) for order <strong>${escapeHtmlForDispute(dispute.order_id)}</strong>.</p>
+             <p>Please review and confirm or reply via your case link.</p>`, 'Review & Confirm', buyerDisputeUrl, 'customers');
+            }
         }
         else if (action === 'propose') {
             if (!proposalText)
@@ -17990,9 +18146,11 @@ const bootstrapAndStartServer = async () => {
                 const locType = String(row.service_location_type || 'seller_premises').trim();
                 const serviceLocation = locType === 'buyer_place'
                     ? "Buyer's place"
-                    : locType === 'both'
-                        ? "Buyer's place or seller's premises"
-                        : "Seller's premises";
+                    : locType === 'online'
+                        ? 'Online'
+                        : locType === 'both'
+                            ? "Buyer's place or seller's premises"
+                            : "Seller's premises";
                 const isAtPremises = locType === 'seller_premises' || locType === 'both';
                 const profileAddr = String(row.seller_company_address ||
                     [row.seller_street, row.seller_zip, row.seller_city, row.seller_country]

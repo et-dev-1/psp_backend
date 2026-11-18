@@ -103,6 +103,18 @@ export const ensureDisputeTables = async (): Promise<void> => {
       INDEX idx_dispute_evidence_dispute (dispute_id)
     )
   `)
+  const extraCols: Array<{ name: string; ddl: string }> = [
+    { name: 'service_booking_id', ddl: 'ALTER TABLE disputes ADD COLUMN service_booking_id INT NULL AFTER service_date' },
+    { name: 'requested_booking_date', ddl: 'ALTER TABLE disputes ADD COLUMN requested_booking_date DATE NULL AFTER service_booking_id' },
+    { name: 'requested_start_time', ddl: 'ALTER TABLE disputes ADD COLUMN requested_start_time VARCHAR(10) NULL AFTER requested_booking_date' },
+    { name: 'requested_end_time', ddl: 'ALTER TABLE disputes ADD COLUMN requested_end_time VARCHAR(10) NULL AFTER requested_start_time' },
+  ]
+  for (const col of extraCols) {
+    const [existing] = await db.query<RowDataPacket[]>(`SHOW COLUMNS FROM disputes LIKE ?`, [col.name])
+    if (!existing.length) {
+      await db.query(col.ddl)
+    }
+  }
   disputeTablesEnsured = true
 }
 
@@ -221,10 +233,12 @@ export const lookupOrdersForDisputeQuery = async (rawOrderRef: string) => {
       CASE WHEN si.product_type = 'item' AND si.product_id IS NULL THEN 'Service' ELSE 'Product' END AS item_kind,
       COALESCE(p.type, CASE WHEN si.product_id IS NULL THEN 'service' ELSE 'physical' END) AS product_subtype,
       sb.id AS booking_id,
+      sb.service_id,
       sb.booking_code,
       sb.booking_date,
       sb.start_time,
-      sb.end_time
+      sb.end_time,
+      sb.status AS booking_status
      FROM sale_items si
      LEFT JOIN products p ON p.id = si.product_id
      LEFT JOIN service_bookings sb ON sb.id = (
@@ -250,8 +264,13 @@ export const lookupOrdersForDisputeQuery = async (rawOrderRef: string) => {
       tax_amount: Number(item.tax_amount || 0),
       line_total: lineTotal,
       item_kind: item.item_kind === 'Service' ? 'Service' : 'Product',
+      service_id: item.service_id != null ? Number(item.service_id) : null,
+      booking_id: item.booking_id != null ? Number(item.booking_id) : null,
       booking_code: item.booking_code || null,
       service_date: item.booking_date ? formatIsoDate(item.booking_date) : null,
+      start_time: item.start_time ? String(item.start_time).slice(0, 5) : null,
+      end_time: item.end_time ? String(item.end_time).slice(0, 5) : null,
+      booking_status: item.booking_status || null,
     })
   }
 
