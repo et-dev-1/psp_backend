@@ -87,6 +87,101 @@ export const calculateNetEarning = (
   return roundToTwo(Number(grandTotal || 0) - Number(totalTax || 0) - Number(commissionAmount || 0))
 }
 
+export interface CartPricingItem {
+  unit_price: number
+  quantity: number
+  tax_rate: number
+}
+
+export interface ShipmentPricingItem {
+  fee_incl_vat: number
+}
+
+export interface OrderPricingItem {
+  product_type?: string | null
+  quantity?: number | string | null
+  unit_price?: number | string | null
+  total_price?: number | string | null
+  tax_amount?: number | string | null
+}
+
+const safePricingNumber = (value: unknown): number => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+export const calculateLineTotalInclVat = (item: CartPricingItem): number => {
+  return Math.round(
+    safePricingNumber(item.unit_price) * safePricingNumber(item.quantity) * (1 + safePricingNumber(item.tax_rate)),
+  )
+}
+
+export const calculateCartTotals = (
+  items: CartPricingItem[],
+  shipments: ShipmentPricingItem[] = [],
+): {
+  subtotalInclVat: number
+  shipmentInclVat: number
+  totalInclVat: number
+} => {
+  const subtotalInclVat = items.reduce((sum, item) => sum + calculateLineTotalInclVat(item), 0)
+  const shipmentInclVat = shipments.reduce((sum, shipment) => sum + safePricingNumber(shipment.fee_incl_vat), 0)
+  return {
+    subtotalInclVat,
+    shipmentInclVat,
+    totalInclVat: subtotalInclVat + shipmentInclVat,
+  }
+}
+
+export const calculateOrderItemTotalInclVat = (item: OrderPricingItem): number => {
+  const qty = safePricingNumber(item.quantity)
+  const unitPrice = safePricingNumber(item.unit_price)
+  const totalExclVat = safePricingNumber(item.total_price ?? unitPrice * qty)
+  const taxAmount = safePricingNumber(item.tax_amount)
+  if (String(item.product_type || '').toLowerCase() === 'shipment') {
+    return totalExclVat + taxAmount
+  }
+  const taxRate = totalExclVat > 0 ? taxAmount / totalExclVat : 0
+  return calculateLineTotalInclVat({
+    unit_price: unitPrice,
+    quantity: qty,
+    tax_rate: taxRate,
+  })
+}
+
+export const calculateOrderTotalFromItems = (
+  items: OrderPricingItem[] | undefined | null,
+  fallbackGrandTotal: number | string = 0,
+): number => {
+  if (!Array.isArray(items) || items.length === 0) {
+    return safePricingNumber(fallbackGrandTotal)
+  }
+  const productItems: CartPricingItem[] = items
+    .filter((item) => String(item.product_type || '').toLowerCase() !== 'shipment')
+    .map((item) => {
+      const qty = safePricingNumber(item.quantity)
+      const unitPrice = safePricingNumber(item.unit_price)
+      const totalExclVat = safePricingNumber(item.total_price ?? unitPrice * qty)
+      const taxAmount = safePricingNumber(item.tax_amount)
+      return {
+        unit_price: unitPrice,
+        quantity: qty,
+        tax_rate: totalExclVat > 0 ? taxAmount / totalExclVat : 0,
+      }
+    })
+  const shipmentItems: ShipmentPricingItem[] = items
+    .filter((item) => String(item.product_type || '').toLowerCase() === 'shipment')
+    .map((item) => {
+      const qty = safePricingNumber(item.quantity)
+      const unitPrice = safePricingNumber(item.unit_price)
+      const totalExclVat = safePricingNumber(item.total_price ?? unitPrice * qty)
+      return {
+        fee_incl_vat: totalExclVat + safePricingNumber(item.tax_amount),
+      }
+    })
+  return calculateCartTotals(productItems, shipmentItems).totalInclVat
+}
+
 export const getPaymentProviderFromReference = (
   paymentReferenceId?: string | null,
 ): 'stripe' | 'swish' | 'unknown' => {

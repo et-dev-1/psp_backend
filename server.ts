@@ -30,6 +30,7 @@ import {
   calculateCommissionAmount,
   calculateTaxOnItem,
   calculateNetEarning,
+  calculateOrderTotalFromItems,
   getPaymentProviderFromReference,
   calculatePaymentProcessorFee,
   generateGroupOrderId,
@@ -8984,7 +8985,19 @@ app.get('/api/admin/orders', async (req: Request, res: Response) => {
       }
     }
 
-    res.status(200).json(Array.from(ordersMap.values()))
+    const adminOrders = Array.from(ordersMap.values()).map((order: any) => {
+      const consistentGrandTotal = calculateOrderTotalFromItems(order.items, order.grand_total)
+      const paymentProviderCost = getPaymentProviderCost(consistentGrandTotal, order.payment_intent_id, runtimeSettings)
+      return {
+        ...order,
+        grand_total: consistentGrandTotal,
+        payment_provider_cost: paymentProviderCost,
+        profit: roundToTwo(Number(order.commission_amount || 0) - paymentProviderCost),
+        seller_net_amount: calculateNetEarning(consistentGrandTotal, order.tax_amount, order.commission_amount),
+      }
+    })
+
+    res.status(200).json(adminOrders)
   } catch (err) {
     console.error(err)
     res.status(500).json({ message: 'Database error' })
@@ -12557,6 +12570,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
           unit_price: unitPrice,
           total_price: totalPrice,
           tax_amount: taxAmount,
+          tax_rate: taxRate,
+          gross_total: Math.round(unitPrice * quantity * (1 + taxRate)),
           commission_amount: 0,
           is_private_seller: isPrivateSeller,
           is_promoted: Boolean(serviceRow.is_promoted),
@@ -12677,6 +12692,8 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
         unit_price: unitPrice,
         total_price: totalPrice,
         tax_amount: taxAmount,
+        tax_rate: taxRate,
+        gross_total: Math.round(unitPrice * quantity * (1 + taxRate)),
         commission_amount: 0,
         is_private_seller: isPrivateSeller,
         is_promoted: Boolean(variant.is_promoted),
@@ -12892,16 +12909,16 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       let itemsGrossTotal = 0
       let percentageCommission = 0
       for (const item of bucketItems) {
-        const itemGross = Number(item.total_price || 0) + Number(item.tax_amount || 0)
+        const itemGross = Number(item.gross_total ?? (Number(item.total_price || 0) + Number(item.tax_amount || 0)))
         if (itemGross <= 0) continue
         itemsGrossTotal += itemGross
         const appliedPercent = item?.is_promoted ? promoPercent : defaultPercent
-        percentageCommission += roundToTwo(itemGross * (appliedPercent / 100))
+        percentageCommission += itemGross * (appliedPercent / 100)
       }
       if (!isServiceOrder && shippingWithVat > 0) {
         const allPromoted = bucketItems.length > 0 && bucketItems.every((item) => Boolean(item?.is_promoted))
         const shippingPercent = allPromoted ? promoPercent : defaultPercent
-        percentageCommission += roundToTwo(shippingWithVat * (shippingPercent / 100))
+        percentageCommission += shippingWithVat * (shippingPercent / 100)
       }
       const bucketGross = roundToTwo(itemsGrossTotal + shippingWithVat)
       if (bucketGross <= 0) return 0
@@ -12958,8 +12975,24 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       sellerBreakdown: combinedSellerBreakdown,
     }
 
-    // Charge customer shipping fee WITH VAT
-    const finalTotal = commissionBreakdown.totalGrandAmount
+    // Charge customer shipping fee WITH VAT (matching cartTotals.ts line-level integer rounding)
+    const finalTotal = roundToTwo(
+      orderBucketsToCreate.reduce((sum, b) => {
+        const isServiceOrder = b.kind === 'service'
+        const shipping = isServiceOrder
+          ? 0
+          : roundToTwo(
+              (sellerShippingPolicyMap.get(b.sellerId)?.feeNoVat || 0) +
+                (sellerShippingPolicyMap.get(b.sellerId)?.vatAmount || 0),
+            )
+        const bucketItemsGross = b.items.reduce(
+          (itemSum: number, item: any) =>
+            itemSum + Number(item.gross_total ?? (Number(item.total_price || 0) + Number(item.tax_amount || 0))),
+          0,
+        )
+        return sum + bucketItemsGross + shipping
+      }, 0),
+    )
 
     // 2. Verify payment (Stripe card or Swish)
     let paymentReferenceId = ''
@@ -13045,8 +13078,13 @@ app.post('/api/customer/orders', async (req: Request, res: Response) => {
       const sellerShippingWithVat = sellerShippingNoVat + sellerShippingVat
       //const sellerDiscount = Number(discount_amount || 0) / Object.keys(ordersBySeller).length // Split discount
 
-      // Commission is on (total + tax + shipment + shipping VAT)
-      const sellerGrandTotal = sellerTotal + sellerTax + sellerShippingWithVat
+      // Commission is on (rounded VAT-inclusive item totals + shipment + shipping VAT)
+      const sellerItemsGross = items.reduce(
+        (sum: number, item: any) =>
+          sum + Number(item.gross_total ?? (Number(item.total_price || 0) + Number(item.tax_amount || 0))),
+        0,
+      )
+      const sellerGrandTotal = sellerItemsGross + sellerShippingWithVat
       const sellerCommission = calculateBucketCommission(sellerId, isServiceOrder, items, sellerShippingWithVat)
 
       const baseSellerOrderId = generateSellerOrderId(groupOrderId, sellerId)
@@ -14269,7 +14307,15 @@ app.get('/api/orders', async (req: Request, res: Response) => {
                 });
             }
         }
-        res.status(200).json(Array.from(ordersMap.values()));
+        const sellerOrders = Array.from(ordersMap.values()).map((order: any) => {
+            const consistentGrandTotal = calculateOrderTotalFromItems(order.items, order.grand_total);
+            return {
+                ...order,
+                grand_total: consistentGrandTotal,
+                seller_net_amount: calculateNetEarning(consistentGrandTotal, order.tax_amount, order.commission_amount),
+            };
+        });
+        res.status(200).json(sellerOrders);
     }
     catch (err: any) {
         console.error(err);
@@ -14410,7 +14456,7 @@ app.post('/api/orders/:id/send-invoice', async (req: Request, res: Response) => 
         const totalInvoiceTax = invoiceItems.reduce((sum: any, item: any) => sum + Number(item.tax_amount || 0), 0);
         const tax = Number(order.tax_amount || 0);
         const commission = Number(order.commission_amount || 0);
-        const grandTotal = Number(order.grand_total || 0);
+        const grandTotal = calculateOrderTotalFromItems(invoiceItems, order.grand_total);
         const netAmount = calculateNetEarning(grandTotal, tax, commission);
         const shippingParts = [
             order.shipping_street,

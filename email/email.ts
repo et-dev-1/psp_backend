@@ -2,6 +2,7 @@ import fs from 'fs'
 import path from 'path'
 const nodemailer = require('nodemailer')
 import { SMTP, EMAIL, CLIENT_URL, BACKEND_PUBLIC_BASE_URL } from '../config'
+import { calculateOrderItemTotalInclVat, calculateOrderTotalFromItems } from '../utils/helpers'
 
 const resolveTemplatePath = (filename: string): string => {
   const candidates = [
@@ -444,12 +445,12 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
       }
 
       const qty = Number(item.quantity || 0)
-      const lineTaxAmount = Number(item.tax_amount || 0)
-      const unitPriceWithTax = qty > 0
-        ? (Number(item.unit_price || 0) + lineTaxAmount / qty)
+      const lineTotalNum = calculateOrderItemTotalInclVat(item)
+      const unitPriceWithTax = !isShipment && qty > 0
+        ? lineTotalNum / qty
         : Number(item.unit_price || 0)
       const unitPrice = unitPriceWithTax.toFixed(2)
-      const lineTotal = (Number(item.total_price || 0) + lineTaxAmount).toFixed(2)
+      const lineTotal = lineTotalNum.toFixed(2)
 
       return `<tr style="background-color:${rowBg};">
           <td align="left" style="padding:14px 16px; font-size:13px; font-weight:500;">${item.product_name}</td>
@@ -468,7 +469,7 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
   const computedTax = normalizedItems.reduce((sum, item) => sum + Number(item.tax_amount || 0), 0)
   const summaryTax = Number.isFinite(Number(input.tax_amount)) ? Number(input.tax_amount) : computedTax
 
-  const totalLineTotal = normalizedItems.reduce((sum, item) => sum + Number(item.total_price || 0) + Number(item.tax_amount || 0), 0)
+  const totalLineTotal = calculateOrderTotalFromItems(normalizedItems, input.grand_total)
   const totalsFooterRow = `<tr style="background-color:#f1f5f9;">
       <td colspan="3" align="right" style="padding:12px 16px; font-size:13px; font-weight:700; color:#111827; border-top:2px solid #d1d5db;">Totals</td>
       <td align="left" style="padding:12px 16px; font-size:13px; font-weight:700; color:#111827; border-top:2px solid #d1d5db;">SEK ${totalLineTotal.toFixed(2)}</td>
@@ -489,7 +490,7 @@ export const createInvoiceEmailHtml = (input: CreateInvoiceEmailHtmlInput): stri
     customer_email: String(input.customer_email || ''),
     shipping_address: String(input.shipping_address || 'N/A'),
     seller_email: String(input.seller_email || ''),
-    grand_total: Number(input.grand_total || 0).toFixed(2),
+    grand_total: totalLineTotal.toFixed(2),
     tax_amount: Number(summaryTax || 0).toFixed(2),
     commission_amount: Number(input.commission_amount || 0).toFixed(2),
     net_amount: Number(input.net_amount || 0).toFixed(2),
