@@ -4110,6 +4110,7 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
       user = freshRows[0]
     }
 
+    await recordUserLastLogin(Number(user.id))
     const token = issueAuthToken(Number(user.id), Number(user.session_version || 1))
     return res.json({
       message: 'Google authentication successful',
@@ -4127,6 +4128,52 @@ app.post('/api/auth/google', async (req: Request, res: Response) => {
 })
 
 // Email verification table helper and endpoints for code-based signup
+
+let userLastLoginColumnEnsured = false
+
+const ensureUserLastLoginColumn = async (): Promise<void> => {
+  if (userLastLoginColumnEnsured) return
+  try {
+    const [cols] = await db.query<RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'last_login'`,
+    )
+    if (cols.length === 0) {
+      await db.query('ALTER TABLE users ADD COLUMN last_login TIMESTAMP NULL DEFAULT NULL')
+    }
+    userLastLoginColumnEnsured = true
+  } catch (err) {
+    console.warn('Could not ensure users.last_login column:', err)
+  }
+}
+
+const recordUserLastLogin = async (userId: number): Promise<void> => {
+  if (!Number.isFinite(userId) || userId <= 0) return
+  try {
+    await ensureUserLastLoginColumn()
+    await db.query('UPDATE users SET last_login = NOW() WHERE id = ?', [userId])
+    await db.query('UPDATE profiles SET last_login = NOW() WHERE user_id = ?', [userId])
+  } catch (err) {
+    console.warn('Could not record last_login:', err)
+  }
+}
+
+const autoApprovePendingItemsForTrustedSeller = async (sellerId: number): Promise<void> => {
+  if (!Number.isFinite(sellerId) || sellerId <= 0) return
+  try {
+    await ensureServiceTables()
+    await db.query(
+      `UPDATE services SET approval_status = 'approved' WHERE seller_id = ? AND approval_status = 'pending'`,
+      [sellerId],
+    )
+    await db.query(
+      `UPDATE products SET approval_status = 'approved' WHERE seller_id = ? AND approval_status = 'pending'`,
+      [sellerId],
+    )
+  } catch (err) {
+    console.warn('Could not auto-approve pending items for trusted seller:', err)
+  }
+}
 
 const ensureEmailVerificationCodesTable = async (): Promise<void> => {
   try {
@@ -4512,6 +4559,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
       }
     }
 
+    await recordUserLastLogin(Number(user.id))
     const token = issueAuthToken(Number(user.id), Number(user.session_version || 1))
 
     res.json({
@@ -8724,6 +8772,7 @@ app.get('/api/admin/sellers', async (req: Request, res: Response) => {
   try {
     await ensureProfilesStatusColumns()
     await ensureAccountDeletionColumns()
+    await ensureUserLastLoginColumn()
     const [rows] = await db.query<RowDataPacket[]>(
       `SELECT
         u.id AS seller_id,
@@ -8751,7 +8800,7 @@ app.get('/api/admin/sellers', async (req: Request, res: Response) => {
         p.blocked_reason,
         p.is_self_commission_exempt,
         p.is_trusted_seller,
-        p.last_login,
+        COALESCE(p.last_login, u.last_login) AS last_login,
         p.created_at AS profile_created_at,
         u.pending_deletion
       FROM users u
@@ -9347,6 +9396,10 @@ const updateSellerProfileStatus = async (
     ],
   )
 
+  if (nextTrustedSeller === true && profileRows[0]?.user_id) {
+    await autoApprovePendingItemsForTrustedSeller(Number(profileRows[0].user_id))
+  }
+
   return {
     profile: profileRows[0],
     status,
@@ -9543,6 +9596,9 @@ app.post('/api/admin/profiles/:id/flags', async (req: Request, res: Response) =>
 
     if (rows.length > 0) {
       const row = rows[0]
+      if (flags.trustedSeller === true) {
+        await autoApprovePendingItemsForTrustedSeller(Number(row.user_id))
+      }
       emitToSeller(Number(row.user_id), 'profile:updated', {
         profile_id: profileId,
         seller_id: Number(row.user_id),
@@ -16176,9 +16232,11 @@ app.post('/api/services', productUpload, async (req: Request, res: Response) => 
         const imageUrls = imageFiles.map((f: any) => `/uploads/products/${f.filename}`);
         const safeMainIdx = mainImageIndex < imageUrls.length ? mainImageIndex : 0;
         const mainImageUrl = imageUrls[safeMainIdx] || imageUrls[0];
+        const sellerAdminFlags = await getSellerAdminFlags(auth.id);
+        const sellerApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : 'pending';
         const serviceSku = String(req.body.sku || '').trim() || (await generateServiceSku(auth.id, name));
         const [insertResult] = await db.query<any>(`INSERT INTO services (seller_id, name, sku, subtitle, description, category, age_category, gender, tax_class, status, approval_status, seo_meta, tags_json, available_cities_json, service_location_type, premises_address, use_profile_address, main_image_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`, [auth.id, name, serviceSku, subtitle, description, category, ageCategory, gender, taxClass, status, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl]);
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [auth.id, name, serviceSku, subtitle, description, category, ageCategory, gender, taxClass, status, sellerApprovalStatus, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl]);
         const serviceId = insertResult.insertId;
         for (let i = 0; i < imageUrls.length; i++) {
             await db.query<any>(`INSERT INTO service_images (service_id, image_url, is_main) VALUES (?, ?, ?)`, [serviceId, imageUrls[i], i === safeMainIdx ? 1 : 0]);
@@ -16289,9 +16347,12 @@ app.put('/api/services/:id', productUpload, async (req: Request, res: Response) 
         }
         const safeMainIdx = mainImageIndex < allImages.length ? mainImageIndex : 0;
         const mainImageUrl = allImages[safeMainIdx] || allImages[0];
+        const sellerAdminFlags = await getSellerAdminFlags(auth.id);
+        const currentApprovalStatus = String(existingRows[0]?.approval_status || 'pending').trim() || 'pending';
+        const nextApprovalStatus = sellerAdminFlags.trustedSeller ? 'approved' : currentApprovalStatus;
         await db.query<any>(`UPDATE services
-       SET name = ?, subtitle = ?, description = ?, category = ?, age_category = ?, gender = ?, tax_class = ?, status = ?, seo_meta = ?, tags_json = ?, available_cities_json = ?, service_location_type = ?, premises_address = ?, use_profile_address = ?, main_image_url = ?
-       WHERE id = ? AND seller_id = ?`, [name, subtitle, description, category, ageCategory, gender, taxClass, status, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl, serviceId, auth.id]);
+       SET name = ?, subtitle = ?, description = ?, category = ?, age_category = ?, gender = ?, tax_class = ?, status = ?, approval_status = ?, seo_meta = ?, tags_json = ?, available_cities_json = ?, service_location_type = ?, premises_address = ?, use_profile_address = ?, main_image_url = ?
+       WHERE id = ? AND seller_id = ?`, [name, subtitle, description, category, ageCategory, gender, taxClass, status, nextApprovalStatus, seoMeta, JSON.stringify(tags), JSON.stringify(availableCities), serviceLocationType, premisesAddress, useProfileAddress ? 1 : 0, mainImageUrl, serviceId, auth.id]);
         await db.query<any>(`DELETE FROM service_images WHERE service_id = ?`, [serviceId]);
         for (let i = 0; i < allImages.length; i++) {
             await db.query<any>(`INSERT INTO service_images (service_id, image_url, is_main) VALUES (?, ?, ?)`, [serviceId, allImages[i], i === safeMainIdx ? 1 : 0]);
